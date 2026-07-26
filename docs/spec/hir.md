@@ -384,10 +384,10 @@ registered `@register_typeinfer(<OpClass>)` body via `ctx.error(...)`
   emitting an effect-form Call into HIR is a verify error.
 
 Generic, analysis-wide typing behavior is owned by
-[analysis](./analysis.md): relation-driven type validity
-([analysis §1.1](./analysis.md#11-relation-derived-type-behavior)), output
+[semantic-analysis](./semantic-analysis.md): relation-driven type validity
+([semantic-analysis §1.1](./semantic-analysis.md#11-relation-derived-type-behavior)), output
 storage of multi-input ops, and operand layout / mesh ownership
-([analysis §3.3](./analysis.md#33-output-storage-and-meshlayout-compatibility)).
+([semantic-analysis §3.3](./semantic-analysis.md#33-output-storage-and-meshlayout-compatibility)).
 HIR ops call these services; each op's registered typeinfer owns the layout /
 mesh compatibility and result layout it requires, and `Reshard` is the explicit
 op that changes a value's layout / mesh.
@@ -747,6 +747,55 @@ Consensus torch.nn.functional ops.
     commutes; typeinfer rejects any `Partial` operand, including secondary
     affine inputs.
 
+##### Gelu
+```python
+class Gelu(Op):
+    """Gaussian Error Linear Unit.
+
+    Attributes:
+        x: input; tensor the activation applies to elementwise.
+        approximate: attribute; ``"tanh"`` selects the tanh-based
+            approximation (HF ``gelu_pytorch_tanh`` / Gemma-2 MLP activation).
+    """
+
+    x: Tensor
+    approximate: str = "tanh"
+```
+- constraints:
+  - Elementwise: the output type, shape, and layout are `x`'s.
+  - `x * Phi(x)` dips below zero before rising back through it near zero, so
+    GELU is **not** monotone and commutes with no reduction — unlike the
+    `ReLU` / `Sigmoid` / `Tanh` group above, which commutes with `max` / `min`.
+    typeinfer rejects any `Partial` operand with a `Reshard` remedy.
+
+##### RMSNorm
+```python
+class RMSNorm(Op):
+    """Normalize ``x`` by the root-mean-square of its last axis, scaled by ``weight``.
+
+    Attributes:
+        x: input; tensor normalized over its last axis.
+        weight: input; rank-1 scale, same length as ``x``'s last axis.
+        eps: attribute; added to the mean square before the root.
+    """
+
+    x: Tensor
+    weight: Tensor
+    eps: float = 1e-6
+```
+- constraints:
+  - `weight` MUST be rank-1 with the same length as `x`'s last axis; every
+    other `x` axis, including a dynamic (`DimVar` / dim-arithmetic) entry,
+    flows through unchanged.
+  - The normalization reduces the whole last axis at once (every output
+    element depends on that axis's full mean of squares), so the reduced
+    axis MUST stay inside a single op instance: it is never an
+    iteration-domain axis of its own, only an existential range that both
+    the read and the write cover in full.
+  - `x` / `weight` normalize across an axis (a non-monotonic combination of
+    every value on that axis), so no mesh-axis reduction provably commutes;
+    typeinfer rejects any `Partial` operand.
+
 ##### RoPE
 ```python
 class RoPE(Op):
@@ -759,6 +808,11 @@ class RoPE(Op):
     pos_ids: Tensor
 ```
 - constraints:
+  - The rotation is the **rotate-half** form: the last axis splits in two
+    halves and the pair `(x[i], x[i + d/2])` rotates together. This is the
+    unqualified HF convention (`apply_rotary_pos_emb` / `rotate_half`); the
+    interleaved form (`rotate_every_two`, GPT-J / CodeGen) is a different Op,
+    not an attribute of this one.
   - The result is `(q_rope, k_rope)` and each branch preserves the layout of
     its corresponding `q` or `k` input.
   - On each mesh axis, a branch MAY preserve one `Partial(sum)` on its

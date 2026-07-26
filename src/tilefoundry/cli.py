@@ -10,11 +10,21 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-from tilefoundry.analysis import AnalysisError, AnalysisOptions, analyze
+from tilefoundry.analysis import (
+    AnalysisError,
+    AnalysisOptions,
+    ExtractError,
+    TileGraph,
+    analyze,
+    extract,
+)
 from tilefoundry.inspection import PythonPrintOptions, as_script
 from tilefoundry.ir.core import VerifyError
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
+from tilefoundry.schedule.kernel_schedule import KernelScheduleError, build_schedule_tree
+from tilefoundry.schedule.render import EmitScaffoldError, HoleContract, emit_scaffold
+from tilefoundry.schedule.select_atoms import AtomSelectionError, select_atoms
 from tilefoundry.target import CudaTarget, default_target
 from tilefoundry.target.hardware import format_capabilities, load_hardware_spec
 
@@ -181,6 +191,85 @@ def run_authored_analysis(source: str, analyses: tuple[str, ...]) -> int:
     return 0
 
 
+def _entry_function(ir: Module | Function) -> Function:
+    """Resolve the HIR Function `schedule` runs its pipeline over -- the
+    same Module -> entry_function() convention as `_selected_target`."""
+    function = ir.entry_function() if isinstance(ir, Module) else ir
+    if not isinstance(function, Function):
+        raise TypeError(f"schedule requires a HIR Function entry, got {type(function).__name__}")
+    return function
+
+
+def _decisions_of(solved: TileGraph) -> dict:
+    """The resource decisions `select_atoms` records on its output."""
+    return solved.decisions
+
+
+def _hole_contract_line(contract: HoleContract) -> str:
+    op_name = type(contract.op_ref.target).__name__
+    inputs = ",".join(view.tensor_name for view in contract.inputs)
+    coords = ",".join(contract.coords)
+    return (
+        f"hole={contract.name} op={op_name} coords={coords} "
+        f"inputs={inputs} output={contract.output.tensor_name}"
+    )
+
+
+def _stage_or_die(target, stage: str) -> str:
+    """``stage`` if the resolved target owns a level by that name. A target
+    that enumerates its levels can name the alternatives; one that does not
+    leaves the service lookup inside `select_atoms` to report the mismatch."""
+    levels = getattr(target, "topology_levels", ())
+    if levels and stage not in levels:
+        raise ValueError(
+            f"target {target.name!r} has no topology level {stage!r}; "
+            f"--stage must be one of {', '.join(levels)}"
+        )
+    return stage
+
+
+def run_schedule(source: str, stage: str) -> int:
+    """Model, schedule, select atoms for, and scaffold one authored HIR
+    Function at one of its target's topology levels -- the schedule-path
+    analogue of `run_authored_analysis`: same source loading, ``#``-headed
+    machine-parsable summary style. The target comes from the Function, not
+    from a flag: a kernel is authored against one."""
+    ir = load_authored_ir(source)
+    function = _entry_function(ir)
+    resolved_target = _selected_target(ir)
+    stage = _stage_or_die(resolved_target, stage)
+
+    tg = extract(function)
+    solved = select_atoms(build_schedule_tree(tg), target=resolved_target, stage=stage)
+    skeleton, swimlane, contracts = emit_scaffold(solved)
+    decisions = _decisions_of(solved)
+
+    header = [
+        f"schedule target={resolved_target.name} stage={stage} function={function.name} "
+        f"statements={','.join(unit.name for unit in tg.units)}",
+        f"decisions status={decisions['status']} makespan={decisions['makespan']}",
+    ]
+    for name, stmt in decisions["statements"].items():
+        header.append(
+            f"decisions statement={name} atom={stmt['atom'] or 'none'} "
+            f"place={stmt['place']} start={stmt['start']} end={stmt['end']}"
+        )
+    if solved.ring:
+        header.append(
+            "ring " + " ".join(f"{buf}={depth}" for buf, depth in sorted(solved.ring.items()))
+        )
+    summary = "\n".join(f"# {line}" for line in header)
+    holes = "\n".join(f"# {_hole_contract_line(contract)}" for contract in contracts)
+
+    sys.stdout.write(
+        f"{summary}\n\n"
+        f"# skeleton\n{skeleton.text}\n"
+        f"# swimlane\n{swimlane.text}\n\n"
+        f"# holes\n{holes}\n"
+    )
+    return 0
+
+
 def _add_source_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("source", metavar="SOURCE", help="model.py[:Module[.function]]")
 
@@ -193,6 +282,18 @@ def build_parser() -> argparse.ArgumentParser:
     _add_source_argument(analyze)
     for analysis in ("roofline", "footprint", "timeline"):
         analyze.add_argument(f"--{analysis}", action="store_true", help=f"print {analysis}")
+
+    schedule = commands.add_parser(
+        "schedule",
+        help="schedule authored HIR at one topology level into an agent-fillable scaffold",
+    )
+    _add_source_argument(schedule)
+    schedule.add_argument(
+        "--stage",
+        required=True,
+        metavar="LEVEL",
+        help="topology level to schedule at (a level the Function's target owns, e.g. core)",
+    )
 
     inspect = commands.add_parser("inspect", help="inspect installed target facts")
     inspect_commands = inspect.add_subparsers(dest="inspect_command", required=True)
@@ -226,6 +327,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 0
         except Exception as error:
+            print(f"tilefoundry: error: {error}", file=sys.stderr)
+            return 1
+    if args.command == "schedule":
+        try:
+            return run_schedule(args.source, args.stage)
+        except (
+            ExtractError,
+            EmitScaffoldError,
+            AtomSelectionError,
+            KernelScheduleError,
+            OSError,
+            TypeError,
+            ValueError,
+        ) as error:
             print(f"tilefoundry: error: {error}", file=sys.stderr)
             return 1
 
