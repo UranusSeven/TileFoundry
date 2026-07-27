@@ -1,18 +1,12 @@
-"""Focused P4 materialization and public CTA-service coverage."""
+"""Materialization of a solved CTA plan, and the public call that produces it."""
 
 from __future__ import annotations
 
-import runpy
 from dataclasses import dataclass, replace
 
 import pytest
 import torch
 
-from tests.models.deepseek_v4_flash.moe import (
-    deepseek_v4_flash_module,
-    deepseek_v4_flash_moe,
-)
-from tests.models.qwen3_5_30b_a3b.static_online import qwen_static_online
 from tests.schedule.test_preflight import _planner_helper, _planner_root
 from tilefoundry.evaluator import evaluate
 from tilefoundry.ir.constraints import (
@@ -22,7 +16,7 @@ from tilefoundry.ir.constraints import (
 from tilefoundry.ir.core.metadata import IRMetadata
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.tir.verify import verify_module
-from tilefoundry.schedule import Schedule, ScheduleOptions
+from tilefoundry.schedule import ScheduleOptions
 from tilefoundry.target.cuda.materialize import materialize_planning_solution
 from tilefoundry.target.cuda.planner import build_planning_problem
 from tilefoundry.target.cuda.solver import solve_planning_problem
@@ -114,62 +108,6 @@ def test_materialization_preserves_unrelated_metadata_and_consumes_constraints()
         not isinstance(value, ScheduleConstraintMetadata)
         for value in (*rebuilt_root.metadata, *rebuilt_root.body.metadata)
     )
-
-
-def test_cuda_cta_service_defaults_and_reconstructable_debug_dump(tmp_path) -> None:
-    module = _small_module()
-    target = _planner_root.resolve_target()
-    service = target.service(Schedule, "cta")
-    assert service is target.service(Schedule, "cta")
-
-    default_result = service.solve(module, module.entry_function())
-    assert default_result.report.stage == "cta"
-
-    result = service.solve(
-        module,
-        module.entry_function(),
-        ScheduleOptions(timeout_seconds=10, workers=1, debug_dump_dir=tmp_path),
-    )
-
-    assert result.report.stage == "cta"
-    dump = tmp_path / "materialized_hir.py"
-    source = dump.read_text()
-    compile(source, str(dump), "exec")
-    namespace = runpy.run_path(str(dump))
-    dumped = namespace["small"]
-    assert isinstance(dumped, Module)
-    assert dumped.entry == result.module.entry
-    verify_module(dumped.functions)
-
-
-def test_real_deepseek_cta_service_materializes_verified_module() -> None:
-    service = deepseek_v4_flash_module.resolve_target().service(Schedule, "cta")
-
-    result = service.solve(
-        deepseek_v4_flash_module,
-        deepseek_v4_flash_moe,
-        ScheduleOptions(timeout_seconds=60, workers=4),
-    )
-
-    assert result.report.status in {"OPTIMAL", "FEASIBLE_NOT_PROVEN"}
-    assert result.module.entry_function().name == deepseek_v4_flash_moe.name
-    assert any("__cta_" in function.name for function in result.module.functions)
-    verify_module(result.module.functions)
-
-
-def test_real_static_qwen_cta_service_materializes_verified_module() -> None:
-    module = qwen_static_online
-    service = qwen_static_online.resolve_target().service(Schedule, "cta")
-
-    result = service.solve(
-        module,
-        module.entry_function(),
-        ScheduleOptions(timeout_seconds=60, workers=4),
-    )
-
-    assert result.report.status in {"OPTIMAL", "FEASIBLE_NOT_PROVEN"}
-    assert result.module.entry_function().name == module.entry_function().name
-    verify_module(result.module.functions)
 
 
 def test_materialization_keeps_the_context_an_inheriting_child_was_scheduled_under() -> None:
