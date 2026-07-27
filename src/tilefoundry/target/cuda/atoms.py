@@ -6,17 +6,16 @@ docstring below for exactly where its numbers come from.
 """
 from __future__ import annotations
 
-from tilefoundry.analysis.atom_facts import AtomFact
 from tilefoundry.ir.core import Call
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.tir.cuda.nn.mma import SM80_16x8x16_F32BF16BF16F32_TN, make_atom
 from tilefoundry.ir.tir.cuda.nn.mma_atom import MmaOpSpec
-from tilefoundry.ir.types import DType, TensorType
+from tilefoundry.ir.types import DType, TensorType, tensor_bytes
 from tilefoundry.ir.types.shard import ShardLayout
 from tilefoundry.ir.types.shard.shard_layout import shard_layout_local_shape
 from tilefoundry.ir.types.storage import StorageKind
+from tilefoundry.schedule.facts import AtomFact
 from tilefoundry.target import Target, default_target, resolve_target
-from tilefoundry.target.cuda.cost import tensor_bytes
 from tilefoundry.target.cuda.target import CudaTarget
 
 # The MMA atom catalogue this bridge searches. V1 has exactly the one op

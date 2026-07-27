@@ -2,16 +2,31 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+# ruff: noqa: I001 -- curated order: the families register themselves on import
+# and must load after the registry they register into.
 
-from .analyzer import AnalysisError, AnalysisOptions, AnalysisResult, analyze
-from .atom_facts import AtomFact
+from .errors import AnalysisError
+from .facts import (
+    ExplicitMemoryLevelFacts,
+    ImplicitMemoryLevelFacts,
+    MemoryHierarchyFacts,
+    MemoryLevelRelation,
+    MemoryRelationKind,
+    ParallelCapacityFacts,
+    ThroughputFacts,
+)
 from .metadata import (
-    FootprintMetadata,
+    ComputeCostMetadata,
+    LevelFootprint,
+    MemoryMetadata,
     RooflineMetadata,
     TimelineMetadata,
     TrafficBytes,
+    ValueLifetime,
 )
+from .registry import ANALYSES, AnalysisAlgorithm, register_analysis
+from . import compute_cost, memory, roofline, timeline  # noqa: F401
+from .api import AnalysisResult, analyze
 from .poly import (
     AccessFootprint,
     AxisExtent,
@@ -26,39 +41,35 @@ from .poly import (
 )
 
 
-class Analysis(Protocol):
-    """One stage's target-dependent facts, for the Schedule stage that
-    decides over them: the polyhedral model itself is target-independent
-    (:func:`extract`), the atom catalogue and the store a tile lives in are
-    not. That store belongs to the level, not the device -- an AMX tile at the
-    ``core`` level lives in L1d, a CUDA one at the ``cta`` level in shared
-    memory."""
-
-    stage: str
-    tile_capacity_bytes: int
-
-    def candidate_atoms(self, op: "Call") -> list[AtomFact]: ...
-
-
 __all__ = [
+    "ANALYSES",
     "AccessFootprint",
-    "AxisExtent",
-    "Analysis",
+    "AnalysisAlgorithm",
     "AnalysisError",
-    "AnalysisOptions",
     "AnalysisResult",
-    "AtomFact",
+    "AxisExtent",
+    "ComputeCostMetadata",
+    "ExplicitMemoryLevelFacts",
     "ExtractError",
-    "FootprintMetadata",
+    "ImplicitMemoryLevelFacts",
+    "LevelFootprint",
+    "MemoryHierarchyFacts",
+    "MemoryLevelRelation",
+    "MemoryMetadata",
+    "MemoryRelationKind",
+    "ParallelCapacityFacts",
     "RooflineMetadata",
+    "ThroughputFacts",
     "TileGraph",
     "TileUnit",
     "TimelineMetadata",
     "TrafficBytes",
+    "ValueLifetime",
     "access_footprints",
     "analyze",
     "carried_distances",
     "extract",
+    "register_analysis",
     "statement_time_dims",
     "time_extents",
 ]

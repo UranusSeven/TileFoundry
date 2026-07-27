@@ -1,13 +1,12 @@
 # TileFoundry Spec — analysis (polyhedral model + per-stage target facts)
 
 This spec owns TileFoundry's fact layer: everything a later stage decides
-*over*, and nothing that decides anything itself. It has three surfaces:
+*over*, and nothing that decides anything itself. It has two surfaces:
 
 | Surface | Entry | What it states |
 |---|---|---|
 | Polyhedral model | `extract(hir) -> TileGraph` | one HIR `Function` body as isl domains, access relations and auto-inferred dependences — target-independent |
-| Per-stage target facts | `Analysis` (structural interface) | the atom candidates of one op and the tile store of one storage level, for one target at one stage |
-| Authored-HIR metrics | `analyze(ir) -> AnalysisResult` | roofline / footprint / timeline records attached to authored HIR as metadata |
+| Composed measurement | `analyze(module, function, analysis=...)` | one root analysis and its dependency closure, leaving typed Metadata on the IR |
 
 Per-Op semantic derivation — typeinfer, the forward access relation, shard
 propagation — is owned by [semantic-analysis](./semantic-analysis.md), and the
@@ -18,8 +17,10 @@ rather than restating it.
 
 **Layering.** The decisions taken over these facts are owned by
 [schedule](./schedule.md#4-kernel-schedule-construction). The dependency is
-one-way: the schedule layer reads Analysis facts, and this layer MUST NOT
-import or otherwise depend on the schedule layer.
+one-way: the schedule layer reads this layer's facts, and this layer MUST NOT
+import or otherwise depend on the schedule layer. The atom catalogue and the
+store a tile lives in are the schedule layer's own inputs and are owned there
+([schedule §5](./schedule.md#5-scheduling-facts)).
 
 ## 1. Polyhedral model
 
@@ -305,155 +306,37 @@ rather than obtained from a scheduler.
     distance `0` there, and MUST NOT be otherwise. A statement with no
     self-dependence MUST have every dimension reported parallel.
 
-## 2. Per-stage target facts
+## 2. Authored-HIR metrics
 
-The polyhedral model is target-independent; the atom catalogue and the store a
-tile lives in are not. That store belongs to the **level**, not to the device: a
-tile at the AMX `core` level lives in that core's L1d, one at the CUDA `cta`
-level in shared memory.
-
-### 2.1 `AtomFact`
-
-```python
-class AtomFact:
-    """One candidate atom's facts, as the deciding stage consumes them.
-
-    Attributes:
-        shape: attribute; The atom's own M, N and K extents.
-        dtype: attribute; The atom's own a, b and c operand DTypes.
-        duration: attribute; Nominal roofline estimate for one instance, in ns.
-        compute_duration: attribute; The compute-side half of that estimate alone, in ns.
-        storage: attribute; Per-role fragment occupancy in bytes.
-        resource: attribute; Required thread-scope footprint, keyed by scope name.
-        is_async: attribute; True when the instruction is asynchronous.
-        atom: attribute; The target's own realized atom descriptor, carried through opaquely.
-    """
-
-    shape: tuple[int, int, int]
-    dtype: tuple[DType, DType, DType]
-    duration: float
-    compute_duration: float
-    storage: dict[str, int]
-    resource: dict[str, int]
-    is_async: bool
-    atom: object
-```
+The measurement entry is the composed operation (§3). What a human or a tool
+reads is a *rendering* of its semantic result and of the records it left on the
+IR ([inspection](./inspection.md)); the command line composes one call per
+requested analysis and renders the results together
+([cli §Analyze](./cli.md#analyze)).
 
 - constraints:
-  - The structure MUST be immutable and MUST stay target-independent: `atom`
-    MUST be kept opaque, so a target package can enumerate its own catalogue
-    without this type knowing that catalogue's types.
-  - `shape` / `dtype` MUST mirror the atom's own shape and operand dtypes, so a
-    consumer can filter and granularise without unpacking `atom`.
-  - `duration` MUST be a nominal estimate in ns for **one** atom instance, and
-    `compute_duration` MUST be its compute-side half alone — for a consumer that
-    models the surrounding traffic itself and would otherwise charge memory
-    twice.
-  - `atom` MUST be the realized descriptor a later fill or codegen stage needs,
-    so that stage never re-resolves it from `shape` / `dtype`.
+  - A rendering MUST NOT be a field of the semantic result, and an analysis MUST
+    NOT format one. A family that rendered its own text would be deciding
+    presentation, and two families would then disagree about it.
+  - A rendering MUST report what the caller *requested*. A requested analysis
+    pulls its dependencies in, so records reach the IR that nobody asked to see;
+    those records MUST stay on the IR and MUST NOT be reported. Which records an
+    analysis owns MUST be read from its registration (§3.1) rather than from a
+    second table.
+  - Every rendering of one run MUST make that selection through one shared
+    decision. A summary and an annotated program are two views of the same run,
+    and choosing separately is how one of them comes to show a dependency the
+    caller never asked about.
+  - A rendering MUST show only records that were actually written, so it never
+    reports a measurement that did not happen.
+  - Every reported quantity MUST come from a record, except a total that is the
+    exact sum of records that state it. A quantity that is not derivable that
+    way MUST be recorded by the analysis that computed it, not reassembled by a
+    renderer.
+  - Two formats over one report MUST carry the same conclusions. They MUST be
+    built from one intermediate structure rather than formatted independently.
 
-### 2.2 `Analysis`
-
-`Analysis` is the structural interface a Target binds for one stage, alongside
-that stage's `Schedule` ([target §1](./target.md#1-target)).
-
-```python
-class Analysis(Protocol):
-    """Report one stage's target-dependent facts.
-
-    Attributes:
-        stage: attribute; Exact Target service key for this implementation.
-        tile_capacity_bytes: attribute; Capacity of the store one tile of this level lives in.
-    """
-
-    stage: str
-    tile_capacity_bytes: int
-
-    def candidate_atoms(self, op: Call) -> list[AtomFact]: ...
-```
-
-- constraints:
-  - An implementation MUST be bound under `(Analysis, stage)` on the Target and
-    selected by `target.service(Analysis, stage)`; `stage` MUST equal that exact
-    key.
-  - `tile_capacity_bytes` MUST be the capacity of the store belonging to the
-    bound level, not the whole device, and MUST be a positive integer.
-  - `candidate_atoms` MUST hard-filter the target's catalogue and MUST NOT rank
-    it: ordering is not a decision this interface makes.
-  - `candidate_atoms` MAY return an empty list — a legitimate "no candidate
-    covers this op" outcome, not an error — and MAY raise `NotImplementedError`
-    for an op kind or target its catalogue does not cover.
-  - The capacity is a fact to record against a footprint, not a gate: an
-    implementation MUST NOT raise because a tile does not fit. A tile wider than
-    its store still has a schedule, only a worse one.
-
-## 3. Authored-HIR metrics
-
-`analyze` is the authored-HIR measurement entry the command line exposes
-([cli §Analyze](./cli.md#analyze)). It re-derives types over the authored
-program, validates it, then attaches one metadata record per measured
-expression.
-
-```python
-class AnalysisOptions:
-    """Select which authored-HIR analyses run.
-
-    Attributes:
-        roofline: attribute; Attach RooflineMetadata per measured Call.
-        footprint: attribute; Attach FootprintMetadata per measured value.
-        timeline: attribute; Attach TimelineMetadata per measured Call.
-    """
-
-    roofline: bool = True
-    footprint: bool = True
-    timeline: bool = True
-
-class AnalysisResult:
-    """Carry the annotated IR and its overall summary.
-
-    Attributes:
-        ir: attribute; The same IR object that was analyzed, now carrying metadata.
-        summary_lines: attribute; Overall summary, one stable line per measured total.
-        metadata_types: attribute; The metadata record types this run attached.
-    """
-
-    ir: "Module"
-    summary_lines: tuple[str, ...]
-    metadata_types: tuple[type, ...]
-
-class AnalysisError(ValueError):
-    """An authored program the analysis rejects, or a measurement that failed."""
-
-def analyze(ir: "Module", *, options: AnalysisOptions | None = None) -> AnalysisResult: ...
-```
-
-- constraints:
-  - `AnalysisOptions` and `AnalysisResult` MUST be immutable. `options=None`
-    MUST mean a fresh default `AnalysisOptions()` for that call, which selects
-    all three analyses.
-  - `analyze` MUST re-derive every authored value type before measuring, and
-    MUST reject an authored program that carries a schedule constraint
-    ([schedule §3](./schedule.md#3-constraint-metadata)) or whose local-storage
-    value has an unresolved layout. Both rejections MUST name the source
-    location and binding where available.
-  - `analyze` MUST attach each record in place on the IR it returns, replacing
-    any earlier record of the same type, and `AnalysisResult.ir` MUST be that
-    same object.
-  - `AnalysisResult.metadata_types` MUST list exactly the record types the
-    selected analyses attached, so a printer can comment them without knowing
-    the option set.
-  - A nested `Function` call MUST measure as its callee's own totals; an
-    unresolved or recursive call graph MUST raise `AnalysisError`.
-  - `analyze` MUST accept a `Module` whose entry function is a HIR `Function`,
-    and MUST reject a bare `Function`: a Function carries neither the Target the
-    cost model measures against nor the topology hierarchy execution counts
-    divide over ([target §6](./target.md#6-target-ownership-and-compile-resolution)).
-  - The Target MUST come from `Module.resolve_target()` and from nowhere else.
-    Analyze MUST NOT read a Target out of module metadata and MUST NOT resolve an
-    undeclared Target to a default: reporting numbers for a device the author
-    never declared is worse than refusing to measure.
-
-### 3.1 Metadata records
+### 2.1 Metadata records
 
 ```python
 class TrafficBytes:
@@ -467,39 +350,94 @@ class TrafficBytes:
     read_bytes: int = 0
     write_bytes: int = 0
 
-class RooflineMetadata(IRMetadata):
-    """Per-Call flop counts, traffic, and the bound they imply.
+class ComputeCostMetadata(IRMetadata):
+    """One Call's logical work, as the authored program states it.
 
     Attributes:
-        flops: attribute; Flop count per DType name, sorted by name.
+        flops: attribute; Flop count per compute DType name, sorted by name.
         traffic: attribute; TrafficBytes per storage level name.
-        theoretical_ns: attribute; The roofline bound in ns.
+        execution_count: attribute; How many times the call runs.
     """
 
     flops: tuple[tuple[str, int], ...] = ()
     traffic: tuple[tuple[str, TrafficBytes], ...] = ()
-    theoretical_ns: int = 0
+    execution_count: int = 1
 
-class FootprintMetadata(IRMetadata):
-    """Live bytes per storage level at one program point.
+class LevelFootprint:
+    """How much of one memory level a function needs at its peak.
 
     Attributes:
-        live_bytes: attribute; Live byte count per storage level name, sorted by name.
+        level: attribute; The memory level name.
+        peak_bytes: attribute; The largest simultaneous claim on the level.
+        persistent_bytes: attribute; The part that cannot be reclaimed.
+        capacity_bytes: attribute; The stated capacity, or None when unknown.
     """
 
-    live_bytes: tuple[tuple[str, int], ...] = ()
+    level: str
+    peak_bytes: int
+    persistent_bytes: int
+    capacity_bytes: int | None = None
+
+class ValueLifetime:
+    """One value's residency, as positions in the function's value order.
+
+    Attributes:
+        binding: attribute; The parameter or authored binding name.
+        level: attribute; The memory level the value occupies.
+        bytes: attribute; Bytes the value occupies at that level.
+        defined_at: attribute; Position the value becomes resident.
+        last_used_at: attribute; Position it may be released.
+        persistent: attribute; Whether it is held for the whole function.
+    """
+
+    binding: str
+    level: str
+    bytes: int
+    defined_at: int
+    last_used_at: int
+    persistent: bool = False
+
+class MemoryMetadata(IRMetadata):
+    """One function's memory behaviour against one target's hierarchy.
+
+    Attributes:
+        footprint: attribute; One row per level the function places values in.
+        traffic: attribute; TrafficBytes per level, over the whole function.
+        lifetimes: attribute; One entry per value residency.
+        advisories: attribute; Capacity findings that do not invalidate the program.
+    """
+
+    footprint: tuple[LevelFootprint, ...] = ()
+    traffic: tuple[tuple[str, TrafficBytes], ...] = ()
+    lifetimes: tuple[ValueLifetime, ...] = ()
+    advisories: tuple[str, ...] = ()
+
+class RooflineMetadata(IRMetadata):
+    """A lower bound on time, and which side of the machine sets it.
+
+    Attributes:
+        compute_ns: attribute; Time the flops imply at the target's rates.
+        memory_ns: attribute; Time the traffic implies at the target's bandwidth.
+        theoretical_ns: attribute; The bound the two imply.
+        bound_by: attribute; Which resource set the bound.
+    """
+
+    compute_ns: int = 0
+    memory_ns: int = 0
+    theoretical_ns: int = 0
+    bound_by: str = "none"
 
 class TimelineMetadata(IRMetadata):
-    """One execution unit's modeled placement on the nominal timeline.
+    """A modeled placement on the nominal timeline.
 
     Attributes:
-        grid_ctas: attribute; CTA extent this unit runs at.
-        waves: attribute; Number of waves the unit's CTAs are issued in.
-        start_ns: attribute; Modeled start of the unit's first wave, in ns.
-        end_ns: attribute; Modeled end of the unit's last wave, in ns.
+        grid_units: attribute; Parallel-unit extent this placement covers.
+        waves: attribute; Number of waves issued.
+        start_ns: attribute; Modeled start, in ns.
+        end_ns: attribute; Modeled end, in ns.
     """
 
-    grid_ctas: int = 1
+    grid_units: int = 1
     waves: int = 1
     start_ns: int = 0
     end_ns: int = 0
@@ -509,23 +447,241 @@ class TimelineMetadata(IRMetadata):
   - Every record MUST be immutable and MUST render one single-line comment form,
     so a printer can attach it without knowing the record type
     ([inspection](./inspection.md)).
-  - A `Call`'s flop and byte counts MUST come from that op's registered cost
-    evaluator ([visitor-registry](./visitor-registry.md)) scaled by the call's
-    execution count, which is the product of the execution-topology extents its
-    value meshes carry and the owning Module declares. An op with no registered
-    cost evaluator MUST raise `AnalysisError`. Conflicting extents for one
-    topology name MUST raise rather than be reconciled.
-  - `theoretical_ns` MUST be the larger of the compute time implied by `flops`
-    over the device's peak throughput per DType and the memory time implied by
-    global traffic over the device's memory bandwidth. A target that publishes
-    neither fact MUST report `0`.
-  - `live_bytes` MUST be measured over the postorder live ranges of the
-    function's values, and a pure view (a reshape or a transpose) MUST allocate
-    nothing.
+  - A record's attachment point MUST say what it is about, and one record type
+    MUST mean the same quantity wherever it hangs. A `Call`-attached record
+    describes that call; a `Function`-attached record describes that whole
+    function. A type MUST NOT change meaning with its attachment point.
+  - A `Function`-attached record MUST NOT be read as data the Function
+    inherently carries. It states what one analysis found when a call reached
+    that function, and there MUST be no cross-call cache behind it.
+  - `ComputeCostMetadata` MUST be derivable from the authored program alone. Its
+    flops MUST come from the op's registered cost evaluator
+    ([visitor-registry](./visitor-registry.md)) scaled by the execution count,
+    and its bytes from the logical types the operands and result carry. It MUST
+    NOT read any Target fact, so one authored call carries the same record on
+    every backend. An op with no registered cost evaluator MUST raise
+    `AnalysisError`.
+  - The execution count MUST be the product of the execution-topology extents the
+    call's value meshes carry and the owning Module declares. Conflicting extents
+    for one topology name MUST raise rather than be reconciled.
+  - A call into another `Function` MUST report that function's totals.
+  - `MemoryMetadata` MUST be attached per `Function`: a peak is a property of the
+    whole function's live ranges and belongs to no single expression.
+  - Parameters MUST be resident from the start of the value order. A parameter
+    declared constant is a weight and MUST be `persistent`, held past its last
+    reader for the whole function; every other value MUST be measured by first
+    definition and last use. A pure view — a reshape or a transpose — MUST
+    allocate nothing.
+  - `RooflineMetadata` MUST be computed from the recorded work rather than from a
+    second reading of the program. On a `Function` the compute and memory times
+    MUST each be summed over the function before being compared, because
+    aggregating per-Call bounds instead would charge the machine for rounding and
+    for overlap it does not suffer.
+  - A dtype or a level the target publishes no rate for MUST contribute nothing
+    to the bound, and MUST NOT be filled in with an assumed rate. Work whose rate
+    is unpublished MUST still report a non-zero bound rather than read as free.
   - `TimelineMetadata` MUST be attached per **execution unit** — the group of
-    calls fused by compatible local placement and equal CTA extent — so every
-    call of one unit MUST carry the same record. A unit whose CTA extent exceeds
-    the capacity one launch admits MUST be modelled as consecutive waves, and
-    the reported makespan MUST respect both the unit order and that capacity.
+    calls fused by compatible local placement and equal parallel extent — so
+    every call of one unit MUST carry the same record. A unit whose extent exceeds
+    the parallel capacity MUST be modelled as consecutive waves. On a `Function`
+    the record MUST span the whole plan, from the origin to the solved makespan.
   - The timeline is a modeled plan. It MUST NOT be read as a guarantee about
     lowering, physical occupancy, or runtime performance.
+
+### 2.2 Analysis families
+
+The first families are `compute-cost`, `memory`, `roofline`, and `timeline`.
+Each owns one record type and declares what it needs.
+
+| Selector | Requires | Owns | Rests on |
+|---|---|---|---|
+| `compute-cost` | — | `ComputeCostMetadata` | the authored program only |
+| `memory` | `compute-cost` | `MemoryMetadata` | `MemoryHierarchyFacts` |
+| `roofline` | `memory`, `compute-cost` | `RooflineMetadata` | `ThroughputFacts` |
+| `timeline` | `roofline` | `TimelineMetadata` | `ParallelCapacityFacts` |
+
+- constraints:
+  - A family MUST obtain hardware only through a Facts aggregate it declares
+    ([target §11](./target.md#11-target-facts-projection)). Common analysis code
+    MUST NOT branch on a concrete Target type, MUST NOT call a complete Target
+    analyzer, and MUST NOT resolve an undeclared Target to a default.
+  - A family MUST read a dependency's record rather than recompute what it
+    states. A number with two derivations has two answers.
+  - Logical work and lifetime MUST remain target-independent. Physical capacity,
+    hierarchy relationships, and throughput comparisons are target-aware.
+
+### 2.3 Memory hierarchy facts
+
+```python
+class MemoryRelationKind(Enum):
+    """How two memory levels are related."""
+
+    CACHES = "caches"
+    SHARES_CAPACITY_WITH = "shares_capacity_with"
+
+class ExplicitMemoryLevelFacts:
+    """A level a program places values in by name.
+
+    Attributes:
+        name: attribute; The storage level name.
+        capacity_bytes: attribute; Stated capacity, or None when unknown.
+        scope: attribute; The topology level the capacity is stated per.
+    """
+
+    name: str
+    capacity_bytes: int | None
+    scope: str
+
+class ImplicitMemoryLevelFacts:
+    """A level traffic passes through without being placed there.
+
+    Attributes:
+        name: attribute; The cache level name.
+        capacity_bytes: attribute; Stated capacity, or None when unknown.
+        scope: attribute; The topology level the capacity is stated per.
+    """
+
+    name: str
+    capacity_bytes: int | None
+    scope: str
+
+class MemoryLevelRelation:
+    """One edge between two memory levels.
+
+    Attributes:
+        kind: attribute; Which relationship this edge states.
+        near: attribute; The level closer to the compute units.
+        far: attribute; The level on the other side of the edge.
+        shared_capacity_bytes: attribute; Size of the divided block, on a sharing edge.
+    """
+
+    kind: MemoryRelationKind
+    near: str
+    far: str
+    shared_capacity_bytes: int | None = None
+
+class MemoryHierarchyFacts:
+    """Every memory level of one target, as a flat graph.
+
+    Attributes:
+        explicit_levels: attribute; The levels a program names.
+        implicit_levels: attribute; The levels traffic only passes through.
+        relations: attribute; The edges between them.
+    """
+
+    explicit_levels: tuple[ExplicitMemoryLevelFacts, ...]
+    implicit_levels: tuple[ImplicitMemoryLevelFacts, ...]
+    relations: tuple[MemoryLevelRelation, ...]
+```
+
+- constraints:
+  - The levels MUST be two flat tuples and the structure MUST be a separate edge
+    list. A hierarchy that is only ever a tree cannot state that a cache and an
+    addressable level divide one physical block, which is the relationship that
+    decides how much of that block either one gets.
+  - A GPU projection MUST cover the explicit levels a program can name and the
+    caches traffic passes through, and MUST state that L1 caches L2, that L2
+    caches global memory, and that L1 divides one physical block with shared
+    memory. A target with no such sharing MUST express that by having no such
+    edge, not by a placeholder one.
+  - An implicit level MUST NOT be given a capacity of its own where its usable
+    capacity depends on the program. That capacity MUST be derived from the
+    sharing edge and the sharing level's measured peak.
+  - Exceeding an explicit level's stated capacity MUST raise `AnalysisError`: the
+    program placed more there than the level holds. Exceeding an implicit level's
+    capacity MUST be recorded as an advisory and MUST NOT fail the call, because
+    a working set larger than a cache still runs.
+
+## 3. Composed analysis
+
+`tilefoundry.analysis.api.analyze` is the dependency-composed measurement
+operation. One call selects one root analysis by name; the operation resolves
+what that root transitively needs, runs each member once, and reports what ran.
+
+```python
+class AnalysisResult:
+    """What one composed Analyze call computed."""
+
+    module: "Module"
+    function: "Function"
+    analysis: str
+    executed: tuple[str, ...]
+    metadata_types: tuple[type[IRMetadata], ...]
+
+
+def analyze(
+    module: "Module",
+    function: "Function",
+    *,
+    analysis: str,
+    options: object | None = None,
+) -> AnalysisResult: ...
+```
+
+- constraints:
+  - One call MUST select exactly one root analysis. A caller wanting several
+    roots MUST call the operation once per root.
+  - The operation MUST resolve the root's full transitive dependency closure,
+    order it so every dependency precedes its dependants, and execute each
+    member exactly once per call. `executed` MUST report that order, so a shared
+    dependency appears once.
+  - Dependencies MUST be resolved under the same exact concrete Target as the
+    root, obtained from `Module.resolve_target()`.
+  - A dependency cycle MUST fail and MUST name the path that closes it. A
+    missing root and a missing dependency MUST be distinguishable: one is the
+    caller's selector, the other a broken registration.
+  - Type inference and validation MUST each run once per call, before any
+    analysis. No analysis MAY run once either has rejected the IR, because an
+    analysis reads inferred types and assumes a verified function.
+  - Re-running MUST recompute the closure and refresh the Metadata that closure
+    owns. There MUST be no cross-call cache. Metadata owned by nothing in the
+    closure MUST be left untouched.
+  - `metadata_types` MUST list the Metadata types the call actually wrote onto
+    the IR, in execution order and without repeats. An analysis that declares a
+    type but writes no record for this function MUST NOT contribute it, so a
+    renderer is never sent after records that are not there.
+  - `AnalysisResult` MUST be semantic. Human text, JSON, and annotated HIR are
+    renderings of it and of the Metadata on the IR, and MUST NOT be fields of
+    it.
+
+### 3.1 Analysis registration
+
+```python
+class AnalysisAlgorithm:
+    """One registered analysis: its identity, needs, and owned Metadata."""
+
+    selector: str
+    run: AnalysisCallable
+    requires: tuple[str, ...]
+    produces: tuple[type[IRMetadata], ...]
+
+
+def register_analysis(
+    target_type: type,
+    selector: str,
+    *,
+    requires: tuple[str, ...] = (),
+    produces: tuple[type[IRMetadata], ...] = (),
+) -> "Callable[[AnalysisCallable], AnalysisCallable]": ...
+```
+
+- constraints:
+  - An analysis MUST be registered under the exact
+    `(Target concrete type, selector)` pair, in the shared algorithm registry
+    contract ([code-organization](./code-organization.md)). A base-class
+    registration MUST NOT serve a subclass, and there MUST be no default-Target
+    fallback: two targets sharing a base can need different implementations.
+  - A target-independent analysis MUST still be registered once per supported
+    target, so the support matrix is read from the registrations rather than
+    inferred from an inheritance chain.
+  - A duplicate registration for one exact pair MUST fail rather than replace,
+    so dispatch cannot depend on import order.
+  - A declaration MUST be rejected when it requires itself, repeats a
+    dependency, produces the same Metadata type twice, or names a `produces`
+    entry that is not an `IRMetadata` subclass.
+  - An analysis MAY change only the Metadata types its registration declares.
+    Ownership MUST be enforced against what reached the IR rather than against
+    what the analysis reports, and MUST cover addition, replacement, and
+    removal alike: deleting another analysis's record changes the IR as much as
+    overwriting it. An equal-valued overwrite of another analysis's record MUST
+    also count as a violation.
