@@ -154,7 +154,7 @@ infrastructure used by both passes and codegen walkers; the framework
 contract lives in [visitor-mutator](./visitor-mutator.md).
 
 Scheduling is an explicit Target-owned service boundary, not a pass-manager
-stage. A caller selects a named service from the root Function's Target and
+stage. A caller selects a named service from the Module's resolved Target and
 invokes it directly. A scheduling service may first verify an authored logical
 program and derive a plan-level execution blueprint; its public summary reports
 only the selected objective and proof state. The direct invocation contract and
@@ -179,7 +179,11 @@ the runtime then loads the `LinkedModule` into a `RuntimeModule`:
 The emit / link pipeline and its products (`LinkableFunction` /
 `LinkableModule` / `LinkedModule`) are owned by [codegen](./codegen.md).
 Target capability (the `Target` descriptors and the admitted program
-topology levels) is owned by [target](./target.md). The Python-side
+topology levels) is owned by [target](./target.md). The hardware numbers those
+descriptors stand on are not written in Python: they come from installed,
+source-attributed Architecture and Device documents resolved by stable ID, and
+a composed Target retains each document's ID and content digest
+([target §10](./target.md#10-installed-hardware-resources)). The Python-side
 `RuntimeModule` boundary (field semantics, ABI, launch rules) is owned
 by [runtime](./runtime.md).
 

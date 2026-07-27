@@ -9,9 +9,11 @@ from tilefoundry import module
 from tilefoundry.dsl import Mesh, Tensor, Topology, func, tf
 from tilefoundry.target import CudaTarget
 
-@module(entry="main")
+@module(entry="main", target=CudaTarget())
 class Model:
-    @func(target=CudaTarget(), topologies=(Topology("cta", 168),))
+    topologies = (Topology("cta", 168),)
+
+    @func
     def main(x: Tensor[(168,), "f32"]):
         with Mesh(Topology("cta", 168), (168,), ("block",)) as cta:
             x_local = tf.reshard(x, (168 @ cta.block,), "rmem")
@@ -41,10 +43,11 @@ def test_inspect_capabilities_is_compact(tmp_path, capsys) -> None:
     path = _write_module(tmp_path)
     assert cli.main(["inspect", "capabilities", f"{path}:Model.main"]) == 0
     output = capsys.readouterr().out
-    assert "target: h200_sxm_sm90" in output
+    assert "architecture: nvidia.sm90" in output
+    assert "device: nvidia.h200_sxm" in output
     assert "grid_cta_count: 168" in output
-    assert "hbm_bandwidth: 4.8 TB/s [direct]" in output
-    assert "l2_bandwidth: unavailable [unavailable]" in output
+    assert "memory.hbm.bandwidth: 4800000000000 byte/s [vendor]" in output
+    assert "memory.l2.bandwidth: unavailable" in output
 
 
 def test_inspect_capabilities_rejects_an_uninstalled_cuda_target(tmp_path, capsys) -> None:
@@ -52,10 +55,13 @@ def test_inspect_capabilities_rejects_an_uninstalled_cuda_target(tmp_path, capsy
         tmp_path,
         _VALID_MODULE.replace(
             "from tilefoundry.target import CudaTarget",
-            "from tilefoundry.target import CudaTarget, SM90",
+            "from dataclasses import replace\n"
+            "from tilefoundry.target import CudaTarget\n"
+            "from tilefoundry.target.cuda.spec import installed_architecture",
         ).replace(
             "target=CudaTarget()",
-            'target=CudaTarget(architecture=SM90(name="sm_90_custom"))',
+            "target=CudaTarget("
+            'architecture=replace(installed_architecture(), name="sm_90_custom"))',
         ),
     )
 
@@ -63,7 +69,7 @@ def test_inspect_capabilities_rejects_an_uninstalled_cuda_target(tmp_path, capsy
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert "no installed authored-analysis hardware spec" in captured.err
+    assert "no installed hardware documents" in captured.err
     assert "sm_90_custom" in captured.err
 
 

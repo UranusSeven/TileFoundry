@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import builtins
 import math
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import isl
 import pytest
@@ -28,7 +28,6 @@ from tilefoundry.schedule.kernel_schedule import band_statement, build_schedule_
 from tilefoundry.schedule.render import emit_scaffold
 from tilefoundry.schedule.select_atoms import AtomSelectionError, select_atoms
 from tilefoundry.target import default_target
-from tilefoundry.target.base import Device
 from tilefoundry.target.cuda.target import CudaTarget
 
 _SM80_ATOM = "SM80_16x8x16_F32BF16BF16F32_TN"
@@ -58,21 +57,19 @@ def f32_gemm_rmsnorm(
     return y
 
 
-@dataclass(frozen=True)
-class _TunedDevice(Device):
-    """An H200 with its shared-memory capacity dialled to order, so a test can
-    put the recorded footprint over the store on purpose."""
-
-    name: str = "tuned"
-    sm_count: int = 132
-    hbm_bandwidth_bytes_per_second: int = 4_800_000_000_000
-    shared_memory_per_cta_bytes: int = 227 * 1024
-
-    def peak_for(self, dtype) -> int:
-        return 989_500_000_000_000
+def _tuned_capacity(shared_memory_per_cta_bytes: int) -> CudaTarget:
+    """A CUDA target whose shared-memory capacity is dialled to order, so a
+    test can put the recorded footprint over the store on purpose. The
+    capacity is an architecture limit, so that is what varies."""
+    installed = CudaTarget().architecture
+    return CudaTarget(
+        architecture=replace(
+            installed, shared_memory_per_cta_bytes=shared_memory_per_cta_bytes
+        )
+    )
 
 
-def _scheduled(fn=bf16_gemm_rmsnorm) -> TileGraph:
+def _scheduled(fn=bf16_gemm_rmsnorm.entry_function()) -> TileGraph:
     return build_schedule_tree(extract(fn))
 
 
@@ -180,7 +177,7 @@ def test_a_capacity_too_small_for_the_footprint_is_recorded_not_raised():
     """The capacity is a fact to present, not a gate: a store far below what
     one tile holds still yields a full set of decisions, with the overflow
     recorded per statement. V1 reports a bad schedule, it does not refuse one."""
-    target = CudaTarget(device=_TunedDevice(shared_memory_per_cta_bytes=512))
+    target = _tuned_capacity(512)
     solved = select_atoms(_scheduled(), target=target)
     decisions = solved.decisions
     print("\n=== over-capacity decisions ===")
@@ -293,7 +290,7 @@ def test_empty_tile_graph_raises_clear_error():
 
 def test_solving_before_build_schedule_tree_raises_clear_error():
     with pytest.raises(AtomSelectionError, match="build_schedule_tree"):
-        select_atoms(extract(bf16_gemm_rmsnorm), target="cuda")
+        select_atoms(extract(bf16_gemm_rmsnorm.entry_function()), target="cuda")
 
 
 def test_resolving_an_already_tiled_tree_raises_clear_error():
@@ -309,7 +306,7 @@ def test_a_statement_order_that_runs_against_a_dependence_is_rejected():
     """The nominal timeline is a prefix sum over ``tg.units``, so that order has
     to agree with every dependence isl reports between two statements --
     reversing it puts RN's start before the MM it reads from."""
-    tg = extract(bf16_gemm_rmsnorm)
+    tg = extract(bf16_gemm_rmsnorm.entry_function())
     reversed_units = build_schedule_tree(replace(tg, units=tuple(reversed(tg.units))))
     with pytest.raises(AtomSelectionError, match="orders 'MM' before 'RN'"):
         select_atoms(reversed_units, target="cuda")

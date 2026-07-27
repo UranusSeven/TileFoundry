@@ -11,13 +11,11 @@ import pytest
 from ortools.sat.python import cp_model
 
 from tests.models.qwen3_5_30b_a3b.static_online import qwen_static_online
-from tilefoundry.ir.core.module import Module
 from tilefoundry.parser.hir_parser import parse_script
 from tilefoundry.schedule import ScheduleOptions
 from tilefoundry.target import CudaTarget
 from tilefoundry.target.base import Device
 from tilefoundry.target.cuda.allocation import _allocation_groups
-from tilefoundry.target.cuda.device import H200SXM
 from tilefoundry.target.cuda.planner import build_planning_problem
 from tilefoundry.target.cuda.projection import project_physical_fusion
 from tilefoundry.target.cuda.solver import PlanningSolution, _build_model, solve_planning_problem
@@ -25,7 +23,7 @@ from tilefoundry.target.cuda.solver import PlanningSolution, _build_model, solve
 
 def _qwen_problem():
     return build_planning_problem(
-        Module("qwen", (qwen_static_online,), "qwen_static_online"), qwen_static_online
+        qwen_static_online, qwen_static_online.entry_function()
     )
 
 
@@ -110,7 +108,7 @@ class _CapacityDevice(Device):
         self.hbm_capacity_bytes = capacity
 
     def peak_for(self, dtype):
-        return H200SXM().peak_for(dtype)
+        return CudaTarget().device.peak_for(dtype)
 
 
 def _constant_problem(capacity: int):
@@ -127,7 +125,7 @@ def root(x: Tensor[(1024,), "f32"], weight: ConstTensor[(1024,), "f32"]) -> Tens
 '''
     )
     root = replace(root, target=CudaTarget(device=_CapacityDevice(capacity)))
-    return build_planning_problem(Module("constant", (root,), "root"), root)
+    return build_planning_problem(root, root.entry_function())
 
 
 def test_constant_root_weight_is_resident_through_makespan(tmp_path: Path) -> None:
