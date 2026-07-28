@@ -158,9 +158,9 @@ contract lives in [visitor-mutator](./visitor-mutator.md).
 Scheduling is one explicit public operation, not a pass-manager stage and not a
 Target-owned service. A caller names the program and one level of the hierarchy
 that program declares; the algorithm registered for that exact hardware and level
-answers with a Plan it owns entirely. An algorithm may first verify an authored
-logical program and derive a plan-level execution blueprint; when it states an
-objective, that summary reports only the selected value and proof state. The
+answers with a Plan it owns entirely. What a Plan states is a decision about a
+program, never a rewritten one: no scheduling algorithm materializes its selection
+into HIR, and applying a decision is a separate operation a caller asks for. The
 invocation contract, the result boundary, and the Plan base are owned by
 [schedule](./schedule.md). An algorithm reads the hardware it decides over by
 projecting the same Target for the aggregates it declares.
@@ -228,7 +228,7 @@ This table is the authoritative spec-to-box map. Each row lists the
 | **[analysis](./analysis.md)** | Fact layer: the polyhedral model of one HIR Function body (`TileGraph` / `extract`, authored-loop modelling, and the facts measured over a time relation), and the composed authored-HIR measurement — its analysis families, their owned Metadata records, and the narrow Target Facts each family declares |
 | **[visitor-mutator](./visitor-mutator.md)** | IR traversal / rewrite infrastructure: expr / stmt visitors, mutators, identity-preserving rewrite invariants, mixed stmt-expr traversal |
 | **[passes](./passes.md)** | Pass framework + implemented passes: `Pass` / `PassManager`, three pass granularities, per-pass subsections (lowering / optimization rules) |
-| **[schedule](./schedule.md)** | The public scheduling operation: invocation contract, exact algorithm registration, shared options, result boundary, the extensible Plan base, the reusable makespan report, the schedule-tree construction / atom selection / scaffold emission stages an algorithm composes its solve from, and the scheduling facts it projects (`AtomFact`, the per-level tile store, the per-operation candidates) |
+| **[schedule](./schedule.md)** | The public scheduling operation: invocation contract, exact algorithm registration, shared options, result boundary, the extensible Plan base, the typed plan each algorithm family exports, the schedule-tree construction and scaffold emission stages an algorithm composes its solve from, and the facts it projects (`AtomFact`, plus each family's own closed facts) |
 | **[target](./target.md)** | Target capability descriptors, architecture/device facts, Facts projection, and admitted program topology levels |
 | **[codegen](./codegen.md)** | Emit / link pipeline and products (`LinkableFunction` / `LinkableModule` / `LinkedModule`), emitter registry, dispatch + shape-scalar ABI, program-shape / dynamic-CTA source contract, ShardLayout emission |
 | **[runtime](./runtime.md)** | `RuntimeModule` / launcher ABI, C++ runtime surface, `runtime.h` umbrella header, runtime op free-function contract |

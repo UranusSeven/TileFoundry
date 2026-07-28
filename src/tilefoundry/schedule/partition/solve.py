@@ -1,4 +1,10 @@
-"""Private CP-SAT solve and decoded CTA planning result."""
+"""The CP-SAT solve over one closed partition problem.
+
+Every number this model needs is already in the problem: durations, traffic
+demands, capacities, and how many parallel positions there are. Nothing here
+resolves a Target, projects a fact, or asks the hardware a question, so what the
+solve minimises is fully determined by its input.
+"""
 
 from __future__ import annotations
 
@@ -16,25 +22,28 @@ from tilefoundry.ir.types import TensorType, Type, tensor_bytes
 from tilefoundry.ir.types.shard import ComposedLayout, ShardLayout
 from tilefoundry.schedule import ScheduleOptions
 
-from .allocation import _allocation_groups
-from .debug import write_debug_dumps
-from .planner import (
-    OpCandidate,
-    PlanningProblem,
-    RegionInfo,
-)
+from .problem import OpCandidate, PartitionProblem
+from .program import RegionInfo
 
 _INT64_MAX = (1 << 63) - 1
 
 
+class PartitionSolveError(RuntimeError):
+    """The closed problem has no schedule, or the solver could not decide."""
+
+
 @dataclass(frozen=True)
 class ExecutionInterval:
+    """One selected candidate's half-open execution interval."""
+
     start_ns: int
     end_ns: int
 
 
 @dataclass(frozen=True)
-class PlanningSolution:
+class PartitionSolution:
+    """What the solve selected, and how sure it is of the objective."""
+
     status: Literal["OPTIMAL", "FEASIBLE_NOT_PROVEN"]
     selected_candidate_ids: tuple[int, ...]
     selected_bucket_ids: tuple[int, ...]
@@ -70,17 +79,19 @@ def _is_view(candidate: OpCandidate) -> bool:
 def _checked_add(total: int, value: int, context: str) -> int:
     result = total + value
     if result < 0 or result > _INT64_MAX:
-        raise ValueError(f"P3: {context} exceeds OR-Tools integer domain")
+        raise PartitionSolveError(f"{context} exceeds the solver integer domain")
     return result
 
 
 def _checked_mul(left: int, right: int, context: str) -> int:
     if left < 0 or right < 0 or (left and right > _INT64_MAX // left):
-        raise ValueError(f"P3: {context} exceeds OR-Tools integer domain")
+        raise PartitionSolveError(f"{context} exceeds the solver integer domain")
     return left * right
 
 
-def _region_chain(problem: PlanningProblem, region_id: int | None) -> tuple[RegionInfo, ...]:
+def _region_chain(
+    problem: PartitionProblem, region_id: int | None
+) -> tuple[RegionInfo, ...]:
     chain: list[RegionInfo] = []
     while region_id is not None:
         region = problem.regions[region_id]
@@ -89,13 +100,15 @@ def _region_chain(problem: PlanningProblem, region_id: int | None) -> tuple[Regi
     return tuple(reversed(chain))
 
 
-def _horizon(problem: PlanningProblem) -> int:
+def _horizon(problem: PartitionProblem) -> int:
     horizon = 0
     for candidate_id, candidate in problem.candidates.items():
         if candidate.duration_ns <= 0:
             continue
         duration = candidate.duration_ns
-        for region in _region_chain(problem, problem.candidate_enclosing_regions.get(candidate_id)):
+        for region in _region_chain(
+            problem, problem.candidate_enclosing_regions.get(candidate_id)
+        ):
             duration = _checked_mul(duration, region.trip_count, "horizon")
         horizon = _checked_add(horizon, duration, "horizon")
     return horizon
@@ -107,7 +120,9 @@ def _tensor_mesh_count(type: Type) -> int:
     shape = type.layout.mesh.layout.shape
     count = shape[0]
     if not isinstance(count, int) or count <= 0:
-        raise ValueError(f"P3: bucket Mesh count must be a positive integer, got {count!r}")
+        raise PartitionSolveError(
+            f"bucket Mesh count must be a positive integer, got {count!r}"
+        )
     return count
 
 
@@ -118,13 +133,15 @@ def _mesh_offset(type: Type) -> int | None:
     return layout.offset if isinstance(layout, ComposedLayout) else None
 
 
-def _buckets_for_value(problem: PlanningProblem, value_id: int) -> tuple[int, ...]:
+def _buckets_for_value(problem: PartitionProblem, value_id: int) -> tuple[int, ...]:
     return tuple(
-        bucket_id for bucket_id, bucket in problem.buckets.items() if bucket.value_id == value_id
+        bucket_id
+        for bucket_id, bucket in problem.buckets.items()
+        if bucket.value_id == value_id
     )
 
 
-def _buckets_by_type(problem: PlanningProblem, value_id: int) -> dict[int, int]:
+def _buckets_by_type(problem: PartitionProblem, value_id: int) -> dict[int, int]:
     return {
         bucket.type_id: bucket_id
         for bucket_id, bucket in problem.buckets.items()
@@ -132,15 +149,17 @@ def _buckets_by_type(problem: PlanningProblem, value_id: int) -> dict[int, int]:
     }
 
 
-def _source_value_ids(problem: PlanningProblem) -> tuple[int, ...]:
+def _source_value_ids(problem: PartitionProblem) -> tuple[int, ...]:
     return tuple(
         value_id
         for value_id, value in problem.values.items()
-        if value.role == "normal" and value.producer_site_id is None and value.function_path == ()
+        if value.role == "normal"
+        and value.producer_site_id is None
+        and value.function_path == ()
     )
 
 
-def _result_region_ids(problem: PlanningProblem) -> dict[int, int]:
+def _result_region_ids(problem: PartitionProblem) -> dict[int, int]:
     result_regions: dict[int, int] = {}
     for region_id, region in problem.regions.items():
         for value_id in region.result_value_ids:
@@ -148,7 +167,7 @@ def _result_region_ids(problem: PlanningProblem) -> dict[int, int]:
     return result_regions
 
 
-def _descendant_regions(problem: PlanningProblem, region_id: int) -> set[int]:
+def _descendant_regions(problem: PartitionProblem, region_id: int) -> set[int]:
     descendants = {region_id}
     changed = True
     while changed:
@@ -160,14 +179,68 @@ def _descendant_regions(problem: PlanningProblem, region_id: int) -> set[int]:
     return descendants
 
 
-def _add_exactly_one(model: cp_model.CpModel, literals: list[cp_model.IntVar], label: str) -> None:
+def _allocation_groups(
+    problem: PartitionProblem,
+) -> tuple[tuple[int, tuple[int, ...]], ...]:
+    """Conservative physical groups covering all possible bucket selections.
+
+    Carry facts are unconditional in-place aliases. View aliases are selected
+    candidate facts, so they are intentionally kept as singleton groups in the
+    pre-solve capacity model. This can overestimate resident bytes, but cannot
+    merge an unselected view path and undercount them.
+    """
+    bucket_ids = tuple(sorted(problem.buckets))
+    parent = {bucket_id: bucket_id for bucket_id in bucket_ids}
+
+    def find(bucket_id: int) -> int:
+        while parent[bucket_id] != bucket_id:
+            parent[bucket_id] = parent[parent[bucket_id]]
+            bucket_id = parent[bucket_id]
+        return bucket_id
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for region in problem.regions.values():
+        for carry in region.carry_infos:
+            carry_values = (
+                carry.init_value_id,
+                carry.carried_value_id,
+                carry.yield_value_id,
+                carry.result_value_id,
+            )
+            for left_value, right_value in zip(carry_values, carry_values[1:]):
+                left_by_type = _buckets_by_type(problem, left_value)
+                right_by_type = _buckets_by_type(problem, right_value)
+                for type_id in left_by_type.keys() & right_by_type.keys():
+                    union(left_by_type[type_id], right_by_type[type_id])
+
+    groups: dict[int, list[int]] = {}
+    for bucket_id in bucket_ids:
+        groups.setdefault(find(bucket_id), []).append(bucket_id)
+    return tuple(
+        (group_id, tuple(sorted(group_bucket_ids)))
+        for group_id, group_bucket_ids in sorted(groups.items())
+    )
+
+
+def _add_exactly_one(
+    model: cp_model.CpModel, literals: list[cp_model.IntVar], label: str
+) -> None:
     if not literals:
-        raise ValueError(f"P3: no selectable {label}")
+        raise PartitionSolveError(f"no selectable {label}")
     model.AddExactlyOne(literals)
 
 
-def _build_model(problem: PlanningProblem) -> _CpModelState:
+def _build_model(problem: PartitionProblem) -> _CpModelState:
     horizon = _horizon(problem)
+    extent = problem.extent
+    bandwidth_per_ns = math.ceil(
+        problem.facts.memory_bandwidth_bytes_per_second / 1_000_000_000
+    )
     model = cp_model.CpModel()
     pick_candidates = {
         candidate_id: model.NewBoolVar(f"pick_candidate_{candidate_id}")
@@ -181,14 +254,20 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
     for site_id in problem.site_order:
         _add_exactly_one(
             model,
-            [pick_candidates[candidate_id] for candidate_id in problem.authored_candidates[site_id]],
+            [
+                pick_candidates[candidate_id]
+                for candidate_id in problem.authored_candidates[site_id]
+            ],
             f"authored candidates for site {site_id}",
         )
     for value_id in _source_value_ids(problem):
         _add_exactly_one(
             model,
-            [pick_buckets[bucket_id] for bucket_id in _buckets_for_value(problem, value_id)
-             if problem.buckets[bucket_id].is_source],
+            [
+                pick_buckets[bucket_id]
+                for bucket_id in _buckets_for_value(problem, value_id)
+                if problem.buckets[bucket_id].is_source
+            ],
             f"source buckets for value {value_id}",
         )
     for requirement in problem.requirements:
@@ -204,8 +283,10 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
             reshard_output_buckets = tuple(
                 bucket_id
                 for bucket_id in value_bucket_ids
-                if any(_is_reshard(problem.candidates[candidate_id])
-                       for candidate_id in problem.buckets[bucket_id].candidate_ids)
+                if any(
+                    _is_reshard(problem.candidates[candidate_id])
+                    for candidate_id in problem.buckets[bucket_id].candidate_ids
+                )
             )
             if not reshard_output_buckets:
                 _add_exactly_one(
@@ -220,12 +301,16 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
                 terminal_buckets[bucket_id] = terminal
                 model.AddImplication(terminal, pick_buckets[bucket_id])
                 terminal_literals.append(terminal)
-            _add_exactly_one(model, terminal_literals, f"function result buckets for value {value_id}")
+            _add_exactly_one(
+                model, terminal_literals, f"function result buckets for value {value_id}"
+            )
 
     for bucket_id, bucket in problem.buckets.items():
         if bucket.is_source or problem.values[bucket.value_id].role != "normal":
             continue
-        producers = [pick_candidates[candidate_id] for candidate_id in bucket.candidate_ids]
+        producers = [
+            pick_candidates[candidate_id] for candidate_id in bucket.candidate_ids
+        ]
         model.Add(sum(producers) == pick_buckets[bucket_id])
     for candidate_id, candidate in problem.candidates.items():
         present = pick_candidates[candidate_id]
@@ -242,13 +327,17 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
             )
     for requirement in problem.requirements:
         for bucket_id in requirement.bucket_ids:
-            demand_literals_by_bucket.setdefault(bucket_id, []).append(pick_buckets[bucket_id])
+            demand_literals_by_bucket.setdefault(bucket_id, []).append(
+                pick_buckets[bucket_id]
+            )
 
     for candidate_id, candidate in problem.candidates.items():
         if not _is_reshard(candidate) or candidate.site_id is not None:
             continue
         output_bucket = candidate.output_bucket_ids[0]
-        demand_literals = tuple(dict.fromkeys(demand_literals_by_bucket.get(output_bucket, ())))
+        demand_literals = tuple(
+            dict.fromkeys(demand_literals_by_bucket.get(output_bucket, ()))
+        )
         if demand_literals:
             demand = model.NewBoolVar(f"reshard_demand_{output_bucket}")
             for literal in demand_literals:
@@ -283,7 +372,9 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
         if candidate.duration_ns <= 0:
             continue
         duration = candidate.duration_ns
-        for region in _region_chain(problem, problem.candidate_enclosing_regions.get(candidate_id)):
+        for region in _region_chain(
+            problem, problem.candidate_enclosing_regions.get(candidate_id)
+        ):
             duration = _checked_mul(duration, region.trip_count, "candidate duration")
         start = model.NewIntVar(0, horizon, f"start_{candidate_id}")
         end = model.NewIntVar(0, horizon, f"end_{candidate_id}")
@@ -291,10 +382,16 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
         ends[candidate_id] = end
         if candidate_id not in merged_geometry_candidates:
             positive_intervals[candidate_id] = model.NewOptionalIntervalVar(
-                start, duration, end, pick_candidates[candidate_id], f"execution_{candidate_id}"
+                start,
+                duration,
+                end,
+                pick_candidates[candidate_id],
+                f"execution_{candidate_id}",
             )
         else:
-            model.Add(end == start + duration).OnlyEnforceIf(pick_candidates[candidate_id])
+            model.Add(end == start + duration).OnlyEnforceIf(
+                pick_candidates[candidate_id]
+            )
         model.Add(start == horizon).OnlyEnforceIf(pick_candidates[candidate_id].Not())
         model.Add(end == 0).OnlyEnforceIf(pick_candidates[candidate_id].Not())
         for input_bucket in candidate.input_bucket_ids:
@@ -311,9 +408,9 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
         if candidate.duration_ns == 0:
             for output_bucket in candidate.output_bucket_ids:
                 if candidate.input_bucket_ids:
-                    model.Add(ready[output_bucket] == ready[candidate.input_bucket_ids[0]]).OnlyEnforceIf(
-                        present
-                    )
+                    model.Add(
+                        ready[output_bucket] == ready[candidate.input_bucket_ids[0]]
+                    ).OnlyEnforceIf(present)
             continue
         for output_bucket in candidate.output_bucket_ids:
             model.Add(ready[output_bucket] == ends[candidate_id]).OnlyEnforceIf(present)
@@ -322,16 +419,21 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
     for bucket_id, bucket in problem.buckets.items():
         bucket_type = problem.types[bucket.type_id]
         count = _tensor_mesh_count(bucket_type)
-        if count > problem.topology.size:
-            raise ValueError(f"P3: bucket {bucket_id} count {count} exceeds root topology")
-        offset = model.NewIntVar(0, problem.topology.size - count, f"offset_{bucket_id}")
+        if count > extent:
+            raise PartitionSolveError(
+                f"bucket {bucket_id} count {count} exceeds topology extent {extent}"
+            )
+        offset = model.NewIntVar(0, extent - count, f"offset_{bucket_id}")
         offsets[bucket_id] = offset
         fixed_offset = bucket.fixed_offset
         if fixed_offset is None:
             fixed_offset = _mesh_offset(bucket_type)
         if fixed_offset is not None:
-            if not 0 <= fixed_offset <= problem.topology.size - count:
-                raise ValueError(f"P3: bucket {bucket_id} fixed offset is outside topology")
+            if not 0 <= fixed_offset <= extent - count:
+                raise PartitionSolveError(
+                    f"bucket {bucket_id} fixed offset {fixed_offset} is outside "
+                    f"topology extent {extent}"
+                )
             model.Add(offset == fixed_offset).OnlyEnforceIf(pick_buckets[bucket_id])
 
     region_starts: dict[int, cp_model.IntVar] = {
@@ -343,7 +445,8 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
         for region_id in problem.regions
     }
     region_members = {
-        region_id: _descendant_regions(problem, region_id) for region_id in problem.regions
+        region_id: _descendant_regions(problem, region_id)
+        for region_id in problem.regions
     }
     for region_id, region in problem.regions.items():
         members = region_members[region_id]
@@ -353,19 +456,24 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
             if candidate_region in members and candidate_id in starts
         ]
         child_regions = [
-            child_id for child_id, child in problem.regions.items()
+            child_id
+            for child_id, child in problem.regions.items()
             if child.parent_region_id == region_id
         ]
         starts_for_min = [starts[candidate_id] for candidate_id in member_candidates]
         starts_for_min.extend(
-            region_starts[child_id] for child_id in child_regions if child_id in region_starts
+            region_starts[child_id]
+            for child_id in child_regions
+            if child_id in region_starts
         )
         ends_for_max = [ends[candidate_id] for candidate_id in member_candidates]
         ends_for_max.extend(
             region_ends[child_id] for child_id in child_regions if child_id in region_ends
         )
         if not starts_for_min or not ends_for_max:
-            raise ValueError(f"P3: GridRegion {region_id} has no positive-duration work")
+            raise PartitionSolveError(
+                f"GridRegion {region_id} has no positive-duration work"
+            )
         model.AddMinEquality(region_starts[region_id], starts_for_min)
         model.AddMaxEquality(region_ends[region_id], ends_for_max)
         for carry in region.carry_infos:
@@ -382,7 +490,9 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
                     left_bucket = left_by_type[type_id]
                     right_bucket = right_by_type[type_id]
                     model.Add(pick_buckets[left_bucket] == pick_buckets[right_bucket])
-                    model.Add(offsets[left_bucket] == offsets[right_bucket]).OnlyEnforceIf(
+                    model.Add(
+                        offsets[left_bucket] == offsets[right_bucket]
+                    ).OnlyEnforceIf(
                         [pick_buckets[left_bucket], pick_buckets[right_bucket]]
                     )
         for carry in region.carry_infos:
@@ -397,11 +507,13 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
         candidate_region = problem.candidate_enclosing_regions.get(candidate_id)
         for bucket_id in candidate.input_bucket_ids:
             result_region = result_regions.get(problem.buckets[bucket_id].value_id)
-            if result_region is None or candidate_region in _descendant_regions(problem, result_region):
+            if result_region is None or candidate_region in _descendant_regions(
+                problem, result_region
+            ):
                 continue
-            model.Add(starts[candidate_id] >= region_ends[result_region]).OnlyEnforceIf(
-                pick_candidates[candidate_id]
-            )
+            model.Add(
+                starts[candidate_id] >= region_ends[result_region]
+            ).OnlyEnforceIf(pick_candidates[candidate_id])
 
     makespan = model.NewIntVar(0, horizon, "makespan")
     makespan_terms = list(ends.values())
@@ -417,23 +529,30 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
         site_start = model.NewIntVar(0, horizon, f"site_start_{site_id}")
         site_end = model.NewIntVar(0, horizon, f"site_end_{site_id}")
         site_duration = model.NewIntVar(0, horizon, f"site_duration_{site_id}")
-        site_offset = model.NewIntVar(0, problem.topology.size, f"site_offset_{site_id}")
-        site_count = model.NewIntVar(1, problem.topology.size, f"site_count_{site_id}")
-        site_offset_end = model.NewIntVar(0, problem.topology.size, f"site_offset_end_{site_id}")
+        site_offset = model.NewIntVar(0, extent, f"site_offset_{site_id}")
+        site_count = model.NewIntVar(1, extent, f"site_count_{site_id}")
+        site_offset_end = model.NewIntVar(0, extent, f"site_offset_end_{site_id}")
         model.Add(site_offset_end == site_offset + site_count)
         for candidate_id in problem.authored_candidates[site_id]:
             candidate = problem.candidates[candidate_id]
             present = pick_candidates[candidate_id]
             model.Add(site_start == starts[candidate_id]).OnlyEnforceIf(present)
             model.Add(site_end == ends[candidate_id]).OnlyEnforceIf(present)
-            model.Add(site_duration == ends[candidate_id] - starts[candidate_id]).OnlyEnforceIf(present)
-            model.Add(site_offset == offsets[candidate.output_bucket_ids[0]]).OnlyEnforceIf(present)
+            model.Add(
+                site_duration == ends[candidate_id] - starts[candidate_id]
+            ).OnlyEnforceIf(present)
+            model.Add(
+                site_offset == offsets[candidate.output_bucket_ids[0]]
+            ).OnlyEnforceIf(present)
             model.Add(site_count == candidate.topology_count).OnlyEnforceIf(present)
-            output_offsets = [offsets[bucket_id] for bucket_id in candidate.output_bucket_ids]
+            output_offsets = [
+                offsets[bucket_id] for bucket_id in candidate.output_bucket_ids
+            ]
             for output_offset in output_offsets[1:]:
                 model.Add(output_offset == output_offsets[0]).OnlyEnforceIf(present)
             for dependency in (
-                item for item in problem.dependencies
+                item
+                for item in problem.dependencies
                 if item.parent_candidate_id == candidate_id
             ):
                 input_offset = offsets[dependency.child_bucket_id]
@@ -446,10 +565,13 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
                     )
                     model.Add(input_offset <= output_offset).OnlyEnforceIf(present)
                     model.Add(
-                        output_offset + candidate.topology_count <= input_offset + input_count
+                        output_offset + candidate.topology_count
+                        <= input_offset + input_count
                     ).OnlyEnforceIf(present)
         time_intervals.append(
-            model.NewIntervalVar(site_start, site_duration, site_end, f"site_execution_{site_id}")
+            model.NewIntervalVar(
+                site_start, site_duration, site_end, f"site_execution_{site_id}"
+            )
         )
         topology_intervals.append(
             model.NewIntervalVar(
@@ -465,36 +587,46 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
             continue
         output_offsets = [offsets[bucket_id] for bucket_id in candidate.output_bucket_ids]
         for output_offset in output_offsets[1:]:
-            model.Add(output_offset == output_offsets[0]).OnlyEnforceIf(pick_candidates[candidate_id])
+            model.Add(output_offset == output_offsets[0]).OnlyEnforceIf(
+                pick_candidates[candidate_id]
+            )
         if _is_view(candidate) and candidate.input_bucket_ids:
             for output_offset in output_offsets:
-                model.Add(output_offset == offsets[candidate.input_bucket_ids[0]]).OnlyEnforceIf(
-                    pick_candidates[candidate_id]
-                )
+                model.Add(
+                    output_offset == offsets[candidate.input_bucket_ids[0]]
+                ).OnlyEnforceIf(pick_candidates[candidate_id])
         if candidate.input_bucket_ids:
             for dependency in (
-                item for item in problem.dependencies
+                item
+                for item in problem.dependencies
                 if item.parent_candidate_id == candidate_id
             ):
                 input_offset = offsets[dependency.child_bucket_id]
                 output_offset = output_offsets[0]
                 if dependency.placement_relation == "SAME_INTERVAL":
-                    model.Add(input_offset == output_offset).OnlyEnforceIf(pick_candidates[candidate_id])
+                    model.Add(input_offset == output_offset).OnlyEnforceIf(
+                        pick_candidates[candidate_id]
+                    )
                 elif dependency.placement_relation == "CONTAINED":
                     input_count = _tensor_mesh_count(
                         problem.types[problem.buckets[dependency.child_bucket_id].type_id]
                     )
-                    model.Add(input_offset <= output_offset).OnlyEnforceIf(pick_candidates[candidate_id])
+                    model.Add(input_offset <= output_offset).OnlyEnforceIf(
+                        pick_candidates[candidate_id]
+                    )
                     model.Add(
-                        output_offset + candidate.topology_count <= input_offset + input_count
+                        output_offset + candidate.topology_count
+                        <= input_offset + input_count
                     ).OnlyEnforceIf(pick_candidates[candidate_id])
-        topology_interval = model.NewOptionalIntervalVar(
-            output_offsets[0], candidate.topology_count,
-            output_offsets[0] + candidate.topology_count,
-            pick_candidates[candidate_id],
-            f"topology_{candidate_id}",
+        topology_intervals.append(
+            model.NewOptionalIntervalVar(
+                output_offsets[0],
+                candidate.topology_count,
+                output_offsets[0] + candidate.topology_count,
+                pick_candidates[candidate_id],
+                f"topology_{candidate_id}",
+            )
         )
-        topology_intervals.append(topology_interval)
         time_intervals.append(positive_intervals[candidate_id])
     if time_intervals:
         model.AddNoOverlap2D(time_intervals, topology_intervals)
@@ -502,7 +634,8 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
     for region_id, region in problem.regions.items():
         parent_region = region.parent_region_id
         direct_candidates = [
-            candidate_id for candidate_id, candidate_region in problem.candidate_enclosing_regions.items()
+            candidate_id
+            for candidate_id, candidate_region in problem.candidate_enclosing_regions.items()
             if candidate_region == parent_region and candidate_id in starts
         ]
         for candidate_id in direct_candidates:
@@ -515,19 +648,23 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
                 [present, before]
             )
         sibling_regions = [
-            other_id for other_id, other in problem.regions.items()
+            other_id
+            for other_id, other in problem.regions.items()
             if other.parent_region_id == parent_region and other_id != region_id
         ]
         for other_id in sibling_regions:
             if other_id < region_id:
                 continue
             before = model.NewBoolVar(f"region_{region_id}_before_{other_id}")
-            model.Add(region_ends[region_id] <= region_starts[other_id]).OnlyEnforceIf(before)
-            model.Add(region_ends[other_id] <= region_starts[region_id]).OnlyEnforceIf(before.Not())
+            model.Add(region_ends[region_id] <= region_starts[other_id]).OnlyEnforceIf(
+                before
+            )
+            model.Add(region_ends[other_id] <= region_starts[region_id]).OnlyEnforceIf(
+                before.Not()
+            )
 
     bandwidth_intervals: list[cp_model.IntervalVar] = []
     bandwidth_demands: list[int] = []
-    device = problem.module.resolve_target().device
 
     def add_bandwidth_group(candidate_ids: list[int], demand: int, label: str) -> None:
         literals = [pick_candidates[candidate_id] for candidate_id in candidate_ids]
@@ -542,13 +679,19 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
         end = model.NewIntVar(0, horizon, f"bandwidth_end_{label}")
         duration = model.NewIntVar(0, horizon, f"bandwidth_duration_{label}")
         for candidate_id in candidate_ids:
-            model.Add(start == starts[candidate_id]).OnlyEnforceIf(pick_candidates[candidate_id])
-            model.Add(end == ends[candidate_id]).OnlyEnforceIf(pick_candidates[candidate_id])
+            model.Add(start == starts[candidate_id]).OnlyEnforceIf(
+                pick_candidates[candidate_id]
+            )
+            model.Add(end == ends[candidate_id]).OnlyEnforceIf(
+                pick_candidates[candidate_id]
+            )
             model.Add(
                 duration == ends[candidate_id] - starts[candidate_id]
             ).OnlyEnforceIf(pick_candidates[candidate_id])
         bandwidth_intervals.append(
-            model.NewOptionalIntervalVar(start, duration, end, active, f"bandwidth_{label}")
+            model.NewOptionalIntervalVar(
+                start, duration, end, active, f"bandwidth_{label}"
+            )
         )
         bandwidth_demands.append(demand)
 
@@ -559,29 +702,30 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
             if candidate_id not in starts or candidate.hbm_demand_bytes_per_ns <= 0:
                 continue
             demand = (
-                math.ceil(device.hbm_bandwidth_bytes_per_second / 1_000_000_000)
+                bandwidth_per_ns
                 if _is_reshard(candidate)
                 else candidate.hbm_demand_bytes_per_ns
             )
             groups.setdefault(demand, []).append(candidate_id)
         for demand, candidate_ids in sorted(groups.items()):
-            add_bandwidth_group(candidate_ids, demand, f"site_{site_id}_demand_{demand}")
+            add_bandwidth_group(
+                candidate_ids, demand, f"site_{site_id}_demand_{demand}"
+            )
 
     for candidate_id, candidate in problem.candidates.items():
         if candidate.site_id is not None or candidate_id not in starts:
             continue
         if candidate.hbm_demand_bytes_per_ns <= 0:
             continue
-        demand = math.ceil(device.hbm_bandwidth_bytes_per_second / 1_000_000_000)
-        add_bandwidth_group([candidate_id], demand, f"candidate_{candidate_id}")
-    if bandwidth_intervals:
-        model.AddCumulative(
-            bandwidth_intervals,
-            bandwidth_demands,
-            math.ceil(device.hbm_bandwidth_bytes_per_second / 1_000_000_000),
+        add_bandwidth_group(
+            [candidate_id], bandwidth_per_ns, f"candidate_{candidate_id}"
         )
+    if bandwidth_intervals:
+        model.AddCumulative(bandwidth_intervals, bandwidth_demands, bandwidth_per_ns)
 
-    _add_capacity_resource(problem, model, pick_candidates, pick_buckets, starts, ends, makespan, horizon)
+    _add_capacity_resource(
+        problem, model, pick_buckets, starts, ends, makespan, horizon
+    )
     return _CpModelState(
         model=model,
         pick_candidates=pick_candidates,
@@ -597,15 +741,15 @@ def _build_model(problem: PlanningProblem) -> _CpModelState:
 
 
 def _add_capacity_resource(
-    problem: PlanningProblem,
+    problem: PartitionProblem,
     model: cp_model.CpModel,
-    pick_candidates: dict[int, cp_model.IntVar],
     pick_buckets: dict[int, cp_model.IntVar],
     starts: dict[int, cp_model.IntVar],
     ends: dict[int, cp_model.IntVar],
     makespan: cp_model.IntVar,
     horizon: int,
 ) -> None:
+    """Charge each allocation group its widest resident type for its lifetime."""
     intervals: list[cp_model.IntervalVar] = []
     demands: list[int] = []
     for group_id, bucket_ids in _allocation_groups(problem):
@@ -619,11 +763,27 @@ def _add_capacity_resource(
         for bucket_id in bucket_ids:
             value_id = problem.buckets[bucket_id].value_id
             if problem.values[value_id].producer_site_id is None:
-                start_terms.append(_constant_or_selected(model, 0, pick_buckets[bucket_id], horizon,
-                                                         f"source_start_{bucket_id}", default=horizon))
+                start_terms.append(
+                    _constant_or_selected(
+                        model,
+                        0,
+                        pick_buckets[bucket_id],
+                        horizon,
+                        f"source_start_{bucket_id}",
+                        default=horizon,
+                    )
+                )
             if problem.values[value_id].is_const:
-                start_terms.append(_constant_or_selected(model, 0, pick_buckets[bucket_id], horizon,
-                                                         f"constant_start_{bucket_id}", default=horizon))
+                start_terms.append(
+                    _constant_or_selected(
+                        model,
+                        0,
+                        pick_buckets[bucket_id],
+                        horizon,
+                        f"constant_start_{bucket_id}",
+                        default=horizon,
+                    )
+                )
             for candidate_id, candidate in problem.candidates.items():
                 if bucket_id in candidate.output_bucket_ids and candidate_id in starts:
                     start_terms.append(starts[candidate_id])
@@ -638,8 +798,12 @@ def _add_capacity_resource(
                 end_terms.append(final_end)
             if problem.values[value_id].is_const:
                 constant_end = model.NewIntVar(0, horizon, f"constant_end_{bucket_id}")
-                model.Add(constant_end == makespan).OnlyEnforceIf(pick_buckets[bucket_id])
-                model.Add(constant_end == 0).OnlyEnforceIf(pick_buckets[bucket_id].Not())
+                model.Add(constant_end == makespan).OnlyEnforceIf(
+                    pick_buckets[bucket_id]
+                )
+                model.Add(constant_end == 0).OnlyEnforceIf(
+                    pick_buckets[bucket_id].Not()
+                )
                 end_terms.append(constant_end)
         if not start_terms:
             start_terms.append(model.NewConstant(0))
@@ -652,16 +816,24 @@ def _add_capacity_resource(
         model.AddMaxEquality(maximum_end, end_terms)
         model.Add(allocation_size == maximum_end - minimum_start).OnlyEnforceIf(active)
         model.Add(allocation_size == 0).OnlyEnforceIf(active.Not())
-        interval = model.NewOptionalIntervalVar(
-            minimum_start, allocation_size, maximum_end, active,
-            f"allocation_{group_id}",
+        intervals.append(
+            model.NewOptionalIntervalVar(
+                minimum_start,
+                allocation_size,
+                maximum_end,
+                active,
+                f"allocation_{group_id}",
+            )
         )
-        intervals.append(interval)
-        type_values = [problem.types[problem.buckets[bucket_id].type_id] for bucket_id in bucket_ids]
-        byte_counts = [tensor_bytes(type) for type in type_values if isinstance(type, TensorType)]
+        type_values = [
+            problem.types[problem.buckets[bucket_id].type_id] for bucket_id in bucket_ids
+        ]
+        byte_counts = [
+            tensor_bytes(type) for type in type_values if isinstance(type, TensorType)
+        ]
         demands.append(max(byte_counts, default=0))
     if intervals:
-        model.AddCumulative(intervals, demands, problem.module.resolve_target().device.hbm_capacity_bytes)
+        model.AddCumulative(intervals, demands, problem.facts.memory_capacity_bytes)
 
 
 def _constant_or_selected(
@@ -680,23 +852,31 @@ def _constant_or_selected(
 
 
 def _decode(
-    problem: PlanningProblem,
+    problem: PartitionProblem,
     state: _CpModelState,
     solver: cp_model.CpSolver,
     status: int,
-) -> PlanningSolution:
+) -> PartitionSolution:
     selected_candidates = tuple(
-        candidate_id for candidate_id in sorted(problem.candidates)
+        candidate_id
+        for candidate_id in sorted(problem.candidates)
         if solver.Value(state.pick_candidates[candidate_id])
     )
     selected_buckets = tuple(
-        bucket_id for bucket_id in sorted(problem.buckets)
+        bucket_id
+        for bucket_id in sorted(problem.buckets)
         if solver.Value(state.pick_buckets[bucket_id])
     )
     intervals = tuple(
-        (candidate_id, ExecutionInterval(solver.Value(state.starts[candidate_id]),
-                                          solver.Value(state.ends[candidate_id])))
-        for candidate_id in selected_candidates if candidate_id in state.starts
+        (
+            candidate_id,
+            ExecutionInterval(
+                solver.Value(state.starts[candidate_id]),
+                solver.Value(state.ends[candidate_id]),
+            ),
+        )
+        for candidate_id in selected_candidates
+        if candidate_id in state.starts
     )
     offsets = tuple(
         (bucket_id, solver.Value(state.offsets[bucket_id]))
@@ -704,16 +884,34 @@ def _decode(
     )
     makespan = solver.Value(state.makespan)
     if status == cp_model.OPTIMAL:
-        return PlanningSolution("OPTIMAL", selected_candidates, selected_buckets, intervals,
-                                offsets, makespan, makespan, 0.0)
+        return PartitionSolution(
+            "OPTIMAL",
+            selected_candidates,
+            selected_buckets,
+            intervals,
+            offsets,
+            makespan,
+            makespan,
+            0.0,
+        )
     best_bound = math.floor(solver.BestObjectiveBound())
     best_bound = max(0, min(best_bound, makespan))
     gap = (makespan - best_bound) / max(makespan, 1)
-    return PlanningSolution("FEASIBLE_NOT_PROVEN", selected_candidates, selected_buckets,
-                            intervals, offsets, makespan, best_bound, gap)
+    return PartitionSolution(
+        "FEASIBLE_NOT_PROVEN",
+        selected_candidates,
+        selected_buckets,
+        intervals,
+        offsets,
+        makespan,
+        best_bound,
+        gap,
+    )
 
 
-def _write_failure(options: ScheduleOptions, problem: PlanningProblem, error: Exception) -> None:
+def _write_failure(
+    options: ScheduleOptions, problem: PartitionProblem, error: Exception
+) -> None:
     if options.debug_dump_dir is None:
         return
     options.debug_dump_dir.mkdir(parents=True, exist_ok=True)
@@ -721,16 +919,17 @@ def _write_failure(options: ScheduleOptions, problem: PlanningProblem, error: Ex
         "error": str(error),
         "root": problem.root.name,
         "status": type(error).__name__,
-        "target": problem.module.resolve_target().name,
+        "target": problem.facts.spec.device_id,
     }
     (options.debug_dump_dir / "solve_failure.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n"
     )
 
 
-def solve_planning_problem(problem: PlanningProblem, options: ScheduleOptions) -> PlanningSolution:
-    """Build and solve one private makespan CP-SAT model."""
-    state: _CpModelState | None = None
+def solve_partition_problem(
+    problem: PartitionProblem, options: ScheduleOptions
+) -> PartitionSolution:
+    """Build and solve one makespan model over an already-closed problem."""
     try:
         state = _build_model(problem)
         state.model.Minimize(state.makespan)
@@ -740,25 +939,30 @@ def solve_planning_problem(problem: PlanningProblem, options: ScheduleOptions) -
         solver.parameters.random_seed = options.random_seed
         status = solver.Solve(state.model)
         if status == cp_model.INFEASIBLE:
-            raise ValueError(
-                f"P3: infeasible CTA blueprint for root {problem.root.name!r} "
-                f"on target {problem.module.resolve_target().name!r}"
+            raise PartitionSolveError(
+                f"no feasible partition for root {problem.root.name!r} at "
+                f"topology {problem.topology.name!r} on {problem.facts.spec.device_id}"
             )
         if status == cp_model.MODEL_INVALID:
-            raise RuntimeError("P3: OR-Tools reported an invalid planning model")
+            raise PartitionSolveError("the solver reported an invalid partition model")
         if status == cp_model.UNKNOWN:
-            raise RuntimeError(
-                f"P3: CP-SAT returned UNKNOWN without an incumbent for root {problem.root.name!r}"
+            raise PartitionSolveError(
+                f"the solver returned no incumbent for root {problem.root.name!r} "
+                "within its time limit"
             )
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            raise RuntimeError(f"P3: unexpected CP-SAT status {solver.StatusName(status)}")
-        solution = _decode(problem, state, solver, status)
-        if options.debug_dump_dir is not None:
-            write_debug_dumps(problem, solution, options.debug_dump_dir)
-        return solution
+            raise PartitionSolveError(
+                f"unexpected solver status {solver.StatusName(status)}"
+            )
+        return _decode(problem, state, solver, status)
     except (ValueError, RuntimeError) as error:
         _write_failure(options, problem, error)
         raise
 
 
-__all__ = ["ExecutionInterval", "PlanningSolution", "solve_planning_problem"]
+__all__ = [
+    "ExecutionInterval",
+    "PartitionSolution",
+    "PartitionSolveError",
+    "solve_partition_problem",
+]

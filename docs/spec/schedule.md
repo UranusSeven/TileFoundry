@@ -154,6 +154,33 @@ class SchedulePlan:
   - A Plan that does not hold together MUST raise `PlanVerificationError` and MUST
     NOT reach the caller.
 
+Which hardware documents a decision was made against is the same question
+whatever was decided, so every Plan states it the same way.
+
+```python
+class TargetSpecRef:
+    """Stable identity of the installed target facts one plan relies on.
+
+    Attributes:
+        architecture_id: attribute; Installed architecture document ID, or the architecture's own name.
+        architecture_digest: attribute; Content digest of that document, empty when none was installed.
+        device_id: attribute; Installed device document ID, or the device's own name.
+        device_digest: attribute; Content digest of that document, empty when none was installed.
+    """
+
+    architecture_id: str
+    architecture_digest: str
+    device_id: str
+    device_digest: str
+```
+
+- constraints:
+  - The structure MUST be immutable and MUST be shared by every Plan that names
+    the hardware it relied on, so two plans cannot describe the same target
+    differently.
+  - A Target constructed directly rather than installed from documents MUST state
+    an empty digest rather than a fabricated one.
+
 ### 2.4 `PipelineSchedulePlan`
 
 ```python
@@ -180,66 +207,143 @@ class PipelineSchedulePlan(SchedulePlan):
   - Plan construction MUST finish Target Facts projection before creating the
     closed problem. The problem and solve MUST hold no Target object or callback.
 
-### 2.5 `ScheduleReport`
+### 2.5 `PartitionSchedulePlan`
 
-`ScheduleReport` is the reusable objective summary: the part of an answer that
-does not depend on what was decided. An algorithm whose Plan states an objective
-carries one of these rather than restating the same fields in its own vocabulary.
-Algorithm-private operation rows, use decisions, candidate costs, and
-solver-native models are not report fields.
+A partition plan states where each value was placed, which operations run over
+which placements, and what the solve proved. It names both by identities derived
+from the authored program rather than by the indexes its own problem allocated, so
+an agent reading the plan can find what it refers to in the program it wrote.
 
 ```python
-class ScheduleReport:
-    """Summarize the selected objective and proof state.
+class PositionInterval:
+    """The half-open range of parallel positions something occupies.
 
     Attributes:
-        root: attribute; Scheduled Function name.
-        target: attribute; Resolved Target name.
-        topology: attribute; The topology level the result was produced at.
-        status: attribute; Public solution status.
-        objective_name: attribute; Primary objective name.
-        unit: attribute; Unit of the primary objective and bound.
-        selected: attribute; Selected primary-objective value.
-        best_bound: attribute; Integer lower bound for the makespan objective.
-        gap: attribute; Relative optimality gap for the makespan objective.
+        start: attribute; First position occupied.
+        end: attribute; One past the last position occupied.
     """
 
-    root: str
-    target: str
-    topology: str
+    start: int
+    end: int
+
+class TimeInterval:
+    """One operation's half-open execution interval.
+
+    Attributes:
+        start_ns: attribute; Start of the interval, in ns.
+        end_ns: attribute; One past the end of the interval, in ns.
+    """
+
+    start_ns: int
+    end_ns: int
+
+class PlacedValue:
+    """One tensor value, the type it was placed in, and who touches it.
+
+    Attributes:
+        id: attribute; Stable identity of this placement, derived from the program.
+        type: attribute; The ordinary IR Type selected for it, carrying its layout and storage.
+        producer_id: attribute; The operation that produces it, or None when the plan produces none.
+        consumer_ids: attribute; Every operation that reads it.
+        positions: attribute; The positions this placement occupies.
+    """
+
+    id: str
+    type: Type
+    producer_id: str | None
+    consumer_ids: tuple[str, ...]
+    positions: PositionInterval
+
+class PartitionedOperation:
+    """One operation that runs, where it runs, and when.
+
+    Attributes:
+        id: attribute; Stable identity of this operation, derived from the program.
+        operation: attribute; The operation's own kind.
+        synthesized: attribute; True when the algorithm introduced it rather than the author.
+        input_ids: attribute; The placements it reads.
+        output_ids: attribute; The placements it produces.
+        positions: attribute; The positions it occupies, or None when it occupies none.
+        interval: attribute; Its execution interval, or None when the model gives it none.
+    """
+
+    id: str
+    operation: str
+    synthesized: bool
+    input_ids: tuple[str, ...]
+    output_ids: tuple[str, ...]
+    positions: PositionInterval | None
+    interval: TimeInterval | None
+
+class PartitionProof:
+    """What the solve proved about its own objective.
+
+    Attributes:
+        status: attribute; Whether optimality was proven or only feasibility reached.
+        objective_ns: attribute; The selected makespan, in ns.
+        best_bound_ns: attribute; The bound the solve established, in ns.
+        proven_optimal: attribute; True when the two met.
+    """
+
     status: Literal["OPTIMAL", "FEASIBLE_NOT_PROVEN"]
-    objective_name: Literal["makespan"]
-    unit: Literal["ns"]
-    selected: int
-    best_bound: int
-    gap: float
+    objective_ns: int
+    best_bound_ns: int
+    proven_optimal: bool
 
-    def to_json(self) -> str: ...
+class PartitionSchedulePlan(SchedulePlan):
+    """The placement one partition solve committed to, and its proof."""
 
-    def to_markdown(self) -> str: ...
+    topology: str
+    extent: int
+    target: TargetSpecRef
+    values: tuple[PlacedValue, ...]
+    operations: tuple[PartitionedOperation, ...]
+    root_results: tuple[str, ...]
+    proof: PartitionProof
 ```
 
 - constraints:
-  - The structure MUST be immutable.
-  - `selected`, `best_bound`, and `gap` MUST describe the one `makespan`
-    objective in `ns`.
-  - `objective_name` is a fixed literal: every algorithm that reports an
-    objective reports the same one quantity, and the field names it rather than
-    selecting it.
-  - The reported value MUST NOT be read as a proof that a solver optimised it. An
-    algorithm MAY minimize the makespan as a solver objective, and an algorithm
-    MAY instead compute it after the fact — as the nominal roofline estimate of
-    the decisions it recorded (§5.1). `status`, `best_bound` and `gap` are what
-    distinguish the two: an algorithm that did not prove optimality MUST NOT
-    report `selected` as its own bound.
-  - A feasible incumbent MUST be reportable even when optimality is unproven.
-  - JSON and Markdown rendering MUST contain every public field and MUST NOT
-    expose algorithm-private solve state.
-  - When the report summarizes a CTA execution blueprint, its selected value
-    describes the modeled plan and MUST NOT be interpreted as a guarantee that
-    current lowering preserves the planned intervals, reserves physical SM
-    shares, promotes values to SRAM or registers, or proves runtime performance
-    or out-of-memory safety.
+  - Every structure MUST be immutable, and the plan MUST state the level it
+    decided about, how many positions of it there were, and the identity of the
+    installed documents it decided against.
+  - An identity MUST be derived from the authored program and MUST be unique
+    within the plan. One value MAY hold more than one placement at once -- that is
+    what a Reshard connects -- so a placement, not a value, is what an identity
+    names.
+  - `PlacedValue.type` MUST be the ordinary IR Type that was selected, so the
+    layout and storage a value was placed in are read off the type system rather
+    than restated in a parallel vocabulary.
+  - An operation the algorithm synthesized MUST appear among `operations`, marked
+    as synthesized, with the placements it moves between. There MUST be no
+    separate route, report, or debug channel through which a caller would learn
+    that data moves.
+  - An operation charged as traffic rather than as occupancy MUST state no
+    position range. Giving it one would claim it excludes other work from those
+    positions, which the decision does not.
+  - `proof` MUST state the objective, the bound the solve established, and whether
+    the two met. It is a result fact and MUST NOT become a generic report facade.
+  - An edge MUST be named the same way from both of its ends: a placement's
+    producer MUST list that placement among its outputs, its consumers MUST list
+    it among their inputs, and every operation's outputs and inputs MUST be
+    reflected back by the placements they name. An edge only one end claims is a
+    claim about a decision nobody made, and a walk that followed it would report a
+    program flow the operations do not implement.
+  - `verify` MUST reject: a level or extent other than the one the plan decided;
+    two placements or two operations sharing an identity; a reference to a
+    placement or operation the plan does not carry; an edge whose two ends
+    disagree; a placement in a type that is not addressable global memory; a synthesized move between two placements that
+    are different logical tensors or that are identical; a position range outside
+    the level; an interval that ends before it starts; two operations holding the
+    same position at the same time; a root result the plan does not carry or
+    cannot reach by following producers; and a bound above the stated objective.
+    It MUST do all of that without rebuilding candidates and without invoking a
+    solver.
+  - JSON and text rendering MUST be deterministic and MUST state the same
+    placements, operations, intervals, and proof.
+  - A solver variable or solver-native value MUST NOT appear in the exported plan.
+  - The plan MUST NOT carry a rewritten program, and producing it MUST NOT rewrite
+    one: a partition decides where work and its tensors go, and applying that
+    decision to HIR is a separate operation the caller asks for.
 
 ## 3. Constraint metadata
 
@@ -279,16 +383,14 @@ decisions, and they do not register a scheduling algorithm for a `CudaTarget`.
 
 ## 4. Kernel schedule construction
 
-An algorithm composes its solve from three stages over one
+An algorithm composes its solve from these stages over one
 `TileGraph` ([analysis §1.2](./analysis.md#12-tilegraph)). Each takes the graph
 and returns it enriched; none of them re-derives a fact the analysis layer
 already states.
 
 ```text
-extract(root)  ──▶  build_schedule_tree  ──▶  select_atoms  ──▶  emit_scaffold
-  (analysis)          tg.tree                 tg.tree tiled       Skeleton
-                                              tg.ring             Swimlane
-                                              tg.decisions        HoleContract...
+extract(root)  ──▶  build_schedule_tree  ──▶  emit_scaffold
+  (analysis)          tg.tree                 Skeleton / Swimlane / HoleContract
 ```
 
 Each stage lives in its own module of the `schedule` package and is imported
@@ -298,7 +400,6 @@ operation and its results only.
 | Stage | Signature | Error |
 |---|---|---|
 | tree construction | `build_schedule_tree(tg: TileGraph) -> TileGraph` | `KernelScheduleError` |
-| atom selection | `select_atoms(tg: TileGraph, target, stage="cta") -> TileGraph` | `AtomSelectionError` |
 | scaffold emission | `emit_scaffold(tg: TileGraph) -> tuple[Skeleton, Swimlane, list[HoleContract]]` | `EmitScaffoldError` |
 
 ### 4.1 Tree construction
@@ -345,81 +446,7 @@ class KernelScheduleError(RuntimeError):
   - `tile_bands` MUST tile every band by its own statement's sizes and MUST
     raise for a statement with no decided size.
 
-### 4.2 Atom selection
-
-`select_atoms` is the one real decision of this layer. Every operation carries
-its own extent and that extent **is** its tile: what the author wrote is what one
-hole computes, so no tile size is searched. The single choice per statement is
-which candidate atom granularises it; everything else is measured off `tg` and
-the scheduling facts projected for that stage (§5.2).
-
-```python
-def select_atoms(tg: TileGraph, target: "Target | str", stage: str = "cta") -> TileGraph: ...
-
-class AtomSelectionError(RuntimeError):
-    """A TileGraph consistency precondition that did not hold, or a stage that exposes no fact to decide on."""
-```
-
-- constraints:
-  - `tg` MUST already carry a tree from `build_schedule_tree`; `tg.tree is None`
-    or an empty `tg.units` MUST raise `AtomSelectionError`.
-  - The facts MUST be read off the untiled tree: one band per statement, and one
-    band member per own domain dimension. A band that schedules anything other
-    than its statement's own dimensions in order, a band count that does not
-    match the statement count, or a `tg.parallel_dims` entry whose flag count
-    does not match the statement's rank, MUST raise.
-  - The target MUST be named by the caller. There MUST be no default-Target
-    fallback: which atoms are candidates and how wide a tile may be are
-    properties of one machine, so a call that names none asks for decisions
-    nobody specified.
-  - The scheduling facts MUST be projected from the resolved target at the
-    requested stage. A stage the target does not schedule, or one whose
-    `tile_capacity_bytes` is not positive, MUST raise `AtomSelectionError`
-    rather than let the projection failure escape.
-  - An op the target's catalogue does not cover MUST be downgraded to "no
-    candidates" rather than abort the run.
-  - The pick MUST be the first candidate the catalogue's own hard filter left,
-    and every survivor MUST also be recorded: no cost model ranks two candidates
-    at this stage.
-  - An atom's shape MUST align to the **trailing** dimensions of the statement's
-    domain; the leading dimensions take extent `1`. An atom shape wider than the
-    domain's rank MUST raise.
-  - Placement MUST be derived, never solved: a statement's dependence-free
-    dimensions are the ones spread over lanes, and a statement with none is
-    serial.
-  - One buffer's ring depth MUST be measured, not searched for: a dependence
-    carried `distance` iterations along a dimension tiled `tile` wide spans
-    `ceil(distance / tile)` tiles, and the ring holds one slot more so the older
-    tile stays alive. The depth MUST be the maximum over every statement holding
-    that buffer, and at least `1`.
-  - A buffer's recorded footprint MUST count each buffer dimension once, at the
-    widest extent any access of that statement needs there, multiplied by the
-    buffer's ring depth.
-  - Capacity MUST be recorded against that footprint, never enforced: exceeding
-    it MUST be reported as a flag on the statement and MUST NOT raise. A tile
-    too wide for its store still has a schedule, only a worse one.
-  - Durations MUST be recorded in integer duration units of one thousandth of a
-    nanosecond, with one atom instance's estimate floored at one unit: a
-    statement's nominal time is a sum over its instances, so recording whole
-    nanoseconds would quantise every atom to the same value. A statement with no
-    candidate atom MUST instead be charged its own domain volume at a nominal one
-    nanosecond per element — its only "how much work" signal is its extent.
-  - The recorded timeline MUST be a prefix sum over `tg.units` order, and every
-    dependence isl reports between two distinct statements MUST run with that
-    order; one that contradicts it MUST raise.
-  - `select_atoms` MUST return `tg` with `tree` tiled by each statement's own
-    extents, `ring` filled per buffer, and `decisions` recorded. Recorded
-    decisions MUST cover, per statement: the picked atom and every candidate, the
-    derived placement, the tile extents and tile count, the atom instance count,
-    the nominal duration and its start and end on the timeline, the per-buffer
-    footprint in bytes, and whether that footprint fits the capacity. Recorded
-    decisions MUST also carry the overall status, the makespan, the capacity, and
-    the ring depths.
-  - The status MUST record that the decision space is a single point per
-    statement: with one candidate order and one tile per statement, the recorded
-    decisions are optimal by construction.
-
-### 4.3 Scaffold emission
+### 4.2 Scaffold emission
 
 `emit_scaffold` renders the decided tree into what an authoring agent fills: a
 holed loop nest, a human-readable swimlane, and one hole contract per statement.
@@ -513,13 +540,21 @@ class EmitScaffoldError(RuntimeError):
 
 ## 5. Scheduling facts
 
-The polyhedral model is target-independent; the atom catalogue and the store a
-tile lives in are not. That store belongs to the **level**, not to the device: a
-tile at the AMX `core` level lives in that core's L1d, one at the CUDA `cta`
-level in shared memory. Both are obtained by projecting the Target
-([target §11](./target.md#11-target-facts-projection)), so an algorithm names
-the facts it needs and never calls into a target through an object whose shape it
-must know.
+The polyhedral model is target-independent; the atom catalogue, the rates work is
+charged at, and the store a tile lives in are not. Each algorithm family declares
+the facts it needs as its own aggregate, so what one family asks for cannot become
+a shared vocabulary another family has to satisfy. All of them are obtained by
+projecting the Target ([target §11](./target.md#11-target-facts-projection)), so
+an algorithm names the facts it needs and never calls into a target through an
+object whose shape it must know.
+
+The level an algorithm is asked about and the level whose store bounds it need not
+be the same one, and a projection MUST NOT collapse them. An AMX core both runs
+the work and owns the L1d its tile lives in. A CUDA pipeline is asked about
+`thread`, because what it decides is how the threads of one CTA overlap their
+work, but the store they cooperate in is shared memory, which is a CTA-scoped
+resource: reporting that capacity as a per-thread number would claim a limit no
+hardware publishes.
 
 ### 5.1 `AtomFact`
 
@@ -561,60 +596,54 @@ class AtomFact:
   - `atom` MUST be the realized descriptor a later fill or codegen stage needs,
     so that stage never re-resolves it from `shape` / `dtype`.
 
-### 5.2 `TileStoreFacts` and `AtomCandidateFacts`
+### 5.2 `PartitionFacts`
 
 ```python
-class TileStoreFacts:
-    """The store a tile of one scheduled level occupies.
+class PartitionFactsQuery:
+    """The one topology level a projection is asked to describe.
 
     Attributes:
-        stage: attribute; The topology level this capacity belongs to.
-        tile_capacity_bytes: attribute; Capacity of that level's store.
+        topology: attribute; The level being divided.
     """
 
-    stage: str
-    tile_capacity_bytes: int
+    topology: str
 
-class AtomCandidateQuery:
-    """Which operation's catalogue is being asked for, at which level.
+class PartitionFacts:
+    """All concrete hardware information required to close one partition.
 
     Attributes:
-        stage: attribute; The topology level being scheduled.
-        op: attribute; The HIR Call whose candidates are wanted.
+        topology: attribute; The level being divided.
+        spec: attribute; Identity of the installed documents these numbers came from.
+        parallel_units: attribute; How many positions of that level the plan may occupy.
+        memory_bandwidth_bytes_per_second: attribute; The rate traffic is charged at.
+        memory_capacity_bytes: attribute; The capacity resident bytes are charged against.
+        peak_flops_per_second: attribute; Dense peak rate per compute DType.
     """
 
-    stage: str
-    op: "Call"
+    topology: str
+    spec: TargetSpecRef
+    parallel_units: int
+    memory_bandwidth_bytes_per_second: int
+    memory_capacity_bytes: int
+    peak_flops_per_second: tuple[tuple[DType, int], ...]
 
-class AtomCandidateFacts:
-    """The atoms one target admits for one operation.
-
-    Attributes:
-        candidates: attribute; Those atoms, in the order the target enumerated them.
-    """
-
-    candidates: tuple[AtomFact, ...]
+    def peak_flops(self, dtype: DType) -> int: ...
 ```
 
 - constraints:
-  - `TileStoreFacts` MUST be queried by stage name and projected once per solve:
-    the capacity is a property of the level and of the hardware, not of any one
-    operation. `tile_capacity_bytes` MUST be the capacity of the store belonging
-    to that level rather than of the whole device, and MUST be positive.
-  - `AtomCandidateFacts` MUST be queried per `(stage, op)` pair and MUST carry
-    only that operation's candidates. Two aggregates rather than one is
-    deliberate: bundling a per-level capacity into a per-operation projection
-    would give one type two meanings depending on how it was asked for.
-  - A projection MUST hard-filter the target's catalogue and MUST NOT rank it:
-    ordering is not a decision made here. The order it returns MUST be the
-    target's own enumeration order, so a consumer that ranks candidates sees the
-    same sequence every run.
-  - An empty `candidates` tuple MUST be a legitimate "no candidate covers this
-    operation" outcome rather than an error, and a projection MAY raise
-    `NotImplementedError` for an operation kind its catalogue does not cover.
-  - A stage the target does not schedule MUST be reported as that, and a
-    consumer MUST surface it as its own scheduling diagnostic rather than let a
-    projection failure escape.
-  - The capacity is a fact to record against a footprint, not a gate: nothing
-    MUST raise because a tile does not fit. A tile wider than its store still has
-    a schedule, only a worse one.
+  - The structure MUST be immutable and MUST contain every numerical fact the
+    closed problem and its solve consume. After it is projected, neither the
+    problem nor the solve MAY hold a Target, follow one through the program, or
+    invoke a projection again.
+  - A capacity MUST be stated once here rather than copied onto each candidate: a
+    candidate states the demand it makes, and what that demand is compared against
+    belongs to the hardware.
+  - A DType the hardware publishes no rate for MUST fail rather than resolve to
+    zero or to a neighbouring rate. Charging work at a rate no document supports
+    would put an unsupported number in the plan.
+  - A level the target does not divide MUST be reported as that, and the algorithm
+    MUST surface it as its own scheduling diagnostic rather than let a projection
+    failure escape.
+  - Compiler policy MUST stay in `ScheduleOptions`, not in these facts: what the
+    hardware is does not depend on how aggressively the compiler was asked to
+    schedule it.
