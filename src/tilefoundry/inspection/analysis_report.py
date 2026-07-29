@@ -27,6 +27,7 @@ from tilefoundry.analysis.registry import ANALYSES
 from tilefoundry.analysis.walk import postorder
 from tilefoundry.ir.core import Call, IRMetadata, binding_name, get_metadata
 from tilefoundry.ir.hir.function import Function
+from tilefoundry.ir.hir.specialize import bound_dims_of, origin_of
 
 
 def _traffic(traffic: tuple[tuple[str, TrafficBytes], ...]) -> dict[str, dict[str, int]]:
@@ -143,17 +144,52 @@ def selected_types(
     return tuple(order)
 
 
+def _same_program(candidate: object, function: object) -> bool:
+    """Whether *candidate* and *function* are the same program at the same size.
+
+    The same object, or two rebuilds of one function at one size: the same
+    recorded origin and the same recorded extents. A rebuild is settled by those
+    two, so they are what is compared.
+
+    The extents are compared because the resulting signature does not imply them.
+    A dimension can occur only in a loop bound or a body operation's attribute,
+    and then two different sizes rebuild into two different programs whose
+    parameters and return type are identical -- so a comparison that read the
+    signature would report measurements of two sizes as one.
+    """
+    if candidate is function:
+        return True
+    origin = origin_of(candidate)
+    if origin is None or origin is not origin_of(function):
+        return False
+    dims = bound_dims_of(candidate)
+    return dims is not None and dims == bound_dims_of(function)
+
+
 def report(results: Sequence[AnalysisResult]) -> dict[str, object]:
-    """One report over every analysis run against one function.
+    """One report over every analysis run against one program.
 
     Only the record types the calls actually wrote are read, so a renderer is
     never sent looking for records that are not there.
+
+    The results have to describe the same program. Usually that is one object,
+    but an analysis asked about a size builds the program at that size, so
+    several analyses at one size hold several rebuilds and share no object.
+    Those are accepted when they were rebuilt from the same function at the same
+    recorded extents. Both are stamped only by the specialiser, so neither can be
+    claimed by something that was not derived, and the extents are compared
+    directly rather than read off the resulting signature -- a dimension occurring
+    only inside the body leaves the signature unchanged at every size.
+
+    Structural equality would be the obvious test and is not available: an
+    operation carries no equality, so two rebuilds of one program are never
+    equal however identical they are.
     """
     if not results:
         raise ValueError("an analysis report needs at least one result")
     first = results[0]
     function = first.function
-    if any(item.function is not function for item in results):
+    if any(not _same_program(item.function, function) for item in results):
         raise ValueError(
             "an analysis report covers one function; these results cover several"
         )
@@ -164,25 +200,76 @@ def report(results: Sequence[AnalysisResult]) -> dict[str, object]:
             if selector not in executed:
                 executed.append(selector)
     target = first.module.resolve_target()
-    calls = []
-    for index, expr in enumerate(postorder(function.body)):
-        if not isinstance(expr, Call):
-            continue
-        records = _records_of(expr, selected)
-        if records:
-            calls.append({"value": _call_label(expr, index), **records})
     data = {
         "target": getattr(target, "name", type(target).__name__),
         "module": first.module.name,
         "function": function.name,
         "requested": [item.analysis for item in results],
         "executed": executed,
-        "function_records": _records_of(function, selected),
-        "calls": calls,
+        "function_records": _merged_function_records(results, selected),
+        "calls": _merged_call_records(results, selected),
     }
     if ComputeCostMetadata in selected:
-        data["totals"] = _work_totals(function)
+        data["totals"] = _work_totals(_costed_function(results))
     return data
+
+
+def _merged_function_records(
+    results: Sequence[AnalysisResult], selected: frozenset
+) -> dict[str, object]:
+    """Every result's own whole-function records, together.
+
+    An analysis records on the program it ran over, and an analysis asked about a
+    size builds that program itself -- so several analyses at one size hold several
+    rebuilds and annotate several objects. Reading one of them would report that one
+    analysis and silently drop the others, which is worse than refusing: the report
+    still names every analysis under `executed`, so the missing conclusions read as
+    analyses that had nothing to say rather than as conclusions nobody collected.
+    """
+    records: dict[str, object] = {}
+    for item in results:
+        records.update(_records_of(item.function, selected))
+    return records
+
+
+def _merged_call_records(
+    results: Sequence[AnalysisResult], selected: frozenset
+) -> list[dict[str, object]]:
+    """Every result's per-Call records, merged by position in the program.
+
+    Position is the correspondence, and it is sound here for the reason the results
+    were accepted at all: they are rebuilds of one program at one set of extents, so
+    they walk in the same order. Two rebuilds share no object, so identity is not
+    available and position is what is left.
+    """
+    labels: dict[int, str] = {}
+    merged: dict[int, dict[str, object]] = {}
+    for item in results:
+        for index, expr in enumerate(postorder(item.function.body)):
+            if not isinstance(expr, Call):
+                continue
+            records = _records_of(expr, selected)
+            if not records:
+                continue
+            merged.setdefault(index, {}).update(records)
+            labels.setdefault(index, _call_label(expr, index))
+    return [{"value": labels[index], **merged[index]} for index in sorted(merged)]
+
+
+def _costed_function(results: Sequence[AnalysisResult]) -> Function:
+    """The rebuild whose Calls carry the work records, for the totals to sum.
+
+    Named rather than assumed to be the first: the totals are the exact sum of those
+    records, so summing over a rebuild that does not carry them would report a
+    program doing no work.
+    """
+    for item in results:
+        if any(
+            get_metadata(expr, ComputeCostMetadata) is not None
+            for expr in postorder(item.function.body)
+        ):
+            return item.function
+    return results[0].function
 
 
 def _work_totals(function: Function) -> dict[str, object]:

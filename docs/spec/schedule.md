@@ -21,6 +21,7 @@ def schedule(
     *,
     topology: str,
     options: ScheduleOptions | None = None,
+    dims: Mapping[str, int] | None = None,
 ) -> ScheduleResult: ...
 ```
 
@@ -28,6 +29,27 @@ def schedule(
   - The caller MUST supply the Module, the Function, and one non-empty topology
     level name. Nothing about the request MAY be inferred from layouts,
     constraints, or the shape of the program.
+  - The Function MUST be one the Module owns: one it declares, or a
+    specialization variant of one it declares
+    ([core-ir §1](./core-ir.md#1-module)). A Function derived by specialising one
+    of these MUST be refused, so that ownership is settled before anything is
+    rebuilt.
+  - `dims` states one extent per dimension the Function declares as a range. A
+    solver places work across a level by counting it and holds a tile against a
+    capacity in bytes, so a Function stating a range MUST be solved at a chosen
+    size rather than as authored.
+  - `dims=None` MUST behave as a call that states no size: the Function is
+    solved as authored.
+  - When `dims` is stated it MUST be non-empty; every key MUST name a dimension
+    the Function declares as a range; every value MUST be an integer inside that
+    dimension's declared bounds; every dimension the Function selects a variant
+    on MUST be given a value; and no dimension MAY remain a range after
+    substitution. Each of these MUST fail with a Schedule domain error. A stated
+    `dims` MUST NOT be silently ignored, including when the Function declares no
+    range at all.
+  - Variant resolution and substitution MUST happen after the ownership check
+    and before the algorithm runs. Exactly one variant MUST cover the stated
+    size; none and more than one MUST both fail.
   - The Target MUST come from `module.resolve_target()`
     ([core-ir §1](./core-ir.md#1-module)); a call MUST NOT override it and MUST
     NOT fall back to a default Target when no Module in the owner chain declares
@@ -79,12 +101,15 @@ class ScheduleOptions:
         timeout_seconds: attribute; Wall-clock budget for the underlying solver.
         workers: attribute; Solver worker count, where zero selects the solver default.
         random_seed: attribute; Deterministic solver tie-break seed.
+        stop_at_first_solution: attribute; Accept the first result satisfying the
+            constraints instead of searching the budget for the best one.
         debug_dump_dir: attribute; Directory for algorithm-private artifacts, or None.
     """
 
     timeout_seconds: float = 60.0
     workers: int = 0
     random_seed: int = 0
+    stop_at_first_solution: bool = False
     debug_dump_dir: Path | None = None
 ```
 
@@ -92,6 +117,13 @@ class ScheduleOptions:
   - The structure MUST be immutable.
   - `debug_dump_dir` MUST affect artifact emission only and MUST NOT change the
     selected result.
+  - `stop_at_first_solution` MUST change which satisfying result is selected and
+    MUST NOT change what counts as one: a result accepted under it MUST satisfy
+    every constraint a result accepted without it satisfies, so a plan obtained
+    this way is verifiable on the same terms.
+  - `stop_at_first_solution` MUST NOT lift `timeout_seconds`. An algorithm that has
+    found no satisfying result yet stays bounded by it, so the option cannot turn a
+    bounded search into an unbounded one.
 
 ### 2.2 `ScheduleResult`
 
@@ -116,10 +148,17 @@ class ScheduleResult:
 
 - constraints:
   - The structure MUST be immutable.
-  - `module` and `function` MUST be the same objects the caller supplied.
-    Scheduling decides about a program; it MUST NOT return a rewritten one in
-    their place. An algorithm whose decision *is* a rewritten program MUST carry
-    that program in its own Plan.
+  - `module` MUST be the same object the caller supplied. Scheduling decides
+    about a program; it MUST NOT return a rewritten Module in its place. An
+    algorithm whose decision *is* a rewritten program MUST carry that program in
+    its own Plan.
+  - When the call states no `dims`, `function` MUST be the same object the
+    caller supplied.
+  - When the call states `dims`, `function` MUST be the concrete Function the
+    plan was solved for, derived from the Function the caller supplied. It MUST
+    record that Function as the one it was specialised from, and the plan MUST
+    verify against it. A caller returned its own symbolic input would hold a
+    plan it cannot check.
   - `topology` MUST be the level as the Module declares it, not a normalized copy.
 
 ### 2.3 `SchedulePlan`
@@ -197,9 +236,22 @@ class PipelineSchedulePlan(SchedulePlan):
 - constraints:
   - `target` MUST record architecture and device IDs with their content digests.
   - Each `ScheduledStatement` MUST carry one stable ID, selected instruction,
-    tile, resource assignment, and a half-open interval.
+    tile, resource assignment, a half-open interval, the bytes it holds, and
+    whether the level's tile store holds them.
+  - `ScheduledStatement.footprint_bytes` MUST count each buffer the statement
+    touches at the ring depth that buffer was given, so it states what the
+    statement occupies once the pipeline is deep enough to run.
+  - `ScheduledStatement.fits_capacity` MUST record `footprint_bytes` against the
+    tile capacity the level states. A statement that does not fit MUST still
+    appear in the plan: the plan states what the program costs on the target,
+    and a solve MUST NOT drop or shrink a statement to make a plan fit.
   - Each `ScheduledBuffer` MUST carry one stable ID, storage, positive ring
     depth, and typed producer and consumer statement IDs.
+  - `ScheduledBuffer.ring_depth` MUST be derived from the dependence distance
+    the buffer carries under the extents of each statement holding it, so that
+    a buffer whose value survives into a later tile is given enough slots to
+    keep the earlier tile alive. A buffer that carries no dependence MUST be
+    given one slot.
   - Each `KernelHole` MUST reference one stable statement ID and expose tuple
     inputs, tuple outputs, and serialized ISL relations. It MUST NOT expose an
     opaque HIR operation reference.

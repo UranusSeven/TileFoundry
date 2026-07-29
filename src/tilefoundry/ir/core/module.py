@@ -220,6 +220,44 @@ class Module:
             )
         return matches[0]
 
+    def owns(self, function: object, *, derived: bool = False) -> bool:
+        """Whether *function* belongs to this Module's execution domain.
+
+        A specialisation variant counts: it is one of the module's own
+        functions, reached through the prototype that dispatches to it rather
+        than listed alongside it, and it is what anything working at one chosen
+        size has in its hands.
+
+        A function rebuilt from one of these -- the same program with a size
+        chosen for it -- does not, by default. The public boundary asks the
+        strict question before it rebuilds anything, so nothing that reaches an
+        algorithm through it needs a weaker one.
+
+        `derived=True` also accepts a function that records one of these as the
+        function it was specialised from, for a precondition inside an algorithm
+        that a caller may also reach directly. It follows that recorded origin
+        rather than matching a name: a name is shared by anything anybody chose
+        to call the same, so answering by name would admit a function from
+        another module, which is what asking about ownership exists to prevent.
+
+        The strict question is identity, never equality. A Function compares by
+        structure, so a copy of one of these is equal to it and is not one of
+        them -- and admitting a copy would mean this Module answering for a
+        program it does not contain, which is what these two answers exist to
+        keep apart. A function that really is a specialisation says so through
+        the record above rather than by resembling its origin.
+        """
+        for owned in self.functions:
+            if function is owned:
+                return True
+            for variant in getattr(owned, "variants", ()):
+                if function is variant:
+                    return True
+        if not derived:
+            return False
+        origin = getattr(function, "_specialized_from", None)
+        return origin is not None and self.owns(origin)
+
     def entry_function(self) -> ModuleFunction:
         matches = self.function_named(self.entry)
         if not matches:

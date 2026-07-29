@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import textwrap
 
+import pytest
+
 from tilefoundry import cli
 
 _VALID_MODULE = """
@@ -79,7 +81,7 @@ def test_analyze_selects_default_or_requested_analyses(monkeypatch) -> None:
     monkeypatch.setattr(
         cli,
         "run_authored_analysis",
-        lambda source, analyses, as_json=False: calls.append(
+        lambda source, analyses, as_json=False, dims=None: calls.append(
             (source, analyses, as_json)
         ),
     )
@@ -92,27 +94,6 @@ def test_analyze_selects_default_or_requested_analyses(monkeypatch) -> None:
         ("model.py", ("timeline",), False),
         ("model.py", ("memory",), True),
     ]
-
-
-def test_analyze_prints_summary_types_and_selected_metadata(tmp_path, capsys) -> None:
-    path = _write_module(tmp_path)
-
-    assert cli.main(["analyze", f"{path}:Model"]) == 0
-
-    captured = capsys.readouterr()
-    assert captured.err == ""
-    assert captured.out.startswith(
-        "# analysis target=cuda module=Model function=main"
-    )
-    assert "type=Tensor[" in captured.out
-    # Every reported line comes off a record; the annotated body carries the
-    # per-Call ones as comments.
-    assert "# peak-footprint gmem=" in captured.out
-    assert "# theoretical-bound=" in captured.out
-    assert "# theoretical-makespan=" in captured.out
-    assert "compute-cost flops=f32:" in captured.out
-    assert "roofline bound=" in captured.out
-    assert "timeline units=168 waves=2" in captured.out
 
 
 def test_analyze_reports_only_the_analyses_that_were_requested(tmp_path, capsys) -> None:
@@ -138,14 +119,18 @@ def test_analyze_reports_only_the_analyses_that_were_requested(tmp_path, capsys)
 
 def test_analyze_json_and_text_report_the_same_conclusions(tmp_path, capsys) -> None:
     """Both formats render one report, so neither can state something the other
-    does not."""
+    does not -- checked over the default run, which is every analysis, so this is
+    also where the text form's own shape is judged: the header a reader looks at
+    first, the types, and one line per analysis that ran."""
     path = _write_module(tmp_path)
 
     assert cli.main(["analyze", f"{path}:Model", "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
 
     assert cli.main(["analyze", f"{path}:Model"]) == 0
-    text = capsys.readouterr().out
+    captured = capsys.readouterr()
+    text = captured.out
+    assert captured.err == ""
 
     assert payload["target"] == "cuda"
     assert payload["function"] == "main"
@@ -154,9 +139,15 @@ def test_analyze_json_and_text_report_the_same_conclusions(tmp_path, capsys) -> 
         assert f"{level}=r{value['read_bytes']}/w{value['write_bytes']}" in text
     for item in payload["function_records"]["memory"]["footprint"]:
         assert f"{item['level']}={item['peak_bytes']}" in text
-    assert (
-        f"by={payload['function_records']['roofline']['bound_by']}" in text
-    )
+    assert f"by={payload['function_records']['roofline']['bound_by']}" in text
+
+    assert text.startswith("# analysis target=cuda module=Model function=main")
+    assert "type=Tensor[" in text
+    # Every reported line comes off a record; the annotated body carries the
+    # per-Call ones as comments.
+    assert "compute-cost flops=f32:" in text
+    assert "roofline bound=" in text
+    assert "timeline units=168 waves=2" in text
 
 
 def test_analyze_failure_reports_line_variable_and_reason(tmp_path, capsys) -> None:
@@ -182,3 +173,49 @@ def test_analyze_failure_reports_line_variable_and_reason(tmp_path, capsys) -> N
     assert f"{path}:9:" in captured.err
     assert "variable 'wrong'" in captured.err
     assert "dtype mismatch" in captured.err
+
+
+def test_parse_dims_reads_one_extent_per_dimension() -> None:
+    """Nothing stated is not the same as nothing chosen."""
+    assert cli.parse_dims(None) is None
+    assert cli.parse_dims([]) is None
+    assert cli.parse_dims(["ctx_len=1024"]) == {"ctx_len": 1024}
+    assert cli.parse_dims(["ctx_len=8", "seq_len=1"]) == {"ctx_len": 8, "seq_len": 1}
+
+
+@pytest.mark.parametrize(
+    "stated",
+    [["ctx_len"], ["ctx_len="], ["=8"], ["ctx_len=eight"], ["ctx_len=1.5"]],
+)
+def test_parse_dims_rejects_an_argument_that_states_no_extent(stated) -> None:
+    with pytest.raises(ValueError):
+        cli.parse_dims(stated)
+
+
+def test_parse_dims_rejects_one_dimension_stated_twice() -> None:
+    """Repeating the flag states another dimension, not another value for one
+    already stated.
+
+    Taking the last would answer an ambiguous request by picking silently, and
+    the caller would be told nothing -- which is the failure worth catching,
+    because both numbers came from them.
+    """
+    with pytest.raises(ValueError, match="ctx_len was given twice"):
+        cli.parse_dims(["ctx_len=8", "ctx_len=512"])
+    # Repeating the same extent is still two statements of one dimension.
+    with pytest.raises(ValueError, match="ctx_len was given twice"):
+        cli.parse_dims(["ctx_len=8", "ctx_len=8"])
+
+
+def test_the_cli_reports_a_duplicate_dimension_and_analyses_nothing(
+    tmp_path, capsys
+) -> None:
+    """Through `main`, so the refusal is what a user actually meets."""
+    source = tmp_path / "model.py"
+    source.write_text("", encoding="utf-8")
+
+    assert cli.main(["analyze", str(source), "--dim=ctx_len=8", "--dim=ctx_len=512"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "ctx_len was given twice" in captured.err

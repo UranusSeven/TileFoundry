@@ -17,25 +17,30 @@ from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.clamp import Clamp
 from tilefoundry.ir.hir.math.softplus import Softplus
 from tilefoundry.ir.hir.math.unary import Unary
+from tilefoundry.ir.hir.nn.gelu import Gelu
 from tilefoundry.ir.hir.nn.layer_norm import LayerNorm
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.hir.nn.relu import ReLU
 from tilefoundry.ir.hir.nn.rms_norm import RMSNorm
+from tilefoundry.ir.hir.nn.rope import RoPE
 from tilefoundry.ir.hir.nn.sigmoid import Sigmoid
 from tilefoundry.ir.hir.nn.softmax import SoftMax
 from tilefoundry.ir.hir.nn.tanh import Tanh
 from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.tensor.argmax import ArgMax
 from tilefoundry.ir.hir.tensor.cast import Cast
+from tilefoundry.ir.hir.tensor.concat import Concat
 from tilefoundry.ir.hir.tensor.full_like import FullLike
 from tilefoundry.ir.hir.tensor.gather import Gather
 from tilefoundry.ir.hir.tensor.quant import Quant
 from tilefoundry.ir.hir.tensor.reduce import Reduce
 from tilefoundry.ir.hir.tensor.repeat_interleave import RepeatInterleave
 from tilefoundry.ir.hir.tensor.reshape import Reshape
+from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.topk import TopK
 from tilefoundry.ir.hir.tensor.transpose import Transpose
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
+from tilefoundry.ir.hir.tensor.zeros import Zeros
 from tilefoundry.ir.types import DType, TensorType, Type, numel, tensor_bytes
 
 from .contexts import Cost, CostContext
@@ -70,12 +75,20 @@ def _elementwise(call: Call, ctx: CostContext, *, dtype: DType | None = None) ->
 
 @register_cost_evaluator(MatMul)
 def _matmul(call: Call, ctx: CostContext) -> Cost:
+    """One multiply and one add per multiply-accumulate, over every batch.
+
+    The batch comes from the output rather than from the left operand. Either side
+    may be the one that is broadcast: a block of a weight matrix multiplied by one
+    token has its batch on the right, and reading the left gave a batch of one --
+    the whole block loop's arithmetic charged as a single tile's. The output's batch
+    is what the call produced, and every batch of it was computed.
+    """
     lhs, rhs = _input_types(call, ctx)
     output = _output_type(call, ctx)
     if not all(isinstance(type, TensorType) for type in (lhs, rhs, output)):
         raise ValueError("MatMul cost requires tensor inputs and output")
     m, k, n = lhs.shape[-2], lhs.shape[-1], rhs.shape[-1]
-    batch = math.prod(lhs.shape[:-2])
+    batch = math.prod(output.shape[:-2])
     flops = 2 * batch * m * k * n
     return Cost({lhs.dtype: flops}, _traffic((lhs, rhs), output))
 
@@ -138,6 +151,34 @@ def _relu(call: Call, ctx: CostContext) -> Cost:
     return _elementwise(call, ctx)
 
 
+@register_cost_evaluator(Gelu)
+def _gelu(call: Call, ctx: CostContext) -> Cost:
+    return _elementwise(call, ctx)
+
+
+@register_cost_evaluator(Concat)
+def _concat(call: Call, ctx: CostContext) -> Cost:
+    """A concatenation places its inputs side by side and computes nothing.
+
+    Every input element is read once and written once, so the traffic is the
+    inputs plus the output -- unlike a slice, which reads only what it keeps.
+    """
+    return Cost({}, _traffic(_input_types(call, ctx), _output_type(call, ctx)))
+
+
+@register_cost_evaluator(Slice)
+def _slice(call: Call, ctx: CostContext) -> Cost:
+    """A slice selects elements and computes none.
+
+    Its traffic is what it actually moves -- the selected region, not the tensor
+    it came from -- so the cost is read off the output rather than the input. A
+    model that splits a wide projection into unequal parts does that once per
+    part, and charging each one for the whole projection would report a kernel
+    reading its input as many times as it has pieces.
+    """
+    return Cost({}, tensor_bytes(_output_type(call, ctx)) * 2)
+
+
 @register_cost_evaluator(SoftMax)
 def _softmax(call: Call, ctx: CostContext) -> Cost:
     return _elementwise(call, ctx)
@@ -150,6 +191,22 @@ def _layer_norm(call: Call, ctx: CostContext) -> Cost:
     if not isinstance(source, TensorType):
         raise ValueError("LayerNorm cost requires a tensor input")
     return Cost({DType.f32: 8 * numel(source)}, _traffic(_input_types(call, ctx), output))
+
+
+@register_cost_evaluator(RoPE)
+def _rope(call: Call, ctx: CostContext) -> Cost:
+    """Rotate q and k in place against the caches.
+
+    Each rotated element costs one multiply against the cosine, one against
+    the sine of its partner, and the add that combines them. The output is the
+    pair, so its element count already covers both q and k.
+    """
+    inputs = _input_types(call, ctx)
+    output = _output_type(call, ctx)
+    query = inputs[0]
+    if not isinstance(query, TensorType):
+        raise ValueError("RoPE cost requires a tensor query input")
+    return Cost({query.dtype: 3 * numel(output)}, _traffic(inputs, output))
 
 
 @register_cost_evaluator(TopK)
@@ -197,6 +254,13 @@ def _tuple_get_item(call: Call, ctx: CostContext) -> Cost:
 
 @register_cost_evaluator(FullLike)
 def _full_like(call: Call, ctx: CostContext) -> Cost:
+    output = _output_type(call, ctx)
+    return Cost({}, tensor_bytes(output))
+
+
+@register_cost_evaluator(Zeros)
+def _zeros(call: Call, ctx: CostContext) -> Cost:
+    """Materialise a tensor of zeros: no arithmetic, one full write."""
     output = _output_type(call, ctx)
     return Cost({}, tensor_bytes(output))
 

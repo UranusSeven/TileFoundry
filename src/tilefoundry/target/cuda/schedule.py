@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
+from tilefoundry.ir.hir.specialize import origin_of
 from tilefoundry.schedule import ScheduleError, ScheduleOptions
 from tilefoundry.schedule.partition import (
     PartitionFacts,
@@ -52,11 +53,24 @@ def _options(topology: str, options: object | None) -> ScheduleOptions:
 
 
 def _entry_function(topology: str, module: Module, function: Function) -> None:
-    if function is not module.entry_function():
-        raise ScheduleError(
-            f"{topology} schedule requires the module entry function, got "
-            f"{function.name!r}"
-        )
+    """Refuse a leaf: these algorithms decide the whole launch.
+
+    The entry at a chosen size is a different object and the same program, so
+    the comparison follows what a specialised function records about where it
+    came from. Comparing objects alone would refuse it; comparing names would
+    accept anything called the same.
+    """
+    entry = module.entry_function()
+    permitted = (entry, *entry.variants)
+    candidate: object | None = function
+    while candidate is not None:
+        if any(candidate is allowed for allowed in permitted):
+            return
+        candidate = origin_of(candidate)
+    raise ScheduleError(
+        f"{topology} schedule requires the module entry function, got "
+        f"{function.name!r}"
+    )
 
 
 def schedule_thread(
