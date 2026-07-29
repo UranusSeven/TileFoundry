@@ -816,7 +816,11 @@ def _emit_def(
             param_strs.append(f"{indent}{name}: {ann}")
         else:
             param_strs.append(f"{indent}{name}")
-    lines.append(",\n".join(param_strs))
+    # One list element per physical line: a nesting caller indents per element,
+    # and `textwrap.dedent` needs every signature line to carry the same prefix.
+    for index, text in enumerate(param_strs):
+        suffix = "," if index < len(param_strs) - 1 else ""
+        lines.extend((text + suffix).split("\n"))
     lines.append(f"){arrow}:")
 
     for param in fn.params:
@@ -1261,14 +1265,14 @@ def _module_tree_functions(mod: Module) -> tuple[HirFunction, ...]:
     return tuple(functions)
 
 
-def _module_decorator_line(mod: Module, entry_name: str) -> str:
+def _module_decorator_line(mod: Module, entry_name: str | None) -> str:
     """The ``@module(...)`` line declaring this Module's entry and Target. An
-    inherited Target prints nothing, so a re-parse rebuilds the same
-    declaration/inheritance split."""
-    kwargs = [f'entry="{entry_name}"']
+    inherited Target prints nothing, and a Module with no default step prints no
+    ``entry``, so a re-parse rebuilds the same declaration/inheritance split."""
+    kwargs = [] if entry_name is None else [f'entry="{entry_name}"']
     if mod.target is not None:
         kwargs.append(f"target={_target_str(mod.target)}")
-    return f"@module({', '.join(kwargs)})"
+    return f"@module({', '.join(kwargs)})" if kwargs else "@module"
 
 
 def _topologies_declaration(mod: Module) -> str | None:
@@ -1290,7 +1294,7 @@ def _emit_module_class(
     """One ``@module`` class block: its topology declaration, its functions,
     then its nested Modules."""
     functions = _module_hir_functions(mod)
-    entry = mod.entry_function() if functions else None
+    entry = mod.entry_function() if functions and mod.entry is not None else None
     lines = [_module_decorator_line(mod, mod.entry), f"class {module_name}:"]
     declaration = _topologies_declaration(mod)
     if declaration is not None:
@@ -1330,9 +1334,14 @@ def _module_to_python(
         )
         module_name = root.name
     functions = _module_tree_functions(root)
-    entry = root.entry_function()
-    if not isinstance(entry, HirFunction):
+    if not functions:
+        raise TypeError("HIR Module printer requires at least one HIR function")
+    entry = root.entry_function() if root.entry is not None else None
+    if entry is not None and not isinstance(entry, HirFunction):
         raise TypeError("HIR Module printer requires a HIR entry Function")
+    # The header describes the tree, not its default step: a root composing
+    # child Modules need not nominate one of its own.
+    header_of = entry if entry is not None else functions[0]
     indent4 = "    "
     meshes: dict[int, Mesh] = {}
     for fn in functions:
@@ -1345,7 +1354,7 @@ def _module_to_python(
     for fn in functions:
         dim_vars.update(dim_vars_reached(fn))
     lines = _emit_header(
-        entry, meshes, mesh_map, indent4, for_module=True, target=root.target,
+        header_of, meshes, mesh_map, indent4, for_module=True, target=root.target,
         dim_vars=dim_vars,
     )
     tensor_names = "ConstTensor, Tensor" if any(

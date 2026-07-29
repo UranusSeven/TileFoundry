@@ -3,7 +3,7 @@ package compares against.
 
 Phase 0 "打样": the first of four planned dense/near-dense models (Qwen3-1.7B,
 Qwen2.5-1.5B, MiniCPM3, Gemma-2) authored against this same three-file
-template (``config.py`` + ``model/decoder_layer.py`` + ``test_decoder_layer.py``,
+template (``config.py`` + ``model.py`` + ``test_decoder_layer.py``,
 mirroring the layout every model package here shares), run on macOS with no
 CUDA:
 **cpu + f32 only**.
@@ -22,7 +22,7 @@ package shares:
   never constructed, on either side of the comparison, and
 - the component -> HF-submodule map.
 
-Component HIR ``@func``s live in ``model/decoder_layer.py``, over this module's
+Component HIR ``@func``s live in ``model.py``, over this module's
 ``REAL`` shape; ``decoder_layer.py`` binds the two together. This module holds
 only the shape, the HF layer / rope-cache / causal-mask builders, and the
 weight-layout helper.
@@ -115,7 +115,7 @@ REAL = Qwen3Shape(
 # ── Component -> HF submodule map ───────────────────────────────────────
 # Each component's HIR is validated against these submodules of a single
 # ``Qwen3DecoderLayer``. ``self_attention`` and ``mlp`` each fuse their
-# preceding RMSNorm (see ``model/decoder_layer.py`` docstring), so their HF
+# preceding RMSNorm (see ``model.py`` docstring), so their HF
 # comparison composes the norm + block rather than the block alone.
 COMPONENT_HF_SUBMODULES = {
     "input_rms_norm": ("input_layernorm",),
@@ -211,17 +211,18 @@ def decode_reference(layer, hidden_ctx, hidden_new, device="cpu"):
 def build_hf_decoder(seed=0, device="cpu", dtype=None, shape: Qwen3Shape = REAL):
     """The complete ``shape.n_layers``-layer decoder stack, random at a fixed seed.
 
-    A ``Qwen3Model`` is built for its layers and its final norm; its token
-    embedding is not part of what this returns, because the decoder's boundary is
-    hidden states in and hidden states out. Stacking one layer's verified
-    behaviour is not the same as the stack behaving, which is why this exists
-    separately from ``build_hf_layer``: layer order, the final norm, and the
-    residual thread between layers are only observable here.
+    A ``Qwen3ForCausalLM`` rather than the base model: the decoder's own boundary
+    is still hidden states in and hidden states out, but the root's weights include
+    the head, and the head exists only on the causal LM. Its layers and final norm
+    are reached through ``.model``. Stacking one layer's verified behaviour is not
+    the same as the stack behaving, which is why this exists separately from
+    ``build_hf_layer``: layer order, the final norm, and the residual thread
+    between layers are only observable here.
     """
-    from transformers.models.qwen3.modeling_qwen3 import Qwen3Model  # noqa: PLC0415
+    from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM  # noqa: PLC0415
 
     return oracle.randomised(
-        lambda: Qwen3Model(build_hf_config(shape, layers=shape.n_layers)),
+        lambda: Qwen3ForCausalLM(build_hf_config(shape, layers=shape.n_layers)),
         seed, device, dtype,
     )
 
@@ -230,7 +231,7 @@ def decoder_context_kv(model, hidden_ctx, device="cpu"):
     """Per-layer ``(k_cache, v_cache)`` for *hidden_ctx*, in layer order."""
     cos, sin = rope_caches(build_hf_config(), hidden_ctx.shape[1], device=device)
     return oracle.stack_context_kv(
-        model.layers, hidden_ctx, cos, sin,
+        model.model.layers, hidden_ctx, cos, sin,
         key_value_of=_key_value_of, apply_rotary=_apply_rotary(),
     )
 
@@ -241,7 +242,7 @@ def decoder_decode_reference(model, hidden_ctx, hidden_new):
     total = hidden_ctx.shape[1] + hidden_new.shape[1]
     cos, sin = rope_caches(build_hf_config(), total, device=device)
     return oracle.decode_reference(
-        model.layers, hidden_ctx, hidden_new, cos, sin, final_norm=model.norm
+        model.model.layers, hidden_ctx, hidden_new, cos, sin, final_norm=model.model.norm
     )
 
 

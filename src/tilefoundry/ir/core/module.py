@@ -4,10 +4,10 @@ orchestration methods. See docs/spec/core-ir.md §1.
 from __future__ import annotations
 
 import copy
-import dataclasses
 import functools
 import types
 from dataclasses import dataclass, field
+from dataclasses import replace as _replace
 from typing import Mapping, Union
 
 from tilefoundry.ir.hir.function import Function as HirFunction
@@ -17,6 +17,19 @@ from tilefoundry.ir.types.tensor_type import TensorType
 from tilefoundry.target import Target
 
 ModuleFunction = Union[HirFunction, PrimFunction]
+
+
+def _refuse_bare_call(module: "Module", kind: str) -> None:
+    """Refuse a bare call on a *kind* whose *module* has neither a ``forward``
+    method nor an entry, naming what to call instead."""
+    if module.entry is not None:
+        return
+    named = sorted({fn.name for fn in module.functions} | set(module.methods))
+    raise TypeError(
+        f"{kind} {module.name!r} has no forward method and no entry, so a bare "
+        f"call has nothing to run; call one by name"
+        + (f" -- {', '.join(named)}" if named else "")
+    )
 
 
 def _owned_by(child: "Module", parent: "Module") -> "Module":
@@ -52,7 +65,8 @@ class Module:
 
     name: str
     functions: tuple[ModuleFunction, ...]
-    entry: str
+    #: Which function is the default step, or ``None`` for a Module without one.
+    entry: str | None = None
     modules: tuple["Module", ...] = field(default_factory=tuple)
     target: Target | None = None
     topologies: tuple[Topology, ...] | None = None
@@ -178,13 +192,14 @@ class Module:
 
     def __getattr__(self, name: str):
         """Resolve *name* to a function, a child module, or a bound method. A
-        function resolves to a **callable that runs it**, not to the IR node —
-        use ``lookup`` for the node."""
+        function resolves to a **callable that runs it over every declared
+        parameter**, not to the IR node — use ``lookup`` for the node, and
+        ``load(resource)`` for a runner that fills constants from bindings."""
         if name.startswith("_"):
             raise AttributeError(name)
         matches = tuple(fn for fn in self.functions if fn.name == name)
         if len(matches) == 1:
-            return functools.partial(self._run, matches[0])
+            return functools.partial(self._run_authored, matches[0])
         if len(matches) > 1:
             raise AttributeError(
                 f"Module {self.name!r}: {name!r} resolves to {len(matches)} "
@@ -259,6 +274,12 @@ class Module:
         return origin is not None and self.owns(origin)
 
     def entry_function(self) -> ModuleFunction:
+        if self.entry is None:
+            raise ValueError(
+                f"Module {self.name!r} declares no entry, so it has no default "
+                f"step; name the function to use -- lookup('<name>') for the node, "
+                f"or <module>.<name>(...) to run it"
+            )
         matches = self.function_named(self.entry)
         if not matches:
             raise ValueError(
@@ -271,47 +292,54 @@ class Module:
             )
         return matches[0]
 
-    def load(self, resource) -> None:
-        """Bind this node's weights by name from *resource*, then recurse into
-        each child."""
-        bound: dict[str, object] = {}
+    def load(self, resource) -> "LoadedModule":
+        """This Module's constants read from *resource*, as a ``LoadedModule``.
+
+        Returns rather than mutates: the Module is IR and may be read any number
+        of times. See docs/spec/runtime.md §1.1.2.
+        """
+        constants: dict[str, object] = {}
         for name in self.weights:
             try:
-                bound[name] = resource.load(name)
+                constants[name] = resource.load(name)
             except KeyError as e:
                 raise KeyError(f"Module {self.name!r}: missing weight {name!r}") from e
-        object.__setattr__(self, "_bound", bound)
-        for child in self.modules:
-            child.load(resource.subtree(child.name))
+        return LoadedModule(
+            module=self,
+            constants=constants,
+            modules=tuple(
+                child.load(resource.subtree(child.name)) for child in self.modules
+            ),
+        )
 
-    def _run(self, fn: ModuleFunction, *acts):
-        """Evaluate *fn*, weights filled by name from ``load``, the rest from
-        *acts* positionally."""
+    def _run_authored(self, fn: ModuleFunction, *args):
+        """Evaluate *fn* over the arguments given, one per declared parameter --
+        a ``ConstTensor`` one included, since a Module holds no constants."""
         from tilefoundry.evaluator import evaluate  # noqa: PLC0415 -- avoid IR→evaluator cycle
 
-        bound = getattr(self, "_bound", {})
-        args = []
-        activations = iter(acts)
-        for param in fn.params:
-            if param.is_const:
-                try:
-                    args.append(bound[param.name])
-                except KeyError:
-                    raise KeyError(
-                        f"Module {self.name!r}: weight {param.name!r} of "
-                        f"{fn.name!r} is not bound; call load(resource) first"
-                    ) from None
-            else:
-                args.append(next(activations))
+        if len(args) != len(fn.params):
+            consts = sum(1 for p in fn.params if p.is_const)
+            hint = (
+                f"; {consts} of them are ConstTensor, which an authored Module "
+                f"does not hold -- pass them here, or call load(resource) and "
+                f"run the LoadedModule with activations alone"
+                if consts
+                else ""
+            )
+            raise TypeError(
+                f"Module {self.name!r}: {fn.name!r} declares {len(fn.params)} "
+                f"parameters but got {len(args)}{hint}"
+            )
         return evaluate(fn, *args)
 
-    def forward(self, *acts):
+    def forward(self, *args):
         """Run this node's step: its ``forward`` orchestration method if it has
-        one, else the entry function."""
+        one, else the entry function over the arguments given."""
         method = self.methods.get("forward")
         if method is not None:
-            return method(self, *acts)
-        return self._run(self.lookup(self.entry), *acts)
+            return method(self, *args)
+        _refuse_bare_call(self, "Module")
+        return self._run_authored(self.lookup(self.entry), *args)
 
     __call__ = forward
 
@@ -381,10 +409,222 @@ class Module:
         for child in self.modules:
             child._prepare_into(raw.subtree(child.name), f"{prefix}{child.name}.", flat, device)
 
+    def cloned(self) -> "Module":
+        """An independent copy of the IR graph: functions, bodies, children, and
+        every internal ``Call.target`` redirected to the copy. Immutable outside
+        context -- owner, ``target``, ``topologies`` -- stays shared."""
+        memo: dict[int, object] = {}
+        for kept in (getattr(self, "_parent", None), self.target, *(self.topologies or ())):
+            # Kept out of the copy: following the owner would clone upwards.
+            if kept is not None:
+                memo[id(kept)] = kept
+        return copy.deepcopy(self, memo)
+
     def renamed(self, name: str) -> "Module":
-        """A copy of this node under a different ``name``. Shallow: children are
-        shared, so an independent instance needs a fresh build."""
-        return dataclasses.replace(self, name=name)
+        """An independent copy of this node under a different ``name``."""
+        clone = self.cloned()
+        object.__setattr__(clone, "name", name)
+        return clone
 
 
-__all__ = ["Module", "ModuleFunction"]
+@dataclass(frozen=True)
+class LoadedModule:
+    """An IR ``Module`` together with the constants read for *this* loading.
+
+    Two may stand over one Module and neither sees what the other bound. Attribute
+    access mirrors ``Module``'s, except that a function resolves to a runner
+    filling ``ConstTensor`` parameters from these constants, so the caller passes
+    activations alone. See docs/spec/runtime.md §1.1.2.
+    """
+
+    module: Module
+    constants: Mapping[str, object]
+    modules: tuple["LoadedModule", ...] = field(default_factory=tuple)
+
+    @property
+    def name(self) -> str:
+        return self.module.name
+
+    def __getattr__(self, name: str):
+        """Resolve *name* against the Module, with functions and children
+        answering from this loading rather than from the IR."""
+        if name.startswith("_"):
+            raise AttributeError(name)
+        module = self.module
+        matches = tuple(fn for fn in module.functions if fn.name == name)
+        if len(matches) == 1:
+            return functools.partial(self._run_bound, matches[0])
+        if len(matches) > 1:
+            raise AttributeError(
+                f"LoadedModule {self.name!r}: {name!r} resolves to "
+                f"{len(matches)} entries; one name must map to one function"
+            )
+        children = tuple(child for child in self.modules if child.name == name)
+        if len(children) == 1:
+            return children[0]
+        if len(children) > 1:
+            raise AttributeError(
+                f"LoadedModule {self.name!r}: {name!r} resolves to "
+                f"{len(children)} child modules; one name must map to one module"
+            )
+        method = module.methods.get(name)
+        if method is not None:
+            # Bound to this LoadedModule, so the method's own `self.<fn>(...)`
+            # reaches the bound runner.
+            return types.MethodType(method, self)
+        raise AttributeError(
+            f"LoadedModule {self.name!r} has no function, child module, or "
+            f"method {name!r}"
+        )
+
+    def _run_bound(self, fn: ModuleFunction, *acts):
+        """Evaluate *fn* over *acts*, its ``ConstTensor`` parameters filled by
+        name from these bindings.
+
+        Weights and activations must already agree on one device, which is where
+        this runs; nothing is moved implicitly. See docs/spec/runtime.md §1.1.2.
+        """
+        from tilefoundry.evaluator import evaluate  # noqa: PLC0415 -- avoid IR→evaluator cycle
+
+        expected = sum(1 for p in fn.params if not p.is_const)
+        if len(acts) != expected:
+            raise TypeError(
+                f"LoadedModule {self.name!r}: {fn.name!r} takes {expected} "
+                f"activation(s) -- its {len(fn.params) - expected} ConstTensor "
+                f"parameter(s) come from the bindings -- but got {len(acts)}"
+            )
+        args = []
+        activations = iter(acts)
+        for param in fn.params:
+            if param.is_const:
+                try:
+                    args.append(self.constants[param.name])
+                except KeyError:
+                    raise KeyError(
+                        f"LoadedModule {self.name!r}: weight {param.name!r} of "
+                        f"{fn.name!r} was not read by load(resource)"
+                    ) from None
+            else:
+                args.append(next(activations))
+        return evaluate(fn, *args, device=self._placement(fn, acts))
+
+    def _placement(self, fn: ModuleFunction, acts: tuple) -> str | None:
+        """The one device every bound constant and tensor activation agrees on,
+        or ``None`` when none names one. See docs/spec/runtime.md §1.1.2."""
+        where: dict[str, list[str]] = {}
+        for name, value in self.constants.items():
+            device = getattr(value, "device", None)
+            if device is not None:
+                where.setdefault(str(device), []).append(f"weight {name!r}")
+        for index, value in enumerate(acts):
+            device = getattr(value, "device", None)
+            if device is not None:
+                where.setdefault(str(device), []).append(f"activation {index}")
+        if len(where) > 1:
+            spread = "; ".join(
+                f"{device}: {', '.join(names)}" for device, names in sorted(where.items())
+            )
+            raise ValueError(
+                f"LoadedModule {self.name!r}: {fn.name!r} was given tensors on "
+                f"more than one device -- {spread}. Load the weights and build the "
+                f"activations on one device; this runner moves nothing."
+            )
+        return next(iter(where), None)
+
+    def forward(self, *acts):
+        """Run this node's step: its ``forward`` orchestration method if it has
+        one, else the entry function over the activations given."""
+        method = self.module.methods.get("forward")
+        if method is not None:
+            return method(self, *acts)
+        _refuse_bare_call(self.module, "LoadedModule")
+        return self._run_bound(self.module.entry_function(), *acts)
+
+    __call__ = forward
+
+
+def _reentered(module: Module, entry: str) -> Module:
+    """*module* re-entried at *entry*.
+
+    ``replace`` rebuilds the value without its owner backlink, so a child
+    selected out of a tree would lose the Target and hierarchy it inherits. The
+    copy therefore carries the context it resolved through.
+    """
+    try:
+        target = module.resolve_target()
+    except ValueError:
+        target = module.target
+    return _replace(
+        module,
+        entry=entry,
+        target=target,
+        topologies=module.effective_topologies(),
+    )
+
+
+def select(module: Module, path: str) -> Module:
+    """The node dotted *path* names below *module*, as a Module.
+
+    Each segment names a child Module, except that the last may instead name one
+    of the reached Module's own functions -- which selects that Module re-entried
+    at it, so what comes back is always something with a Target and a topology
+    hierarchy to be measured against. An empty *path* is *module* itself.
+
+    See docs/spec/core-ir.md §1.2.
+    """
+    selected = module
+    segments = path.split(".") if path else []
+    if any(not segment for segment in segments):
+        raise ValueError(
+            f"selector {path!r}: an empty segment names nothing. Dropping it would "
+            f"make two different paths mean the same node"
+        )
+    for index, name in enumerate(segments):
+        children = {child.name: child for child in selected.modules}
+        if name in children:
+            selected = children[name]
+            continue
+        if index != len(segments) - 1:
+            raise ValueError(
+                f"selector {path!r}: Module {selected.name!r} has no child "
+                f"module {name!r}"
+            )
+        # `lookup` refuses a name this Module does not define, so reaching here
+        # means the last segment named one of its functions.
+        selected.lookup(name)
+        return _reentered(selected, name)
+    return selected
+
+
+def function_selectors(
+    module: Module, prefix: str = ""
+) -> tuple[tuple[str, HirFunction], ...]:
+    """Every HIR function in *module*'s tree, each with the selector naming it.
+
+    Root-relative and dotted, the same paths :func:`select` resolves, so a leaf's
+    name is qualified by the children it was reached through: two child Modules
+    may each define a ``moe``, and an unqualified name would make them one entry
+    in an inventory meant to be countable.
+
+    A ``PrimFunction`` is not one of these: it is an implementation of a function
+    rather than a function of the model.
+
+    See docs/spec/core-ir.md §1.2.
+    """
+    found: list[tuple[str, HirFunction]] = [
+        (f"{prefix}{function.name}", function)
+        for function in module.functions
+        if isinstance(function, HirFunction)
+    ]
+    for child in module.modules:
+        found.extend(function_selectors(child, f"{prefix}{child.name}."))
+    return tuple(found)
+
+
+__all__ = [
+    "LoadedModule",
+    "Module",
+    "ModuleFunction",
+    "function_selectors",
+    "select",
+]

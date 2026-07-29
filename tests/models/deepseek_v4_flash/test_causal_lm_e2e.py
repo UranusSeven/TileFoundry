@@ -10,12 +10,13 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tests.models.deepseek_v4_flash.causal_lm import load_causal_lm
-from tests.models.deepseek_v4_flash.config import DSV4Config
+from tests.models.deepseek_v4_flash.config import TINY
 from tests.models.deepseek_v4_flash.hf_alias import hf_alias
+from tests.models.deepseek_v4_flash.model import build_deepseek_v4_flash
 from tests.models.deepseek_v4_flash.runtime import build_runtime_causal_lm
 from tests.models.generation import generate
 from tilefoundry.evaluator.value import to_torch_dtype
+from tilefoundry.ir.core.module import Module
 from tilefoundry.runtime import (
     SafetensorsResource,
     bench,
@@ -124,12 +125,14 @@ def _dequant_blocks(weight, scale):
 
 @pytest.fixture(scope="module")
 def config():
-    return DSV4Config.tiny()
+    return TINY
 
 
 @pytest.fixture(scope="module")
 def semantic(config):
-    return load_causal_lm(config)
+    """The whole tree at the small shape: the size this end-to-end path is
+    affordable at, named rather than derived."""
+    return build_deepseek_v4_flash(config)
 
 
 @pytest.fixture(scope="module")
@@ -151,9 +154,10 @@ def prepared(tmp_path_factory, config, semantic, raw_tensors):
 @pytest.fixture(scope="module")
 def twins(config, semantic, prepared):
     runtime = build_runtime_causal_lm(config, ir=semantic)
-    semantic.load(SafetensorsResource(str(prepared), device="cuda"))
+    # The ir module's `load` returns; the runtime twin's still binds in place.
+    loaded = semantic.load(SafetensorsResource(str(prepared), device="cuda"))
     runtime.load(SafetensorsResource(str(prepared), device="cuda"))
-    return semantic, runtime
+    return loaded, runtime
 
 
 def _node_inputs(semantic, config):
@@ -172,8 +176,9 @@ def _node_inputs(semantic, config):
 
 
 def test_prepare_and_parity(config, raw_tensors, prepared, twins):
-    """``prepare`` digests the checkpoint's naming and really converts, and the
-    twin agrees with the evaluator node by node."""
+    """``prepare`` digests the checkpoint's naming and really converts, one leaf of
+    the prepared store loads on its own, and the twin agrees with the evaluator node
+    by node."""
     semantic, runtime = twins
     store = SafetensorsResource(str(prepared), device="cuda")
 
@@ -208,6 +213,25 @@ def test_prepare_and_parity(config, raw_tensors, prepared, twins):
     assert w1_scale.dtype == torch.float8_e8m0fnu
     assert torch.equal(w1_scale.float().cpu(), expected_scale)
 
+    # One leaf against its own slice of the same store, with `prepare` patched to
+    # raise so that reaching it would fail here.
+    leaf = semantic.layer0.moe.module
+    with pytest.MonkeyPatch.context() as patched:
+        def refuse(*_args, **_kwargs):
+            raise AssertionError("loading one leaf reached Module.prepare")
+
+        patched.setattr(Module, "prepare", refuse)
+        loaded_leaf = leaf.load(store.subtree("layer0").subtree("moe"))
+
+    assert loaded_leaf.module is leaf
+    assert set(loaded_leaf.constants) == set(leaf.weights)
+    assert {f"layer0.moe.{name}" for name in loaded_leaf.constants} == {
+        key for key in EXPECTED_PREPARED_KEYS if key.startswith("layer0.moe.")
+    }
+    assert torch.equal(
+        loaded_leaf.constants["w1_weight"].float(), store.load("layer0.moe.w1_weight").float()
+    )
+
     inputs = _node_inputs(semantic, config)
     nodes = {
         "attention": (runtime.layer0.attention, semantic.layer0.attention),
@@ -227,8 +251,8 @@ def test_the_generate_loop_threads_state_and_stops_at_the_window(config, twins):
 
     State is held entirely by the caller and threaded functionally in and out, so
     the cache each step reads is the context before its token: what a step hands
-    back is that context with one position appended, which is what makes the
-    second step read the first one's output. Past the window the caller stops
+    back is that token's own position, and the caller appending it is what makes
+    the second step read the first one's output. Past the window the caller stops
     growing it -- eviction is a policy applied to a tensor, which is why the
     description carries a range and not a fixed capacity, and why it is visible
     here rather than buried in a write index. And the twin runs the same loop:
@@ -262,9 +286,12 @@ def test_the_generate_loop_threads_state_and_stops_at_the_window(config, twins):
     for model in (semantic, runtime):
         caches = model.init_caches(device="cuda")
         args = model.prepare_inputs_for_generation(ids, 0, caches, device="cuda")
-        _, next_caches = model(*args)
-        # A step appends: the context it was given comes back unchanged with one
-        # more position after it, and that position is this token's own latent.
+        _, fresh = model(*args)
+        # A step hands back one position per layer -- this token's own latent --
+        # and appending it leaves the context it was given unchanged with that
+        # position after it.
+        assert fresh[0].shape[1] == 1, type(model).__name__
+        next_caches = model.append_cache(caches, fresh)
         assert next_caches[0].shape[1] == caches[0].shape[1] + 1, type(model).__name__
         assert torch.equal(next_caches[0][:, :seed_ctx], caches[0])
         assert next_caches[0][:, seed_ctx:].float().any()
@@ -274,8 +301,10 @@ def test_structure_mismatch_rejected(config, twins):
     """``@runtime_module`` rejects a missing, extra, or mismatched kernel/child
     at decoration time."""
     semantic, runtime = twins
-    attention = semantic.layer0.attention
-    layer = semantic.layer0
+    # `runtime_module` decorates against the IR's function and child names, so it
+    # takes the Module rather than this loading of it.
+    attention = semantic.layer0.attention.module
+    layer = semantic.layer0.module
 
     with pytest.raises(TypeError, match=r"missing \['mla_kv_update'\]"):
         @runtime_module(attention)

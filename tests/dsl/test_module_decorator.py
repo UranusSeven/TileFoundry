@@ -88,6 +88,139 @@ def test_collects_orchestration_method_and_rejects_other_members():
             budget = 3  # not a DSL function, a child Module, or a plain function
 
 
+def test_what_a_class_body_must_declare_to_be_a_module():
+    """Only an empty body is refused: one function, one child, or one plain method
+    is enough, so a body of methods alone — refused before for owning no function —
+    is valid. A supplied ``entry`` is still checked, and a class-body ``__call__``
+    is refused rather than dropped."""
+
+    with pytest.raises(TypeError, match="empty class body"):
+
+        @module
+        class _Empty:
+            pass
+
+    @module
+    class _MethodsOnly:
+        def walk(self, x):
+            return x
+
+    assert _MethodsOnly.entry is None
+    assert _MethodsOnly.walk(3) == 3
+
+    with pytest.raises(ValueError, match=r"entry 'absent' names no collected function"):
+
+        @module(entry="absent")
+        class _WrongEntry:
+            @func
+            def only(x: Tensor[(2, 4), "f32"], g: Tensor[(4,), "f32"]) -> Tensor[(2, 4), "f32"]:
+                return tf.rms_norm(x, g)
+
+    with pytest.raises(TypeError, match=r"__call__ has no effect"):
+
+        @module(entry="only")
+        class _OwnCall:
+            @func
+            def only(x: Tensor[(2, 4), "f32"], g: Tensor[(4,), "f32"]) -> Tensor[(2, 4), "f32"]:
+                return tf.rms_norm(x, g)
+
+            def __call__(self, x):
+                raise AssertionError("never reached")
+
+
+def test_a_module_without_a_default_step_says_so_rather_than_blaming_entry():
+    """A bare call is answered by naming what to call; asking for the entry is
+    answered by saying there is no default step. Neither may read as ``entry``
+    being wrong, which is what ``None`` reaching the entry lookup produces."""
+
+    @module
+    class _NoStep:
+        @func
+        def helper(x: Tensor[(2, 4), "f32"], g: Tensor[(4,), "f32"]) -> Tensor[(2, 4), "f32"]:
+            return tf.rms_norm(x, g)
+
+    with pytest.raises(TypeError, match=r"no forward method and no entry.*helper"):
+        _NoStep()
+
+    with pytest.raises(ValueError, match=r"declares no entry, so it has no default step"):
+        _NoStep.entry_function()
+
+    assert _NoStep.lookup("helper").name == "helper"
+
+
+def test_the_runner_on_an_authored_module_takes_the_weights_too():
+    """A Module's callable takes every declared param, a ``ConstTensor`` one
+    included; a ``LoadedModule``'s takes activations alone. Each wrong argument
+    list is refused naming the runner it wanted, and neither is sent to the
+    other's."""
+    import torch  # noqa: PLC0415 — only this test needs a real tensor
+
+    from tilefoundry.dsl import ConstTensor  # noqa: PLC0415
+    from tilefoundry.runtime.resource import DictResource  # noqa: PLC0415
+
+    @module(entry="scale")
+    class _Weighted:
+        @func
+        def scale(x: Tensor[(2,), "f32"], w: ConstTensor[(2,), "f32"]):
+            return x * w
+
+    ones = torch.ones(2, dtype=torch.float32)
+    weight = torch.full((2,), 3.0)
+
+    assert _Weighted.scale(ones, weight).float().cpu().tolist() == [3.0, 3.0]
+
+    with pytest.raises(TypeError, match=r"declares 2 parameters but got 1.*load\(resource\)"):
+        _Weighted.scale(ones)
+
+    loaded = _Weighted.load(DictResource({"w": weight}))
+    with pytest.raises(TypeError, match=r"takes 1 activation") as excinfo:
+        loaded.scale(ones, weight)
+    assert "load(resource)" not in str(excinfo.value)
+
+
+def test_one_shared_child_binds_once_per_owner():
+    """Two owners over one child IR read their own subtrees rather than the last
+    one loaded winning."""
+    import copy  # noqa: PLC0415
+
+    import torch  # noqa: PLC0415
+
+    from tilefoundry.dsl import ConstTensor  # noqa: PLC0415
+    from tilefoundry.runtime.resource import DictResource  # noqa: PLC0415
+
+    @module(entry="scale")
+    class _Leaf:
+        @func
+        def scale(x: Tensor[(2,), "f32"], w: ConstTensor[(2,), "f32"]):
+            return x * w
+
+    @module(entry="twice")
+    class _Owner:
+        leaf = _Leaf
+
+        @func
+        def twice(x: Tensor[(2,), "f32"]):
+            return x + x
+
+    def aliasing(name):
+        # `copy.copy` skips __post_init__, and with it the claim that would clone
+        # the child -- normal construction cannot put one child under two owners.
+        node = copy.copy(_Owner)
+        object.__setattr__(node, "name", name)
+        return node
+
+    left, right = aliasing("left"), aliasing("right")
+    assert left.modules[0] is right.modules[0]
+
+    ones = torch.ones(2, dtype=torch.float32)
+    loaded_left = left.load(DictResource({"leaf.w": torch.full((2,), 3.0)}))
+    loaded_right = right.load(DictResource({"leaf.w": torch.full((2,), 10.0)}))
+
+    assert loaded_left.leaf.module is loaded_right.leaf.module
+    assert loaded_left.leaf.scale(ones).float().cpu().tolist() == [3.0, 3.0]
+    assert loaded_right.leaf.scale(ones).float().cpu().tolist() == [10.0, 10.0]
+
+
 def test_forward_reference_sibling_fails_loudly():
     """A method that calls a sibling defined *below* it cannot resolve the
     sibling (only callee-before-caller is supported) and raises rather than
