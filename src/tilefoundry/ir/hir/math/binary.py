@@ -124,7 +124,11 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     rhs_ty = ctx.type_of(call.args[1])
     if lhs_ty.dtype != rhs_ty.dtype:
         ctx.error(call, f"Binary {op.kind.name}: dtype mismatch "
-                        f"({lhs_ty.dtype} vs {rhs_ty.dtype})")
+                        f"({lhs_ty.dtype.name} vs {rhs_ty.dtype.name}); tensor "
+                        f"operands are never promoted for you. A number you wrote is "
+                        f"f32 -- tf.full_like(x, value=...) gives it x's dtype; "
+                        f"otherwise tf.cast one side explicitly. "
+                        f"See `tilefoundry spec dsl binary`")
     if op.kind in _LOGICAL_KINDS and lhs_ty.dtype != DType.bool:
         ctx.error(call, f"Binary {op.kind.name}: operands must be bool")
     if op.kind in _INT_ONLY_KINDS and lhs_ty.dtype not in (DType.i32, DType.i64):
@@ -156,7 +160,9 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         # relation builds the broadcast domain, the output shape is read back
         # from it, and the shard engine consumes the same maps.
         relation = build_relation(call, (lhs_ty, rhs_ty), ctx)
-        out_shape = shape_from_relation(relation)
+        out_shape = shape_from_relation(
+            relation, broadcast_shapes(lhs_ty.shape, rhs_ty.shape)
+        )
         shard = None
         if isinstance(la, ShardLayout) or isinstance(lb, ShardLayout):
             shard = derive_output_shard_layout((lhs_ty, rhs_ty), relation, out_shape)

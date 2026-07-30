@@ -40,25 +40,23 @@ _QSCALE = 1.0 / math.sqrt(config.gdn_head_k_dim)
 _L2_EPS = 1e-6
 
 
-# The active context length: the only range this kernel carries. DimVar bounds
-# are half-open [lo, hi), so the envelope's exclusive upper bound is max_ctx + 1
-# to keep the largest supported context inside it. The lower bound is 1: a step
-# with no prior context is a prefill, not a decode step.
-C = DimVar("ctx_len", 1, config.max_ctx + 1)
+# Prior-cache length. The caller appends this step's returned K/V entry.
+C = DimVar("ctx_len", 0, config.max_ctx)
 
 # One token per step.
 
 _HQ = config.n_q_heads
 _HKV = config.n_kv_heads
+# Published dimensions; do not derive them from the other fields.
 _D = config.head_dim
 _ROT = config.rotary_dim
 _PASS = config.pass_dim
 _G = config.gqa_group
 
-# The rotary caches need one row per position a step may be decoded at, which is
-# at most ``max_ctx``; ``max_position_embeddings`` is 262144 and a cache that
-# size is 67 MB of zeros nothing reads.
-_ROPE_ROWS = config.max_ctx + 1
+# One row per position a step may be decoded at: `pos_ids` is the prior-cache
+# length, which stops one below ``max_ctx``. ``max_position_embeddings`` is 262144
+# and a cache that size is 67 MB of zeros nothing reads.
+_ROPE_ROWS = config.max_ctx
 
 
 # One token per step.
@@ -296,23 +294,39 @@ class Qwen3_5FullAttention:
         )
         return tf.matmul(gated, w_o), k_rope, v
 
-@module(entry="moe")
-class Qwen3_5MoE:
+@module(entry="routing")
+class Qwen3_5Router:
+    """The block's expert selection, as a Module of its own so it loads and runs
+    by itself. Its output is an index, so a router that picked a different eight
+    would be a different model even if every weight matched."""
+
     @func
     def routing(
         tokens: Tensor[(S, _H), config.dt],
+        # Only ConstTensor parameters are bound by Module.load.
         w_router: ConstTensor[(_H, _E), config.dt],
     ):
         # HF `Qwen3_5MoeTopKRouter`: softmax over every expert in f32, then the
-        # top k, then renormalise. Kept its own function because the selection
-        # is the one value in this block that is an index rather than a number,
-        # and a router that picked a different 8 would be a different model even
-        # if every weight matched.
+        # top k, then renormalise.
         logits = tf.cast(tf.matmul(tokens, w_router), dtype="f32")
         probs = tf.softmax(logits, axis=-1)
         top_vals, indices = tf.topk(probs, k=_K, axis=-1)
         denom = tf.reduce(top_vals, axes=(-1,), keepdim=True, kind="sum")
         return tf.cast(top_vals / denom, dtype=config.dt), indices
+
+
+@module(entry="experts")
+class Qwen3_5MoE:
+    router = Qwen3_5Router
+
+    @func
+    def post_norm(
+        hidden: Tensor[(1, S, _H), config.dt],
+        gamma_post: ConstTensor[(_H,), config.dt],
+    ) -> Tensor[(S, _H), config.dt]:
+        # HF `post_attention_layernorm`, fused here rather than in the layer, and
+        # its own function because the router reads its output.
+        return tf.reshape(tf.rms_norm(hidden, gamma_post), new_shape=(S, _H))
 
     @func
     def routed_experts(
@@ -360,10 +374,10 @@ class Qwen3_5MoE:
         return dense * scale
 
     @func
-    def moe(
-        hidden: Tensor[(1, S, _H), config.dt],
-        gamma_post: ConstTensor[(_H,), config.dt],
-        w_router: ConstTensor[(_H, _E), config.dt],
+    def experts(
+        tokens: Tensor[(S, _H), config.dt],
+        weights: Tensor[(S, _K), config.dt],
+        indices: Tensor[(S, _K), "i64"],
         w_gate: ConstTensor[(_E, _I, _H), config.dt],
         w_up: ConstTensor[(_E, _I, _H), config.dt],
         w_down: ConstTensor[(_E, _H, _I), config.dt],
@@ -372,15 +386,20 @@ class Qwen3_5MoE:
         w_shared_down: ConstTensor[(_IS, _H), config.dt],
         w_shared_scale: ConstTensor[(_H, 1), config.dt],
     ) -> Tensor[(1, S, _H), config.dt]:
-        # Fused post_attention_layernorm + `Qwen3_5MoeSparseMoeBlock`, no
-        # residual (the layer owns the residual add).
-        tokens = tf.reshape(tf.rms_norm(hidden, gamma_post), new_shape=(S, _H))
-        weights, indices = routing(tokens, w_router)
+        # `Qwen3_5MoeSparseMoeBlock` once the selection is made, and everything in
+        # the block that is heavy: the routed experts, the dense shared one, and
+        # their mix. No residual -- the layer owns the residual add.
         routed = routed_experts(tokens, weights, indices, w_gate, w_up, w_down)
         shared = shared_expert(
             tokens, w_shared_gate, w_shared_up, w_shared_down, w_shared_scale
         )
         return tf.reshape(routed + shared, new_shape=(1, S, _H))
+
+    def forward(self, hidden):
+        """One decode step of the block: post-norm, route, then the experts."""
+        tokens = self.post_norm(hidden)
+        weights, indices = self.router.routing(tokens)
+        return self.experts(tokens, weights, indices)
 
 
 def _layer_forward(self, hidden, mixer_args):
@@ -489,6 +508,7 @@ class Qwen3_5Decoder:
     embedding, the walk, the closing norm, the head. Each layer is an independent
     copy, so an analysis of one annotates only it."""
 
+    # The published layer-type cycle determines each layer Module.
     layers = tuple(
         LAYER_TYPE[kind].renamed(f"layer{index}")
         for index, kind in enumerate(config.layer_types)
@@ -562,9 +582,8 @@ class Qwen3_5Decoder:
         A linear-attention layer's two halves are genuinely zero at the start:
         Hugging Face left-pads the convolution window when the context is shorter
         than it, and `initial_state=None` is the zero recurrent matrix. An
-        attention layer gets a container of no positions -- not a decode start,
-        since no prefix produced it and `ctx_len` is bounded below by 1, so
-        `forward` needs a context the caller prefilled.
+        attention layer gets a container of no positions, which `ctx_len` admits:
+        the first step of a sequence attends the one position it brings itself.
         """
         import torch  # noqa: PLC0415
 

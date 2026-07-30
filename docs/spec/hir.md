@@ -214,6 +214,12 @@ freeze** below).
 
 - `variants` is a canonical IR field — it participates in structural
   equality, hashing, and canonical printing.
+- A variant MAY carry a **display label**, taken from the identifier its author
+  decorated ([parser.md §1.1](./parser.md#11-authoring-decorators)). The label is
+  non-canonical metadata: it MUST NOT participate in structural equality,
+  hashing, or the canonical signature, and nothing MAY select an implementation
+  by it. Printing a variant back to source MUST preserve it, since it is the only
+  thing distinguishing two implementations that share a name.
 - Every variant of a base MUST share the base's `name`, `params`, and
   `return_type`: a variant specializes the body, not the signature. A variant
   runs in the same execution domain as its base because both are owned by the
@@ -622,6 +628,12 @@ class Reduce(Op):
 ```
 - constraints:
   - The logical result shape follows numpy reduction rules.
+  - A reduction over an axis of no elements MUST return that kind's identity
+    rather than fail. For `max` that is the least value its result dtype can
+    hold, which is not always `-inf`: an integer dtype cannot hold `-inf`,
+    `bool`'s least value is `False`, and a finite-only float has no infinity.
+    `abs_max` is 0, its results being magnitudes. `sum` is 0. `mean` has no
+    identity — there is nothing to divide by — so it MUST NOT invent one.
   - Storage is preserved.
   - Plain input layout passes through unchanged.
   - For `ShardLayout` input, every split layout position that belongs to a

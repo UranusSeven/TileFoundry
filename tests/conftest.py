@@ -138,3 +138,4 @@ def _tilefoundry_dump_scope(request: pytest.FixtureRequest):
     dumper = FileDumper(test_root)
     with DumpScope(dumper=dumper, flags=DumpFlags.ALL) as scope:
         yield scope
+

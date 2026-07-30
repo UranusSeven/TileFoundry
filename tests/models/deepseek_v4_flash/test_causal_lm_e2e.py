@@ -5,6 +5,7 @@ check parity.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -19,13 +20,13 @@ from tilefoundry.evaluator.value import to_torch_dtype
 from tilefoundry.ir.core.module import Module
 from tilefoundry.runtime import (
     Absolute,
+    Cosine,
+    RelL2,
     SafetensorsResource,
-    bench,
     check,
     runtime_func,
     runtime_module,
 )
-from tilefoundry.target.cuda import CudaTarget
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -33,6 +34,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 #: read the previous one's output; the remaining steps only fill the window, and
 #: running the runtime side over all of them buys the same fact per step.
 TWINNED_STEPS = 2
+
+#: bf16 end to end, one f32->bf16 landing per kernel: the two bounds the real
+#: bring-up ran on throughout. Stated here because there is no default bound.
+_AGREES = (RelL2(max=1e-3), Cosine(min=0.999))
 
 EXPECTED_PREPARED_KEYS = {
     "table",
@@ -258,15 +263,23 @@ def test_prepare_and_parity(config, raw_tensors, prepared, twins):
     )
 
     inputs = _node_inputs(semantic, config)
+    step_and_latent = {"output[0]": _AGREES, "output[1]": _AGREES}
     nodes = {
-        "attention": (runtime.layer0.attention, semantic.layer0.attention),
-        "moe": (runtime.layer0.moe, semantic.layer0.moe),
-        "layer0": (runtime.layer0, semantic.layer0),
-        "root": (runtime, semantic),
+        "attention": (runtime.layer0.attention, semantic.layer0.attention, step_and_latent),
+        "moe": (runtime.layer0.moe, semantic.layer0.moe, {"output": _AGREES}),
+        "layer0": (runtime.layer0, semantic.layer0, step_and_latent),
+        "root": (
+            runtime,
+            semantic,
+            {
+                "output[0]": _AGREES,
+                **{f"output[1][{i}]": _AGREES for i in range(config.n_layers)},
+            },
+        ),
     }
-    for name, (candidate, reference) in nodes.items():
-        report = check(candidate.forward, reference.forward, inputs[name])
-        assert report.passed, f"{name}: {dict(report.metrics)}"
+    for name, (candidate, reference, expect) in nodes.items():
+        report = check(candidate.forward, reference.forward, inputs[name], expect=expect)
+        assert report.passed, f"{name}: {report}"
         assert "forward" not in vars(type(candidate)), name
 
 
@@ -298,8 +311,9 @@ def test_the_generate_loop_threads_state_and_stops_at_the_window(config, twins):
         lambda: candidate_logits,
         lambda: reference_logits[:TWINNED_STEPS],
         (),
+        expect={f"output[{step}]": _AGREES for step in range(TWINNED_STEPS)},
     )
-    assert report.passed, dict(report.metrics)
+    assert report.passed, report
     for step, logits in enumerate(reference_logits):
         assert torch.isfinite(logits.float()).all(), step
 
@@ -353,6 +367,32 @@ def test_structure_mismatch_rejected(config, twins):
             def mla_attend_extra(self, *args):
                 raise AssertionError("never called")
 
+    # `module` is a name an authored Module may legitimately use, and a twin
+    # answers to it itself, so the collision is refused from either side.
+    with pytest.raises(TypeError, match="a runtime twin reserves"):
+        @runtime_module(replace(attention, methods={**attention.methods, "module": None}))
+        class ReservedInTheModule:
+            @runtime_func
+            def mla_kv_update(self, *args):
+                raise AssertionError("never called")
+
+            @runtime_func
+            def mla_attend(self, *args):
+                raise AssertionError("never called")
+
+    with pytest.raises(TypeError, match="a runtime twin reserves"):
+        @runtime_module(attention)
+        class ReservedInTheTwin:
+            module = "not a Module"
+
+            @runtime_func
+            def mla_kv_update(self, *args):
+                raise AssertionError("never called")
+
+            @runtime_func
+            def mla_attend(self, *args):
+                raise AssertionError("never called")
+
     with pytest.raises(TypeError, match=r"child module names.*missing \['moe'\]"):
         @runtime_module(layer)
         class MissingChild:
@@ -369,8 +409,3 @@ def test_structure_mismatch_rejected(config, twins):
             @runtime_func
             def residual_add(self, *args):
                 raise AssertionError("never called")
-
-    inputs = _node_inputs(semantic, config)["attention"]
-    report = bench(runtime.layer0.attention.forward, inputs, iters=3, device=CudaTarget().device)
-    assert report.metrics["mean_ms"] > 0
-    assert report.passed is None
