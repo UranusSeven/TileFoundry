@@ -363,6 +363,8 @@ class: both implementations below take an `alias={canonical: raw}` table,
 resolved by the same lookup order.
 
 ```python
+AliasValue = str | tuple[str, ...] | Absolute
+
 class RuntimeResource(Protocol):
     def load(self, name: str) -> torch.Tensor: ...
     def load_group(self, name: str) -> "tuple[torch.Tensor, ...] | None": ...
@@ -396,19 +398,30 @@ tuple value is the one-to-many group `load_group` reads; `subtree`'s own
 segment resolution rejects a tuple-valued hit (a subtree segment MUST
 resolve to one name).
 
+Aliasing therefore only ever reaches **downward**: a name resolved inside a
+scope carries that scope's prefix, so a node cannot address a tensor its
+parent owns — and a checkpoint may well store one there, such as a
+layer-level norm weight a child consumes. `Absolute(name)` is the escape: an
+alias whose value is `Absolute` MUST resolve to `name` as the whole raw key,
+with no prefix joined onto it. It stays a leaf-only form — `load_group` reads
+it as the one-to-one case and returns `None`, and `subtree` MUST reject it in
+the same shape as a tuple-valued hit, because a subtree segment must resolve
+to one relative name.
+
 Two implementations:
 
 ```python
 class DictResource:
     def __init__(
         self, data: Mapping[str, torch.Tensor], prefix: str = "",
-        alias: "Mapping[str, str | tuple[str, ...]] | None" = None,
+        alias: "Mapping[str, AliasValue] | None" = None,
     ) -> None: ...
 
 class SafetensorsResource:
     def __init__(
         self, ckpt_dir: str, prefix: str = "", device: str = "cuda",
-        alias: "Mapping[str, str | tuple[str, ...]] | None" = None,
+        alias: "Mapping[str, AliasValue] | None" = None,
+        dtype: "torch.dtype | None" = None,
     ) -> None: ...
 ```
 
@@ -417,11 +430,21 @@ class SafetensorsResource:
     `{"layer0.w": tensor, ...}` mapping; `subtree` only extends the prefix
     each `load` / `load_group` name is joined onto, carrying `alias` down to
     every child view.
-  - `SafetensorsResource` — reads a repacked safetensors checkpoint
-    directory (N shard files + `model.safetensors.index.json`'s
-    `weight_map`); `load` / `load_group` open at most one shard handle per
-    shard file (mmap'd via `safetensors.safe_open`, shared across `subtree`
-    views) and read only the requested tensor(s), placed on *device*.
+  - `SafetensorsResource` — reads a safetensors checkpoint directory; `load` /
+    `load_group` open at most one shard handle per shard file (mmap'd via
+    `safetensors.safe_open`, shared across `subtree` views) and read only the
+    requested tensor(s), placed on *device*. Two directory shapes MUST be
+    accepted: N shard files with a `model.safetensors.index.json` whose
+    `weight_map` names the shard holding each key, and a single unsharded
+    `model.safetensors` with no index, whose own key list is that map — a
+    published checkpoint is only sharded once it outgrows the writer's limit,
+    so requiring an index would refuse the small ones. A directory with
+    neither MUST be reported as such rather than as a missing index.
+  - `dtype`, when given, is the dtype every tensor is read as, whatever the
+    checkpoint stores it as; the same value carries down to every `subtree`
+    view. Without it, a tensor keeps its stored dtype. This is what lets one
+    checkpoint serve modules that declare a different precision than it holds:
+    the alternative is a per-weight converter whose only work is a cast.
 
 ### 1.6 `check` / `bench`
 

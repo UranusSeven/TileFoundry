@@ -401,6 +401,16 @@ surface aliases ([core-ir §2.3](./core-ir.md)) over the kinded Ops; there are n
 per-name IR classes.
 [torch element-wise ops](https://pytorch.org/docs/stable/torch.html#pointwise-ops).
 
+One spelling is preferred, so that two authors reading the same IR write it the
+same way: an arithmetic or comparison operand pair SHOULD be written with the
+Python operator (`a + b`, `a * b`, `a < b`), and a sub-tensor SHOULD be written as
+a subscript (`x[:, :, j:j + 1]`, `x[:, :, 3]`). The named forms `add(a, b)` and
+`slice(x, begin=…, end=…, strides=…)` remain the underlying surface — they are what
+the operator and subscript resolve to, and they stay available where a name must be
+computed — but they are not the form to reach for first. Both spellings build the
+same IR, so the choice carries no semantic weight; leaving it open is what lets one
+model read one way and its neighbour another.
+
 ##### Binary
 ```python
 class Binary(Op):
@@ -417,7 +427,11 @@ class Binary(Op):
     kind: BinaryKind
 ```
 - constraints:
-  - Behavior follows torch pointwise semantics with TileFoundry type promotion.
+  - Values follow torch pointwise semantics; dtypes do not promote. Both operands
+    MUST already carry the same `dtype`, and typeinfer MUST reject a mismatch. A
+    Python float scalar is given the other operand's float dtype by the authoring
+    surface, before it is an operand at all ([parser §1.9](./parser.md)); a Python
+    integer is not.
   - The elementwise `min` / `max` kinds are also surfaced as `minimum` / `maximum`.
   - A `ShardLayout` operand carrying `Partial(reduction)` propagates to the
     output only when `kind` provably commutes with `reduction`
@@ -768,6 +782,26 @@ class Gelu(Op):
     GELU is **not** monotone and commutes with no reduction — unlike the
     `ReLU` / `Sigmoid` / `Tanh` group above, which commutes with `max` / `min`.
     typeinfer rejects any `Partial` operand with a `Reshard` remedy.
+
+##### Silu
+```python
+class Silu(Op):
+    """Sigmoid Linear Unit — ``x * sigmoid(x)`` as one op.
+
+    Attributes:
+        x: input; tensor the activation applies to elementwise.
+    """
+
+    x: Tensor
+```
+- constraints:
+  - Elementwise: the output type, shape, and layout are `x`'s.
+  - Fused rather than decomposed into `Sigmoid` + `Binary(MUL)`: the fused form
+    does not round the intermediate `sigmoid(x)` to `x`'s dtype, so at reduced
+    precision the two differ by up to ~1 ULP per element.
+  - `x * sigmoid(x)` has a minimum near `x = -1.278`, so SiLU is **not** monotone
+    and commutes with no reduction; typeinfer rejects any `Partial` operand with a
+    `Reshard` remedy, as `Gelu` does.
 
 ##### RMSNorm
 ```python
