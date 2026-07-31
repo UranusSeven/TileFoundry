@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -35,17 +36,20 @@ PROMPT = "Explain why the sky appears blue in one sentence."
 STEPS = 16
 DEV = "cuda"
 
-# The published fields this run reads, and the shape field each one becomes.
-_PUBLISHED = {
-    "hidden": "hidden_size",
-    "head_dim": "head_dim",
-    "n_q_heads": "num_attention_heads",
-    "n_kv_heads": "num_key_value_heads",
-    "intermediate": "intermediate_size",
-    "vocab": "vocab_size",
-    "max_pos": "max_position_embeddings",
-    "n_layers": "num_hidden_layers",
-}
+#: The dtype the checkpoint publishes, and so the dtype both sides decode at.
+DTYPE = torch.bfloat16
+
+# The published keys this run reads off the mounted checkpoint.
+_PUBLISHED = (
+    "hidden_size",
+    "head_dim",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "intermediate_size",
+    "vocab_size",
+    "max_position_embeddings",
+    "num_hidden_layers",
+)
 
 # Canonical name -> published key. The seven projections and the head resolve to
 # the keys their converters read; `layer{i}` is a subtree segment, not a leaf.
@@ -65,18 +69,6 @@ _ALIAS = {
     "up_proj_weight": "mlp.up_proj.weight",
     "down_proj_weight": "mlp.down_proj.weight",
 }
-
-# The `tests.models.qwen3_1_7b.config` the emitted source imports `REAL` from. The
-# wheel ships model source and not this module, so the run writes it from the
-# mounted checkpoint: the dimensions the source binds to are the decoded ones.
-_COMPANION = '''\
-"""Qwen3-1.7B's dimensions, read from the mounted checkpoint."""
-from types import SimpleNamespace
-
-REAL = SimpleNamespace(
-{fields}
-)
-'''
 
 
 def _installed(venv: Path) -> None:
@@ -99,7 +91,7 @@ def _published(mount: Path) -> dict:
     read = json.loads(stated.read_text(encoding="utf-8"))
     if read.get("model_type") != "qwen3":
         raise SystemExit(f"{mount} publishes model_type {read.get('model_type')!r}")
-    missing = sorted(key for key in _PUBLISHED.values() if key not in read)
+    missing = sorted(key for key in _PUBLISHED if key not in read)
     if missing:
         raise SystemExit(f"{stated} states no {', '.join(missing)}")
     if not sorted(mount.glob("model*.safetensors*")):
@@ -107,7 +99,7 @@ def _published(mount: Path) -> dict:
     return read
 
 
-def _emitted(venv: Path, work: Path, outside: Path) -> Path:
+def _emitted(venv: Path, work: Path, outside: Path, mount: Path) -> Path:
     """Ask the installation for the model source, and write it where it will run."""
     done = subprocess.run(
         [str(venv / "bin" / "tilefoundry"), "models", MODEL, "--source"],
@@ -120,39 +112,17 @@ def _emitted(venv: Path, work: Path, outside: Path) -> Path:
         )
     source = work / "model.py"
     source.write_text(done.stdout, encoding="utf-8")
+    # The source reads its dimensions from a `config.json` beside it, so the
+    # mounted checkpoint's own file is what it binds to here.
+    shutil.copyfile(mount / "config.json", work / "config.json")
     print(f"emitted {len(done.stdout)} characters of {MODEL} source to {source}")
     return source
 
 
-def _companion(work: Path, published: dict) -> Path:
-    """Write the config module the emitted source imports, and return its root."""
-    fields = {field: published[key] for field, key in _PUBLISHED.items()}
-    fields.update(
-        # A position past the rotary cache has no embedding to gather.
-        max_ctx=fields["max_pos"],
-        # The dtype the kernels are authored at, not a published field.
-        dt="f32",
-        gqa_group=fields["n_q_heads"] // fields["n_kv_heads"],
-        q_proj=fields["n_q_heads"] * fields["head_dim"],
-        kv_proj=fields["n_kv_heads"] * fields["head_dim"],
-    )
-
-    root = work / "companion"
-    package = root / "tests" / "models" / MODEL
-    package.mkdir(parents=True, exist_ok=True)
-    for name in ("tests", "tests/models", f"tests/models/{MODEL}"):
-        (root / name / "__init__.py").write_text("", encoding="utf-8")
-    rendered = "\n".join(f"    {name}={value!r}," for name, value in fields.items())
-    package.joinpath("config.py").write_text(
-        _COMPANION.format(fields=rendered), encoding="utf-8"
-    )
-    return root
-
-
 def _oracle(mount: Path):
-    """The published model and tokenizer, at the f32 the kernels are authored at."""
+    """The published model and tokenizer, at the dtype the checkpoint publishes."""
     tokenizer = AutoTokenizer.from_pretrained(str(mount))
-    model = AutoModelForCausalLM.from_pretrained(str(mount), dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(str(mount), dtype=DTYPE)
     return tokenizer, model.to(DEV).eval()
 
 
@@ -163,20 +133,16 @@ def _rope_caches(config, rows: int):
     reproduces the cos / sin the published attention applies.
     """
     rotary = Qwen3RotaryEmbedding(config).to(DEV)
-    reference = torch.zeros(1, rows, config.hidden_size, device=DEV)
+    reference = torch.zeros(1, rows, config.hidden_size, device=DEV, dtype=DTYPE)
     cos, sin = rotary(reference, torch.arange(rows, device=DEV).unsqueeze(0))
-    return cos[0], sin[0]
+    return cos[0].to(DTYPE), sin[0].to(DTYPE)
 
 
 def _loaded(source: Path, work: Path, mount: Path, n_layers: int):
     """The emitted decoder with the published weights bound, through `prepare`."""
     root = runpy.run_path(str(source))["Qwen3_1_7B_Decoder"].cloned()
     alias = {**_ALIAS, **{f"layer{i}": f"model.layers.{i}" for i in range(n_layers)}}
-    raw = SafetensorsResource(
-        str(mount), device="cpu", alias=alias, dtype=torch.float32
-    )
-    # The canonical store is twice the checkpoint: published bf16 weights land at
-    # the f32 the kernels are authored at.
+    raw = SafetensorsResource(str(mount), device="cpu", alias=alias, dtype=DTYPE)
     prepared = work / "prepared"
     root.prepare(raw, str(prepared), device="cpu")
     return root.load(SafetensorsResource(str(prepared), device=DEV))
@@ -235,14 +201,13 @@ def main(argv: list[str] | None = None) -> int:
     if not args.checkpoint.is_dir():
         raise SystemExit(f"--checkpoint {args.checkpoint} is not a directory")
     if not torch.cuda.is_available():
-        raise SystemExit("no CUDA device: this decodes two f32 copies of a 1.7B model")
+        raise SystemExit("no CUDA device: this decodes two copies of a 1.7B model")
 
     _installed(args.venv)
     published = _published(args.checkpoint)
     args.work.mkdir(parents=True, exist_ok=True)
 
-    source = _emitted(args.venv, args.work, args.outside)
-    sys.path.insert(0, str(_companion(args.work, published)))
+    source = _emitted(args.venv, args.work, args.outside, args.checkpoint)
 
     tokenizer, model = _oracle(args.checkpoint)
     loaded = _loaded(source, args.work, args.checkpoint, published["num_hidden_layers"])
@@ -254,7 +219,7 @@ def main(argv: list[str] | None = None) -> int:
     context, want = _hf_greedy(model, prompt_ids)
     cos, sin = _rope_caches(model.config, published["max_position_embeddings"])
     scale = torch.full(
-        (1, 1, 1, 1), model.model.layers[0].self_attn.scaling, device=DEV
+        (1, 1, 1, 1), model.model.layers[0].self_attn.scaling, device=DEV, dtype=DTYPE
     )
 
     caches, token, got = context, prompt_ids[0, -1:], []
