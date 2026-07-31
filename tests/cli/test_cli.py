@@ -154,6 +154,57 @@ def test_spec_rejects_a_section_that_does_not_exist(capsys) -> None:
     assert "silu" in error
 
 
+@pytest.mark.parametrize(
+    ("topic", "section", "expected"),
+    (
+        ("target", "topology-levels", "Only `cta` MAY have a launch-provided"),
+        ("core-ir", "target-inheritance", 'with `target="cuda"`'),
+        ("core-ir", "default-step", "MUST have no default step"),
+    ),
+)
+def test_spec_answers_the_target_and_default_step_rules(
+    topic, section, expected, capsys
+) -> None:
+    """The rules' stable slug keys are directly askable."""
+    assert cli.main(["spec", topic, section]) == 0
+
+    assert expected in capsys.readouterr().out
+
+
+def test_schedule_refusal_of_a_launch_provided_level_points_to_the_spec(
+    tmp_path, capsys
+) -> None:
+    """A schedule refusal points to the rule that distinguishes launch shape."""
+    path = _write_module(
+        tmp_path,
+        _VALID_MODULE.replace(
+            'Topology("cta", 168)', 'Topology("cta", None)', 1
+        ),
+    )
+
+    assert cli.main(["schedule", str(path), "--topology", "cta"]) == 1
+
+    error = capsys.readouterr().err
+    assert "not known until launch" in error
+    assert "The rule: tilefoundry spec target topology-levels" in error
+
+
+def test_module_without_an_entry_names_its_functions_and_rule(tmp_path, capsys) -> None:
+    """An absent default step names both the callable choices and its contract."""
+    path = _write_module(
+        tmp_path,
+        _VALID_MODULE.replace(
+            '@module(entry="main", target=CudaTarget())', '@module(target=CudaTarget())'
+        ),
+    )
+
+    assert cli.main(["schedule", str(path), "--topology", "cta"]) == 1
+
+    error = capsys.readouterr().err
+    assert "declares no entry, so it has no default step. It declares main" in error
+    assert "The rule: tilefoundry spec core-ir default-step" in error
+
+
 def test_inspect_capabilities_is_compact(tmp_path, capsys) -> None:
     path = _write_module(tmp_path)
     assert cli.main(["inspect", "capabilities", f"{path}:Model.main"]) == 0
