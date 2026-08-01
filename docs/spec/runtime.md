@@ -204,14 +204,16 @@ class LoadedModule:  # tilefoundry.ir.core.module — one reading of a Module
     from the directory this writes.
   - `Module.load(resource)`: read this node's `weights`
     ([core-ir §1](./core-ir.md#1-module)) by name from `resource` and recurse
-    into each child under `resource.subtree(child.name)`, **returning a
-    `LoadedModule` tree**. It MUST NOT write bindings onto the `Module`, which
-    stays pure IR: one `Module` may be read any number of times — two
-    checkpoints, two devices — and each reading is independent of the others.
-    A child reached from two owners therefore yields one `LoadedModule` per
-    owner rather than one binding the last owner wins. This is the
-    semantic-side counterpart of the `RuntimeModule` twin's own `load` (§1.1),
-    which still binds itself in place.
+    into each child under `resource.subtree(child.name)`, strictly validating
+    every read tensor's shape and dtype against its declared `ConstTensor`
+    type, **returning a `LoadedModule` tree**. It MUST NOT write bindings onto
+    the `Module`, which stays pure IR: one `Module` may be read any number of
+    times — two checkpoints, two devices — and each reading is independent of
+    the others. A child reached from two owners therefore yields one
+    `LoadedModule` per owner rather than one binding the last owner wins. This
+    is the semantic-side counterpart of the `RuntimeModule` twin's own `load`
+    (§1.1), which validates against the same declarations before binding in
+    place.
   - `LoadedModule` attribute access mirrors the `Module`'s
     ([core-ir §1.1](./core-ir.md#11-function-access)) against that reading: a
     function resolves to a callable taking **activations alone**, its
@@ -254,6 +256,17 @@ class LoadedModule:  # tilefoundry.ir.core.module — one reading of a Module
     left to fail as a shape error inside the evaluator. `check` compares the
     semantic and runtime forwards (§1.6). A multi-node composition is chained
     by the caller, one `forward` (or one named function call) per node.
+  - a causal-LM root MAY define `init_caches`,
+    `prepare_inputs_for_generation`, and `append_cache` orchestration methods.
+    `prepare_inputs_for_generation(input_ids, step, caches, *, device)` receives
+    a one-dimensional `torch.Tensor` of token IDs. The model selects the token
+    at `step`, reshapes and places it, creates all other activation inputs in
+    its own `forward` order, and returns that positional tuple. The caller owns
+    the cache and expands only the token-ID tensor; it MUST NOT reconstruct a
+    model's positional, rotary, scaling, or state inputs. It passes the active
+    token-ID prefix as a view; a method MUST NOT mutate that view or retain it
+    across steps. These methods bind on a `LoadedModule` and its runtime twin in
+    the same way as `forward`.
 
 ### 1.1.3 Internal Pipeline (compiled origin)
 
@@ -374,7 +387,11 @@ class: both implementations below take an `alias={canonical: raw}` table,
 resolved by the same lookup order.
 
 ```python
-AliasValue = str | tuple[str, ...] | Absolute
+AliasValue = str | tuple[str, ...] | Absolute | Preprocessed
+
+class Preprocessed:
+    name: str | Absolute
+    read: Callable[[torch.Tensor], torch.Tensor]
 
 class RuntimeResource(Protocol):
     def load(self, name: str) -> torch.Tensor: ...
@@ -383,6 +400,8 @@ class RuntimeResource(Protocol):
 ```
 
 - constraints:
+  - `Preprocessed` is a frozen dataclass carrying one raw name and its one-tensor
+    read transform.
   - `load(name)` returns the tensor for *name*; raises `KeyError` if absent,
     and MUST raise `TypeError` (naming `load_group`) if *name* resolves to a
     tuple-valued (one-to-many) alias.
@@ -394,9 +413,16 @@ class RuntimeResource(Protocol):
     (`seg` is itself alias-resolved), so a child `RuntimeModule` addresses
     its own weights by their bare (unprefixed) name — `RuntimeModule.__init__`
     never sees a dotted name.
-  - the resource only looks names up and returns tensors; it never stacks,
-    casts, or reshapes — assembling a one-to-many group into one tensor is
-    `prepare`'s job (§1.1.2), via `torch.stack`.
+  - the resource resolves names and reads tensors. It MUST NOT stack, and it
+    reshapes only where a `Preprocessed` alias entry states that the checkpoint
+    stores that one tensor differently from how the Module declares it — a
+    transpose, a slice of a fused tensor, or a dropped axis. Assembling a
+    one-to-many group into one tensor stays `prepare`'s job (§1.1.2), via
+    `torch.stack`, and so does any value that is a function of more than one raw
+    tensor. `Preprocessed` MUST resolve to one name: a tuple-valued name is
+    rejected at construction, naming the weight converter as the way to express
+    it. Precision is not preprocessing: a read MUST return the checkpoint's own
+    stored element type and be validated against the declaration (§1.1.2).
 
 An `alias` entry renames one path *segment* or *leaf* **within the current
 scope**, joined onto the caller's already-accumulated prefix: lookup order is
@@ -405,9 +431,10 @@ then identity (`f"{prefix}{name}"` unchanged). A bare entry therefore serves
 every instance at that level uniformly (e.g. `{"gamma_kv": "kv_norm.weight"}`
 fires under every layer); a per-instance name (one real decoder layer, one
 per-expert shard group) needs one literal entry per instance instead. A
-tuple value is the one-to-many group `load_group` reads; `subtree`'s own
-segment resolution rejects a tuple-valued hit (a subtree segment MUST
-resolve to one name).
+`Preprocessed` value is a one-to-one leaf: `load` applies its `read` callable
+to the raw tensor. A tuple value is the one-to-many group `load_group` reads;
+`subtree`'s own segment resolution rejects a tuple-valued or `Preprocessed` hit
+(a subtree segment MUST resolve to one relative path).
 
 Aliasing therefore only ever reaches **downward**: a name resolved inside a
 scope carries that scope's prefix, so a node cannot address a tensor its
@@ -432,7 +459,6 @@ class SafetensorsResource:
     def __init__(
         self, ckpt_dir: str, prefix: str = "", device: str = "cuda",
         alias: "Mapping[str, AliasValue] | None" = None,
-        dtype: "torch.dtype | None" = None,
     ) -> None: ...
 ```
 
@@ -451,11 +477,10 @@ class SafetensorsResource:
     published checkpoint is only sharded once it outgrows the writer's limit,
     so requiring an index would refuse the small ones. A directory with
     neither MUST be reported as such rather than as a missing index.
-  - `dtype`, when given, is the dtype every tensor is read as, whatever the
-    checkpoint stores it as; the same value carries down to every `subtree`
-    view. Without it, a tensor keeps its stored dtype. This is what lets one
-    checkpoint serve modules that declare a different precision than it holds:
-    the alternative is a per-weight converter whose only work is a cast.
+  - every read tensor keeps the element type the checkpoint stores. A
+    declaration requiring a different precision uses a weight converter
+    (§1.1.2), and `load` validates the converted or raw result against that
+    declaration.
 
 ### 1.6 `check`
 

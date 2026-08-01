@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from tilefoundry.cli import data, models
 
 REPO = Path(__file__).resolve().parents[3]
@@ -34,8 +36,8 @@ def test_models_renders_the_whole_forest_with_leaf_modules_marked(tf) -> None:
     forest = done.stdout
 
     assert "28 leaf modules, 115 functions" in forest
-    assert "  Qwen3_1_7B_Decoder\n" in forest
-    assert "* Qwen3_1_7B\n" not in forest
+    assert "  Qwen3_1_7B\n" in forest
+    assert "* Qwen3_1_7B_DecoderLayer\n" not in forest
     assert "*   layer0..layer27  (28 identical, each as shown)" in forest
     assert "layer1\n" not in forest
     assert "input_rms_norm(hidden: Tensor[(1, 1, 2048), \"bf16\"]" in forest
@@ -56,15 +58,25 @@ def test_models_source_names_the_shipped_directory_and_its_files(tf, shipped, tm
         and "Qwen3-1.7B's dense decoder layer and the stack that closes it" in line
         for line in lines[1:]
     )
+    assert any(
+        line.startswith("hf_alias.py")
+        and "The published checkpoint as this model's weights" in line
+        for line in lines[1:]
+    )
     assert any(line.startswith("config.json") and line.endswith("-") for line in lines[1:])
 
     copied = tmp_path / "mine"
     shutil.copytree(source, copied)
-    static = f"{copied / 'model.py'}:Qwen3_1_7B_Decoder.layer0.mlp"
+    static = f"{copied / 'model.py'}:Qwen3_1_7B.layer0.mlp"
     analysed = tf("analyze", static, "--compute-cost")
     assert analysed.returncode == 0, analysed.stderr
     assert "target=cuda" in analysed.stdout
     assert "flops" in analysed.stdout and "traffic gmem=" in analysed.stdout
+
+    targetless = f"{copied / 'model.py'}:Qwen3_1_7B_DecoderLayer"
+    rejected = tf("analyze", targetless, "--compute-cost")
+    assert rejected.returncode == 1
+    assert "no target is declared" in rejected.stderr
 
     environment = dict(os.environ)
     environment.pop("PYTHONPATH", None)
@@ -85,6 +97,26 @@ def test_models_source_names_the_shipped_directory_and_its_files(tf, shipped, tm
     )
     assert checkout.returncode == 0, checkout.stderr
     assert _listed_names(checkout.stdout) == _listed_names(done.stdout)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("qwen3_1_7b", "qwen2_5_1_5b", "gemma2_2b", "minicpm3_4b", "qwen3_5_35b_a3b"),
+)
+def test_models_source_lists_each_shipped_hf_alias(tf, capsys, name) -> None:
+    """A raw-checkpoint model ships its own table, in manifest order."""
+    done = tf("models", name, "--source")
+    assert done.returncode == 0, done.stderr
+    lines = done.stdout.splitlines()
+    assert lines[1].startswith("model.py")
+    assert any(
+        line.startswith("hf_alias.py")
+        and "The published checkpoint as this model's weights" in line
+        for line in lines[2:]
+    )
+
+    assert models.run_models(name, source=True) == 0
+    assert _listed_names(capsys.readouterr().out) == _listed_names(done.stdout)
 
 
 def test_models_source_follows_the_manifest_without_importing_files(
@@ -134,7 +166,7 @@ def test_the_shipped_source_answers_the_public_commands_as_it_ships(
 ) -> None:
     """No editing step: the root declares its machine, so the commands answer."""
     source = Path(shipped["models"]) / "qwen3_1_7b" / "model.py"
-    static = f"{source}:Qwen3_1_7B_Decoder.layer0.mlp"
+    static = f"{source}:Qwen3_1_7B.layer0.mlp"
 
     scheduled = tf("schedule", static, "--topology", "cta")
     assert scheduled.returncode == 0, scheduled.stderr
@@ -145,7 +177,7 @@ def test_the_shipped_source_answers_the_public_commands_as_it_ships(
     assert "pipeline schedule" in threaded.stdout
 
     # A selector whose extent is stated at launch takes it on the command line.
-    dynamic = f"{source}:Qwen3_1_7B_Decoder.layer0.self_attention"
+    dynamic = f"{source}:Qwen3_1_7B.layer0.self_attention"
     sized = tf("analyze", dynamic, "--compute-cost", "--dim", "ctx_len=1024")
     assert sized.returncode == 0, sized.stderr
     assert "flops" in sized.stdout

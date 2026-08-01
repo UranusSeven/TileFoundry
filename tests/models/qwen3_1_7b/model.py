@@ -51,6 +51,7 @@ tensor the head split already produces.
 from __future__ import annotations
 
 import json
+from functools import lru_cache
 from pathlib import Path
 
 from transformers import Qwen3Config
@@ -71,11 +72,6 @@ def published(path: Path | None = None) -> Qwen3Config:
 
 config = published()
 
-#: The longest prior cache these kernels are authored for. Not a published field:
-#: `max_position_embeddings` is where the checkpoint stops, and a position beyond
-#: the rotary cache has no embedding to gather, so the envelope is that limit.
-MAX_CTX = config.max_position_embeddings
-
 # The published dtype as the DSL spells it. The checkpoint stores its weights at
 # this precision, so it is what a kernel reading them consumes.
 _DT = {"bfloat16": "bf16", "float16": "f16", "float32": "f32"}[
@@ -91,9 +87,10 @@ _GQA = config.num_attention_heads // config.num_key_value_heads
 _EPS = config.rms_norm_eps
 
 # The prior cache this step reads: the only range this model carries. Zero is a
-# first step, and the exclusive upper bound is max_ctx because a position beyond
+# first step, and the exclusive upper bound is `config.max_position_embeddings`
+# because a position beyond
 # the rotary cache has no embedding to gather.
-C = DimVar("ctx_len", 0, MAX_CTX)
+C = DimVar("ctx_len", 0, config.max_position_embeddings)
 
 # One token per step.
 S = 1
@@ -101,8 +98,30 @@ S = 1
 _G = _GQA
 
 
+def _generation_device(device):
+    import torch  # noqa: PLC0415
+
+    return torch.accelerator.current_accelerator() if device is None else device
+
+
+@lru_cache(maxsize=None)
+def _generation_rope(device):
+    import torch  # noqa: PLC0415
+
+    dim = config.head_dim
+    inverse = 1.0 / (
+        config.rope_parameters["rope_theta"]
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+    )
+    phases = torch.outer(
+        torch.arange(config.max_position_embeddings, device=device, dtype=torch.float32), inverse
+    )
+    phases = torch.cat((phases, phases), dim=-1)
+    return phases.cos().to(config.dtype), phases.sin().to(config.dtype)
+
+
 @module(entry="decoder_layer")
-class Qwen3_1_7B:
+class Qwen3_1_7B_DecoderLayer:
     @func
     def input_rms_norm(
         hidden: Tensor[(1, S, config.hidden_size), _DT],
@@ -246,82 +265,15 @@ class Qwen3_1_7B:
         mlp_out = mlp(h1, gamma_post, w_gate, w_up, w_down)
         return h1 + mlp_out, k_new, v_new
 
-    # HF stores every projection as `nn.Linear.weight`, `(out, in)`; the matmuls
-    # above want `(1, in, out)`. Seven separate declarations rather than one
-    # mapping, because each names the published key it reads.
-
-    @decoder_layer.converter("w_q")
-    def _w_q(
-        q_proj_weight: ConstTensor[(_Q_PROJ, config.hidden_size), _DT],
-    ) -> Tensor[(1, config.hidden_size, _Q_PROJ), _DT]:
-        return tf.reshape(
-            tf.transpose(q_proj_weight, perm=(1, 0)),
-            new_shape=(1, config.hidden_size, _Q_PROJ),
-        )
-
-    @decoder_layer.converter("w_k")
-    def _w_k(
-        k_proj_weight: ConstTensor[(_KV_PROJ, config.hidden_size), _DT],
-    ) -> Tensor[(1, config.hidden_size, _KV_PROJ), _DT]:
-        return tf.reshape(
-            tf.transpose(k_proj_weight, perm=(1, 0)),
-            new_shape=(1, config.hidden_size, _KV_PROJ),
-        )
-
-    @decoder_layer.converter("w_v")
-    def _w_v(
-        v_proj_weight: ConstTensor[(_KV_PROJ, config.hidden_size), _DT],
-    ) -> Tensor[(1, config.hidden_size, _KV_PROJ), _DT]:
-        return tf.reshape(
-            tf.transpose(v_proj_weight, perm=(1, 0)),
-            new_shape=(1, config.hidden_size, _KV_PROJ),
-        )
-
-    @decoder_layer.converter("w_o")
-    def _w_o(
-        o_proj_weight: ConstTensor[(config.hidden_size, _Q_PROJ), _DT],
-    ) -> Tensor[(1, _Q_PROJ, config.hidden_size), _DT]:
-        return tf.reshape(
-            tf.transpose(o_proj_weight, perm=(1, 0)),
-            new_shape=(1, _Q_PROJ, config.hidden_size),
-        )
-
-    @decoder_layer.converter("w_gate")
-    def _w_gate(
-        gate_proj_weight: ConstTensor[(config.intermediate_size, config.hidden_size), _DT],
-    ) -> Tensor[(1, config.hidden_size, config.intermediate_size), _DT]:
-        return tf.reshape(
-            tf.transpose(gate_proj_weight, perm=(1, 0)),
-            new_shape=(1, config.hidden_size, config.intermediate_size),
-        )
-
-    @decoder_layer.converter("w_up")
-    def _w_up(
-        up_proj_weight: ConstTensor[(config.intermediate_size, config.hidden_size), _DT],
-    ) -> Tensor[(1, config.hidden_size, config.intermediate_size), _DT]:
-        return tf.reshape(
-            tf.transpose(up_proj_weight, perm=(1, 0)),
-            new_shape=(1, config.hidden_size, config.intermediate_size),
-        )
-
-    @decoder_layer.converter("w_down")
-    def _w_down(
-        down_proj_weight: ConstTensor[(config.hidden_size, config.intermediate_size), _DT],
-    ) -> Tensor[(1, config.intermediate_size, config.hidden_size), _DT]:
-        return tf.reshape(
-            tf.transpose(down_proj_weight, perm=(1, 0)),
-            new_shape=(1, config.intermediate_size, config.hidden_size),
-        )
-
 
 @module(target=CudaTarget("nvidia.h200_sxm"))
-class Qwen3_1_7B_Decoder:
+class Qwen3_1_7B:
     """The ordered layer stack plus the norm that closes it."""
 
     topologies = (Topology("cta", 132), Topology("thread", 512))
 
     layers = tuple(
-        Qwen3_1_7B.renamed(f"layer{index}")
+        Qwen3_1_7B_DecoderLayer.renamed(f"layer{index}")
         for index in range(config.num_hidden_layers)
     )
 
@@ -352,14 +304,6 @@ class Qwen3_1_7B_Decoder:
         w_head: ConstTensor[(config.hidden_size, config.vocab_size), _DT],
     ) -> Tensor[(1, config.vocab_size), _DT]:
         return tf.matmul(tf.reshape(hidden, new_shape=(1, config.hidden_size)), w_head)
-
-    @lm_head.converter("w_head")
-    def _(
-        head_weight_raw: ConstTensor[(config.vocab_size, config.hidden_size), _DT],
-    ) -> Tensor[(config.hidden_size, config.vocab_size), _DT]:
-        # HF stores the head as (vocab, hidden); the matmul above wants it the
-        # other way. Tied models alias this input to the embedding table.
-        return tf.transpose(head_weight_raw, perm=(1, 0))
 
     def forward(self, token_ids, cos_cache, sin_cache, pos_ids, scale, caches):
         """The whole decode step: this token's row, every layer over it, its logits.
@@ -408,7 +352,7 @@ class Qwen3_1_7B_Decoder:
             for (k_cache, v_cache), (k_new, v_new) in zip(caches, fresh)
         )
 
-    def init_caches(self, device="cuda"):
+    def init_caches(self, device=None):
         """The per-layer cache container, zero positions long.
 
         `ctx_len` admits 0, so these are a decode start: the first step of a
@@ -419,6 +363,7 @@ class Qwen3_1_7B_Decoder:
         from tilefoundry.evaluator.value import to_torch_dtype  # noqa: PLC0415
         from tilefoundry.ir.types import DType  # noqa: PLC0415
 
+        device = _generation_device(device)
         empty = (1, 0, config.num_key_value_heads, config.head_dim)
         dtype = to_torch_dtype(DType.from_name(_DT))
         return tuple(
@@ -428,3 +373,16 @@ class Qwen3_1_7B_Decoder:
             )
             for _ in range(config.num_hidden_layers)
         )
+
+    def prepare_inputs_for_generation(self, input_ids, step, caches, device=None):
+        """The token and positional activations for one decode step."""
+        import torch  # noqa: PLC0415
+
+        device = _generation_device(device)
+        token_ids = input_ids[step].reshape(1).to(device=device, dtype=torch.int64)
+        cos_cache, sin_cache = _generation_rope(device)
+        pos_ids = torch.tensor([step], device=device, dtype=torch.int32)
+        scale = torch.full(
+            (1, 1, 1, 1), config.head_dim ** -0.5, device=device, dtype=config.dtype
+        )
+        return token_ids, cos_cache, sin_cache, pos_ids, scale, caches

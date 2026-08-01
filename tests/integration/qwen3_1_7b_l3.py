@@ -25,7 +25,6 @@ from pathlib import Path
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from transformers.models.qwen3.modeling_qwen3 import Qwen3RotaryEmbedding
 
 import tilefoundry
 from tilefoundry.runtime import SafetensorsResource
@@ -51,26 +50,6 @@ _PUBLISHED = (
     "max_position_embeddings",
     "num_hidden_layers",
 )
-
-# Canonical name -> published key. The seven projections and the head resolve to
-# the keys their converters read; `layer{i}` is a subtree segment, not a leaf.
-_ALIAS = {
-    "w_embed": "model.embed_tokens.weight",
-    "gamma_final": "model.norm.weight",
-    "head_weight_raw": "lm_head.weight",
-    "gamma_in": "input_layernorm.weight",
-    "gamma_post": "post_attention_layernorm.weight",
-    "gamma_q": "self_attn.q_norm.weight",
-    "gamma_k": "self_attn.k_norm.weight",
-    "q_proj_weight": "self_attn.q_proj.weight",
-    "k_proj_weight": "self_attn.k_proj.weight",
-    "v_proj_weight": "self_attn.v_proj.weight",
-    "o_proj_weight": "self_attn.o_proj.weight",
-    "gate_proj_weight": "mlp.gate_proj.weight",
-    "up_proj_weight": "mlp.up_proj.weight",
-    "down_proj_weight": "mlp.down_proj.weight",
-}
-
 
 def _installed(venv: Path) -> None:
     """Refuse to run unless the `tilefoundry` imported here came out of *venv*."""
@@ -100,30 +79,41 @@ def _published(mount: Path) -> dict:
     return read
 
 
-def _emitted(venv: Path, work: Path, outside: Path) -> Path:
-    """Ask the installation for its model directory and copy it where it will run."""
+def _source_directory(venv: Path, *command: str, outside: Path) -> Path:
+    """The first directory a source-listing command from *venv* names."""
     done = subprocess.run(
-        [str(venv / "bin" / "tilefoundry"), "models", MODEL, "--source"],
+        [str(venv / "bin" / "tilefoundry"), *command],
         cwd=str(outside), capture_output=True, text=True, check=False,
     )
     if done.returncode != 0:
         raise SystemExit(
-            f"`tilefoundry models {MODEL} --source` exited {done.returncode}\n"
+            f"`tilefoundry {' '.join(command)}` exited {done.returncode}\n"
             f"{done.stderr.strip()}"
         )
     lines = done.stdout.splitlines()
     if not lines:
-        raise SystemExit(f"`tilefoundry models {MODEL} --source` printed no directory")
+        raise SystemExit(f"`tilefoundry {' '.join(command)}` printed no directory")
     shipped = Path(lines[0])
     if not shipped.is_dir():
-        raise SystemExit(f"`tilefoundry models {MODEL} --source` named no directory: {shipped}")
+        raise SystemExit(f"`tilefoundry {' '.join(command)}` named no directory: {shipped}")
+    return shipped
+
+
+def _emitted(venv: Path, work: Path, outside: Path) -> tuple[Path, Path]:
+    """Copy the shipped model, and locate the shipped decode driver."""
+    shipped = _source_directory(venv, "models", MODEL, "--source", outside=outside)
     copied = work / shipped.name
     shutil.copytree(shipped, copied)
-    source = copied / "model.py"
-    if not source.is_file():
+    model_source = copied / "model.py"
+    alias_source = copied / "hf_alias.py"
+    if not model_source.is_file() or not alias_source.is_file():
         raise SystemExit(f"copied model directory has no model.py: {copied}")
     print(f"copied {MODEL} source directory to {copied}")
-    return source
+    driver = _source_directory(venv, "tutorial", "orchestrator", "causal_lm", outside=outside)
+    generation_source = driver / "generation.py"
+    if not generation_source.is_file():
+        raise SystemExit(f"shipped causal_lm source has no generation.py: {driver}")
+    return model_source, generation_source
 
 
 def _oracle(mount: Path):
@@ -133,30 +123,18 @@ def _oracle(mount: Path):
     return tokenizer, model.to(DEV).eval()
 
 
-def _rope_caches(config, rows: int):
-    """Full cos / sin caches `[rows, head_dim]` from the model's own rotary class.
-
-    Row `p` is the embedding for absolute position `p`, so gathering by `pos_ids`
-    reproduces the cos / sin the published attention applies.
-    """
-    rotary = Qwen3RotaryEmbedding(config).to(DEV)
-    reference = torch.zeros(1, rows, config.hidden_size, device=DEV, dtype=DTYPE)
-    cos, sin = rotary(reference, torch.arange(rows, device=DEV).unsqueeze(0))
-    return cos[0].to(DTYPE), sin[0].to(DTYPE)
-
-
-def _loaded(source: Path, work: Path, mount: Path, n_layers: int):
-    """The emitted decoder with the published weights bound, through `prepare`."""
-    root = runpy.run_path(str(source))["Qwen3_1_7B_Decoder"].cloned()
-    alias = {**_ALIAS, **{f"layer{i}": f"model.layers.{i}" for i in range(n_layers)}}
-    raw = SafetensorsResource(str(mount), device="cpu", alias=alias, dtype=DTYPE)
-    prepared = work / "prepared"
-    root.prepare(raw, str(prepared), device="cpu")
-    return root.load(SafetensorsResource(str(prepared), device=DEV))
+def _loaded(source: Path, mount: Path):
+    """The emitted decoder with its published weights bound directly."""
+    namespace = runpy.run_path(str(source))
+    root = namespace["Qwen3_1_7B"].cloned()
+    alias = runpy.run_path(str(source.with_name("hf_alias.py")))["hf_alias"](
+        namespace["config"]
+    )
+    return root.load(SafetensorsResource(str(mount), device=DEV, alias=alias))
 
 
 def _hf_greedy(model, prompt_ids):
-    """Hugging Face's own 16 greedy continuations, and the prompt's cache.
+    """Hugging Face's own 16 greedy continuations.
 
     Stepped by hand rather than through `generate`, so both sides run 16 steps
     whatever the tokens are and no `generation_config` field decides what greedy
@@ -164,21 +142,29 @@ def _hf_greedy(model, prompt_ids):
     """
     with torch.no_grad():
         prefill = model(prompt_ids[:, :-1], use_cache=True)
-        context = tuple(
-            (
-                layer.keys.transpose(1, 2).contiguous(),
-                layer.values.transpose(1, 2).contiguous(),
-            )
-            for layer in prefill.past_key_values.layers
-        )
-
         cache, token, tokens = prefill.past_key_values, prompt_ids[:, -1:], []
         for _ in range(STEPS):
             step = model(token, past_key_values=cache, use_cache=True)
             cache = step.past_key_values
             token = torch.argmax(step.logits[:, -1], dim=-1, keepdim=True)
             tokens.append(int(token))
-    return context, tokens
+    return tokens
+
+
+def _recorded_greedy(generation: dict[str, object], tokens: list[int]):
+    """Return greedy sampling that skips decode's unmeasured warm sample."""
+    warmed = False
+
+    def sample(logits) -> int:
+        nonlocal warmed
+
+        token = generation["greedy"](logits)
+        if warmed:
+            tokens.append(token)
+        warmed = True
+        return token
+
+    return sample
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -187,7 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         "--venv", required=True, type=Path, help="the installation under test"
     )
     parser.add_argument(
-        "--work", required=True, type=Path, help="scratch directory for the store"
+        "--work", required=True, type=Path, help="scratch directory for copied source"
     )
     parser.add_argument(
         "--checkpoint",
@@ -211,33 +197,30 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("no CUDA device: this decodes two copies of a 1.7B model")
 
     _installed(args.venv)
-    published = _published(args.checkpoint)
+    _published(args.checkpoint)
     args.work.mkdir(parents=True, exist_ok=True)
+    args.outside.mkdir(parents=True, exist_ok=True)
 
-    source = _emitted(args.venv, args.work, args.outside)
+    source, generation_source = _emitted(args.venv, args.work, args.outside)
 
     tokenizer, model = _oracle(args.checkpoint)
-    loaded = _loaded(source, args.work, args.checkpoint, published["num_hidden_layers"])
+    loaded = _loaded(source, args.checkpoint)
+    generation = runpy.run_path(str(generation_source))
 
     prompt_ids = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEV)
     if prompt_ids.shape[1] < 2:
         raise SystemExit("a continuation needs a token of context")
 
-    context, want = _hf_greedy(model, prompt_ids)
-    cos, sin = _rope_caches(model.config, published["max_position_embeddings"])
-    scale = torch.full(
-        (1, 1, 1, 1), model.model.layers[0].self_attn.scaling, device=DEV, dtype=DTYPE
+    want = _hf_greedy(model, prompt_ids)
+    got: list[int] = []
+    done = generation["decode"](
+        loaded,
+        tokenizer,
+        PROMPT,
+        max_new=STEPS,
+        sampler=_recorded_greedy(generation, got),
+        device=DEV,
     )
-
-    caches, token, got = context, prompt_ids[0, -1:], []
-    for offset in range(STEPS):
-        pos_ids = torch.tensor(
-            [prompt_ids.shape[1] - 1 + offset], device=DEV, dtype=torch.int32
-        )
-        logits, entries = loaded.forward(token, cos, sin, pos_ids, scale, caches)
-        caches = loaded.append_cache(caches, entries)
-        token = torch.argmax(logits[0]).reshape(1).to(torch.int64)
-        got.append(int(token))
 
     if got != want:
         step = next(i for i, (a, b) in enumerate(zip(got, want)) if a != b)
@@ -245,7 +228,10 @@ def main(argv: list[str] | None = None) -> int:
             f"diverged at step {step}: {tokenizer.decode(got)!r} "
             f"against {tokenizer.decode(want)!r}"
         )
-    print(f"{STEPS} greedy steps agree: {tokenizer.decode(got)!r}")
+    print(
+        f"{done.tokens} greedy steps agree at "
+        f"{done.tokens / done.seconds:.1f} tok/s: {tokenizer.decode(got)!r}"
+    )
     return 0
 
 

@@ -91,6 +91,8 @@ divides it. Both are config-derived constants rather than runtime tensors like
 from __future__ import annotations
 
 import json
+import math
+from functools import lru_cache
 from pathlib import Path
 
 from transformers import MiniCPM3Config
@@ -111,11 +113,6 @@ def published(path: Path | None = None) -> MiniCPM3Config:
 
 
 config = published()
-
-#: The longest prior cache these kernels are authored for. Not a published field:
-#: `max_position_embeddings` is where the checkpoint stops, and a position beyond
-#: the rotary cache has no embedding to gather, so the envelope is that limit.
-MAX_CTX = config.max_position_embeddings
 
 # The published dtype as the DSL spells it. The checkpoint stores its weights at
 # this precision, so it is what a kernel reading them consumes.
@@ -146,9 +143,10 @@ _KV_B_PROJ = config.num_attention_heads * (
 _ATTN_OUT = config.num_attention_heads * config.v_head_dim   # o_proj in
 
 # The prior cache this step reads: the only range this model carries. Zero is a
-# first step, and the exclusive upper bound is max_ctx because a position beyond
+# first step, and the exclusive upper bound is `config.max_position_embeddings`
+# because a position beyond
 # the rotary cache has no embedding to gather.
-C = DimVar("ctx_len", 0, MAX_CTX)
+C = DimVar("ctx_len", 0, config.max_position_embeddings)
 
 # One token per step.
 S = 1
@@ -163,8 +161,32 @@ EMBED_SCALE = float(config.scale_emb)
 LOGITS_SCALING = config.logits_scaling
 
 
+def _generation_device(device):
+    import torch  # noqa: PLC0415
+
+    return torch.accelerator.current_accelerator() if device is None else device
+
+
+@lru_cache(maxsize=None)
+def _generation_rope(device):
+    import torch  # noqa: PLC0415
+
+    dim = config.head_dim
+    factors = torch.tensor(config.rope_parameters["short_factor"], device=device, dtype=torch.float32)
+    inverse = 1.0 / (
+        factors
+        * config.rope_parameters["rope_theta"]
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+    )
+    phases = torch.outer(
+        torch.arange(config.max_position_embeddings, device=device, dtype=torch.float32), inverse
+    )
+    phases = torch.cat((phases, phases), dim=-1)
+    return phases.cos().to(config.dtype), phases.sin().to(config.dtype)
+
+
 @module(entry="decoder_layer")
-class MiniCPM3_4B:
+class MiniCPM3_4B_DecoderLayer:
     @func
     def input_rms_norm(
         hidden: Tensor[(1, S, config.hidden_size), _DT],
@@ -324,14 +346,14 @@ class MiniCPM3_4B:
 
 
 @module(target=CudaTarget("nvidia.h200_sxm"))
-class MiniCPM3_4B_Decoder:
+class MiniCPM3_4B:
     """The ordered layer stack, the norm that closes it, and the two scaled ends
     that bracket it."""
 
     topologies = (Topology("cta", 132), Topology("thread", 512))
 
     layers = tuple(
-        MiniCPM3_4B.renamed(f"layer{index}")
+        MiniCPM3_4B_DecoderLayer.renamed(f"layer{index}")
         for index in range(config.num_hidden_layers)
     )
 
@@ -428,7 +450,7 @@ class MiniCPM3_4B_Decoder:
             for (k_cache, v_cache), (k_new, v_new) in zip(caches, fresh)
         )
 
-    def init_caches(self, device="cuda"):
+    def init_caches(self, device=None):
         """The per-layer cache container, zero positions long.
 
         `ctx_len` admits 0, so these are a decode start: the first step of a
@@ -441,6 +463,7 @@ class MiniCPM3_4B_Decoder:
         from tilefoundry.evaluator.value import to_torch_dtype  # noqa: PLC0415
         from tilefoundry.ir.types import DType  # noqa: PLC0415
 
+        device = _generation_device(device)
         dtype = to_torch_dtype(DType.from_name(_DT))
         return tuple(
             (
@@ -449,3 +472,22 @@ class MiniCPM3_4B_Decoder:
             )
             for _ in range(config.num_hidden_layers)
         )
+
+    def prepare_inputs_for_generation(self, input_ids, step, caches, device=None):
+        """The token and positional activations for one decode step."""
+        import torch  # noqa: PLC0415
+
+        device = _generation_device(device)
+        token_ids = input_ids[step].reshape(1).to(device=device, dtype=torch.int64)
+        cos_cache, sin_cache = _generation_rope(device)
+        pos_ids = torch.tensor([step], device=device, dtype=torch.int32)
+        scale = torch.full(
+            (1, 1, 1, 1), config.head_dim ** -0.5, device=device, dtype=config.dtype
+        )
+        residual_scale = torch.full(
+            (1, 1, 1),
+            config.scale_depth / math.sqrt(config.num_hidden_layers),
+            device=device,
+            dtype=config.dtype,
+        )
+        return token_ids, cos_cache, sin_cache, pos_ids, scale, residual_scale, caches

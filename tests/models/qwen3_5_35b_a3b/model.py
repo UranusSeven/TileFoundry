@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+from functools import lru_cache
 from pathlib import Path
 
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import (
@@ -39,13 +40,6 @@ def published(path: Path | None = None) -> Qwen3_5MoeTextConfig:
 
 
 config = published()
-
-#: The largest context the full-attention kernels are authored for. Not a
-#: published field: `max_position_embeddings` is 262144, and a decode kernel
-#: authored to that envelope is the same kernel as one authored to a smaller one
-#: -- what the envelope has to be is larger than any context a test draws, and
-#: stated rather than implied.
-MAX_CTX = 4096
 
 # The published dtype as the DSL spells it. The checkpoint stores its weights at
 # this precision, so it is what a kernel reading them consumes.
@@ -104,7 +98,9 @@ _L2_EPS = 1e-6
 
 
 # Prior-cache length. The caller appends this step's returned K/V entry.
-C = DimVar("ctx_len", 0, MAX_CTX)
+# The full-attention kernels accept a 4096-position cache. This is our chosen
+# envelope, not a published field: `max_position_embeddings` is 262144.
+C = DimVar("ctx_len", 0, 4096)
 
 # One token per step.
 
@@ -117,9 +113,8 @@ _PASS = _PASS_DIM
 _G = _GQA
 
 # One row per position a step may be decoded at: `pos_ids` is the prior-cache
-# length, which stops one below ``max_ctx``. ``max_position_embeddings`` is 262144
-# and a cache that size is 67 MB of zeros nothing reads.
-_ROPE_ROWS = MAX_CTX
+# length, which stops one below the chosen 4096-row envelope.
+_ROPE_ROWS = 4096
 
 
 # One token per step.
@@ -488,7 +483,7 @@ def _layer_forward(self, hidden, mixer_args):
 
 
 @module(entry="residual_add")
-class Qwen3_5FullAttnLayer:
+class Qwen3_5FullAttentionDecoderLayer:
     mixer = Qwen3_5FullAttention.renamed("mixer")
     moe = Qwen3_5MoE.renamed("moe")
 
@@ -503,7 +498,7 @@ class Qwen3_5FullAttnLayer:
 
 
 @module(entry="residual_add")
-class Qwen3_5LinearAttnLayer:
+class Qwen3_5LinearAttentionDecoderLayer:
     mixer = Qwen3_5LinearAttention.renamed("mixer")
     moe = Qwen3_5MoE.renamed("moe")
 
@@ -520,12 +515,29 @@ class Qwen3_5LinearAttnLayer:
 #: Which layer class each published `layer_types` entry names. The model states
 #: this, not its tests: it is the same fact `config.layer_types` is written in.
 LAYER_TYPE = {
-    "full_attention": Qwen3_5FullAttnLayer,
-    "linear_attention": Qwen3_5LinearAttnLayer,
+    "full_attention": Qwen3_5FullAttentionDecoderLayer,
+    "linear_attention": Qwen3_5LinearAttentionDecoderLayer,
 }
 
 #: _DT as torch spells it -- the state below is at the kernels' own dtype.
 _TORCH_DT = to_torch_dtype(DType.from_name(_DT))
+
+
+@lru_cache(maxsize=None)
+def _generation_rope(device):
+    """The text-only rotary tables each full-attention step reads."""
+    import torch  # noqa: PLC0415
+
+    inverse = 1.0 / (
+        _ROPE["rope_theta"]
+        ** (
+            torch.arange(0, _ROTARY_DIM, 2, device=device, dtype=torch.float32)
+            / _ROTARY_DIM
+        )
+    )
+    phases = torch.outer(torch.arange(_ROPE_ROWS, device=device, dtype=torch.float32), inverse)
+    phases = torch.cat((phases, phases), dim=-1)
+    return phases.cos().to(_TORCH_DT), phases.sin().to(_TORCH_DT)
 
 
 #: The parameters a mixer declares for its own state, whichever kind it is. The
@@ -566,7 +578,7 @@ def advance_state(kind, state, fresh):
 
 
 @module(target=CudaTarget("nvidia.h200_sxm"))
-class Qwen3_5Decoder:
+class Qwen3_5_35B_A3B:
     """The layer stack in `config.layer_types` order, and the step around it --
     embedding, the walk, the closing norm, the head. Each layer is an independent
     copy, so an analysis of one annotates only it."""
@@ -641,7 +653,7 @@ class Qwen3_5Decoder:
         normed, states = self.decode_hidden(hidden, layer_args, caches)
         return self.lm_head(normed), states
 
-    def init_caches(self, device="cuda"):
+    def init_caches(self, device=None):
         """The per-layer state container, one entry per layer.
 
         A linear-attention layer's two halves are genuinely zero at the start:
@@ -652,6 +664,7 @@ class Qwen3_5Decoder:
         """
         import torch  # noqa: PLC0415
 
+        device = torch.accelerator.current_accelerator() if device is None else device
         entries = []
         for kind in config.layer_types:
             if kind == "linear_attention":
@@ -671,3 +684,18 @@ class Qwen3_5Decoder:
             advance_state(kind, cache, new)
             for kind, cache, new in zip(config.layer_types, caches, fresh)
         )
+
+    def prepare_inputs_for_generation(self, input_ids, step, caches, device=None):
+        """The token and each layer's non-state activations for one decode step."""
+        import torch  # noqa: PLC0415
+
+        device = torch.accelerator.current_accelerator() if device is None else device
+        token_ids = input_ids[step].reshape(1).to(device=device, dtype=torch.int64)
+        cos_cache, sin_cache = _generation_rope(device)
+        pos_ids = torch.tensor([step], device=device, dtype=torch.int32)
+        scale = torch.full((1, 1, 1, 1), _D ** -0.5, device=device, dtype=_TORCH_DT)
+        layer_args = tuple(
+            (cos_cache, sin_cache, pos_ids, scale) if kind == "full_attention" else ()
+            for kind in config.layer_types
+        )
+        return token_ids, layer_args, caches

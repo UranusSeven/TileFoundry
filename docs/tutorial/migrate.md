@@ -12,6 +12,23 @@ different kinds in a published cycle.
 `tilefoundry models qwen3_5_35b_a3b --source` names the directory that holds it
 and lists the shipped files.
 
+## The five access faces
+
+One Module, five things you can ask it for. Mixing them up is the most common
+first-day confusion, so they are listed together:
+
+| expression | what you get |
+|---|---|
+| `Mod.some_func(*all parameters)` | runs it; nothing is bound, so `ConstTensor` parameters are passed explicitly |
+| `Mod.some_child` | the child `Module` node |
+| `Mod.lookup("some_func")` | the `ModuleFunction` IR node |
+| `loaded.some_func(*activations only)` | runs it; `ConstTensor` parameters come from this loading's bindings |
+| `loaded.some_child` | the child `LoadedModule` |
+
+What `entry` means, how `forward` relates to `__call__`, and what a twin may and
+may not declare are stated once, normatively, in `tilefoundry spec runtime 1.1`.
+Read it there rather than here: a second copy is the one that goes stale.
+
 ## The four things to get right
 
 Each of these is a decision you make in the first ten minutes and pay for later.
@@ -73,7 +90,7 @@ A hybrid model publishes which kind each layer is. The root reads that list and
 builds the stack from it, so the cycle is a fact of the model rather than something
 a reader of the fixture has to work out.
 
-{{fixture: qwen3_5_35b_a3b/model.py:Qwen3_5Decoder}}
+{{fixture: qwen3_5_35b_a3b/model.py:Qwen3_5_35B_A3B}}
 
 ## When step one is finished
 

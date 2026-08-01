@@ -40,7 +40,7 @@ from tests.models.corpus import (
     ReferenceCase,
     SizedCase,
 )
-from tests.models.gemma2_2b.model import MAX_CTX, Gemma2_2B_Decoder
+from tests.models.gemma2_2b.model import Gemma2_2B, config
 from tests.models.gemma2_2b.reference import (
     CTX_LEN,
     decoder_step_inputs,
@@ -50,13 +50,13 @@ from tests.models.gemma2_2b.reference import (
 
 #: The context length the cache-reading functions are asked about at. A decode
 #: kernel's cost is dominated by the cache it streams, so the length is stated
-#: rather than minimised. Well inside ``MAX_CTX`` (Gemma-2's sliding
+#: rather than minimised. Well inside ``config.sliding_window`` (Gemma-2's sliding
 #: window), where a sliding layer and a full layer are the same computation.
 ANALYZED_AT = {"ctx_len": 1024}
 
 CASE = ModelCase(
     id="gemma2_2b",
-    prototype=Gemma2_2B_Decoder,
+    prototype=Gemma2_2B,
     scope="layer0",
     reference=ReferenceCase(
         id="gemma2_2b/reference/full_decoder_decode",
@@ -97,7 +97,7 @@ CASE = ModelCase(
             id="gemma2_2b/sized/decoder_layer",
             selector="decoder_layer",
             dims=ANALYZED_AT,
-            ceiling={"ctx_len": MAX_CTX - 1},
+            ceiling={"ctx_len": config.sliding_window - 1},
         ),
     ),
 )
