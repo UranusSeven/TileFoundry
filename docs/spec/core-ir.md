@@ -6,7 +6,7 @@ Defines the shared node algebra — `Module` / `Expr` / `IRMetadata` / `Op` /
 each extend it with their own `Function` container and their own `Op` / `Stmt`
 subclasses. Types carried by `Expr.type` are defined in [types](./types.md);
 the distributed layout layer is [shard](./shard.md); `Stmt` is not here — it
-lives only in [tir §1](./tir.md) as a TIR-only base class.
+lives only in [tir §1](./tir.md#1-tir-stmt-hierarchy) as a TIR-only base class.
 
 ```mermaid
 flowchart TB
@@ -62,7 +62,7 @@ class Module:
   - a `Module` owns its child subtree. Placing a child that already belongs to
     another owner MUST NOT change what the first owner's subtree resolves.
 
-- `parse_module` (see [parser §1](./parser.md)) returns a `Module`.
+- `parse_module` (see [parser §1](./parser.md#1-dsl-syntax)) returns a `Module`.
 - A bare `@func` / `@prim_func` becomes an implicit single-function
   `Module` whose `entry` is set to that function. A function that declares
   execution context of its own is therefore already a `Module`.
@@ -103,7 +103,7 @@ chain and is not copied onto each Module or Function.
   `forward` / `init_caches`; full collection rule in
   [parser §2.7](./parser.md#27-module-authoring-surface)). A function name,
   a child module name, and a method name MUST be disjoint at one `Module`'s
-  own level — all three resolve through the same attribute surface (§1.1
+  own level — all three resolve through the same attribute surface ([§1.1](#11-function-access)
   below), so a name used by more than one would be ambiguous.
 - `weights` is a derived property, not a stored field: each access unions
   every function's `ConstTensor` params (`Var.is_const`), in (function
@@ -111,7 +111,7 @@ chain and is not copied onto each Module or Function.
   identical `TensorType`, or the access raises. There is no `states` field
   or persistent-state concept in the IR — a tensor that must survive across
   steps (e.g. a KV cache) is an ordinary `Tensor` param the caller passes in
-  and receives back explicitly (docs/spec/runtime.md §1.1.2).
+  and receives back explicitly ([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)).
 - Constructing a `Module` **seals** its functions: each base function and
   its specialization variants are finalized. Variants may be added to a
   base only during authoring, before the base enters a `Module`; once
@@ -192,7 +192,7 @@ entries — so name resolution is always single-valued.
   takes **one argument per declared param**, a `ConstTensor` one included; the
   callable that fills constants from bindings instead belongs to
   `LoadedModule`, which runs on the one device its bindings and activations
-  agree on (docs/spec/runtime.md §1.1.2). A **child module** name
+  agree on ([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)). A **child module** name
   resolves to that child `Module`. A **method** name resolves to the
   class-body function bound like an instance method (`m.forward(...)`). Names
   beginning with `_` are never functions, modules, or methods and resolve by
@@ -286,7 +286,8 @@ def source_metadata(expr: "Expr") -> tuple[IRMetadata, ...]: ...
 
 `Expr` always carries a `type`. The runtime class of `Expr.type` is
 one of `TensorType` / `TupleType` / `UnitType`
-([types §2 / §4 / §6](./types.md)). Concrete `Expr` subclasses are
+([types §2](./types.md#2-tensortype) / [types §4](./types.md#4-dim--symbolic-shape-dimensions)
+/ [types §6](./types.md#6-unittype)). Concrete `Expr` subclasses are
 not introduced per Op — value-producing Ops appear as `Call` nodes
 whose `target` carries the Op instance. Multi-output Ops produce a
 single `Call` whose `type` is `TupleType`; consumers project a single
@@ -338,7 +339,7 @@ class Tuple(Expr):
     changing its `TensorType`.
 
 `Tuple` is the value-level aggregate node; it pairs with `TupleType`
-([types §4](./types.md)) but is not the same — `Tuple` is an `Expr`
+([types §4](./types.md#4-dim--symbolic-shape-dimensions)) but is not the same — `Tuple` is an `Expr`
 in the IR graph, `TupleType` is the type carried by `Expr.type`.
 
 ### 2.3 `Op`
@@ -454,7 +455,7 @@ An Op is **value-form** when its `Call` produces an observable
 result the IR consumes — `Call.type` is then `TensorType` or
 `TupleType`. An Op is **effect-form** when it performs an in-place
 effect (e.g. `tir.memory.Copy` / `tir.cuda.nn.Mma`) and produces no
-readable value (`UnitType`, [types §6](./types.md)); in Stmt position
+readable value (`UnitType`, [types §6](./types.md#6-unittype)); in Stmt position
 it appears as `Evaluate(op, args)`
 ([tir §1.4](./tir.md#14-evaluate)).
 
@@ -474,7 +475,7 @@ class Pattern:
 
 Two consumer surfaces:
 
-- **Parser dispatch** — `ParamDef.pattern` (§2.3) is matched against an
+- **Parser dispatch** — `ParamDef.pattern` ([§2.3](#23-op)) is matched against an
   argument's `Expr.type` during overload resolution. Subclasses used:
   `ScalarPat` (rank-0), `TensorPat(rank?, dtype?)` (non-scalar), and
   `AndPat(parts)` (conjunction). Two singletons are exported as

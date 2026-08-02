@@ -222,7 +222,7 @@ class TypeInferVisitor(ExprVisitor[TensorType | TupleType]):
     unregistered `Op` call routes through `ctx.error`.
   - `visit_Tuple` derives a structural `TupleType` from `ctx.type_of` of each
     element — never the `Tuple` node's own stamped `.type`.
-  - `hir.Function` is itself a valid `Call.target` (§4 above): its registered
+  - `hir.Function` is itself a valid `Call.target` ([§4](#4-instance-1--typeinfer) above): its registered
     typeinfer handler elaborates the callee under the call's actual argument
     types ([hir §1.1](./hir.md#11-function)) rather than reading the target's
     own `.type`.
@@ -297,7 +297,7 @@ returns its result, or `None` when the op has no registered builder.
 ### 4.2 Per-boundary relation service — `access_relation`
 
 A second, independent registry over the same Op classes. Where `type_relation`
-(§4.1) returns one iteration domain plus one map per boundary and drives
+([§4.1](#41-forward-relation-service--type_relation)) returns one iteration domain plus one map per boundary and drives
 typeinfer, this one classifies each boundary on its own and admits a boundary
 the affine framework cannot express at all.
 
@@ -336,7 +336,7 @@ def register_access_relation(op_cls: type): ...
 
 The two registries are peers, not layers: a given Op MAY register with either,
 both, or neither. The polyhedral model ([analysis §1](./analysis.md#1-polyhedral-model))
-reads only §4.1's forward relation, so an Op it must cover needs a
+reads only [§4.1](#41-forward-relation-service--type_relation)'s forward relation, so an Op it must cover needs a
 `type_relation` regardless of what it registers here.
 
 ## 5. Instance 2 — `verify`
@@ -376,7 +376,7 @@ dispatches `verify_stmt_registry.lookup(type(stmt.callable))`. The
 registry key is the Op class; the handler input shape is owned by the
 registry implementation. The stable IR shape is `Evaluate(op, args)`;
 the stable IR does not wrap a value-form `Call` inside `Evaluate`. See
-[visitor-mutator §7](./visitor-mutator.md)
+[visitor-mutator §7](./visitor-mutator.md#7-visitor-entry-forms-for-evaluate)
 for the matching visitor entry-form contract and
 [tir §1.4](./tir.md#14-evaluate) for the wrapper definition.
 

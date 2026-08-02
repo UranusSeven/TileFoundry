@@ -78,7 +78,7 @@ class ModulePass(Pass):                             # runs over the whole Module
 
 - constraints:
   - `run` returns a new `Module`; inherits the `Pass` no-mutation / no-global-state
-    contract (§2).
+    contract ([§2](#2-pass-base-class)).
 
 ### 3.2 `FunctionPass`
 
@@ -96,7 +96,7 @@ class FunctionPass(Pass):                                                       
 ```
 
 - constraints:
-  - inherits the `Pass` contract (§2); the default `run` reassembles the `Module`
+  - inherits the `Pass` contract ([§2](#2-pass-base-class)); the default `run` reassembles the `Module`
     from `run_function` results.
 
 ### 3.3 `PrimFuncPass`
@@ -114,7 +114,7 @@ class PrimFuncPass(Pass):                                                       
 ```
 
 - constraints:
-  - inherits the `Pass` contract (§2); same shape as `FunctionPass` over
+  - inherits the `Pass` contract ([§2](#2-pass-base-class)); same shape as `FunctionPass` over
     `tir.PrimFunction`.
 
 ## 4. Transform pass idiom
@@ -131,7 +131,7 @@ and dispatches on `type(stmt.callable)`.
 
 The visit-and-rewrite contract — including the `visit_Evaluate`
 entry form for TIR effect Ops — is owned by
-[visitor-mutator §7](./visitor-mutator.md).
+[visitor-mutator §7](./visitor-mutator.md#7-visitor-entry-forms-for-evaluate).
 
 ## 5. `PassManager`
 
@@ -234,7 +234,7 @@ no return-tensor form. After this pass, `PassManager` reruns HIR
 #### Per-op lowering dispatch
 
 Per-op lowering is **registry-dispatched**, not a hand-written `isinstance`
-chain (§4): each HIR op registers its lowering handler keyed by op class
+chain ([§4](#4-transform-pass-idiom)): each HIR op registers its lowering handler keyed by op class
 (`register_hir_lowering(OpClass)`), and the pass looks the handler up by
 `type(call.target)`. A target-owned op (e.g. the CUDA `Mma`) registers its own
 lowering, so the pass core depends on the registry contract, not on importing
@@ -368,8 +368,7 @@ Each lowered `PrimFunction` that references `ShapeOf(param, axis)`
 gains a hidden scalar parameter named `<param.name>_shape_<axis>` of
 `TensorType((), i32)`. The CUDA host wrapper extracts the value from
 the runtime tensor's shape; the parameter is invisible at the user
-FFI surface (see
-[target §6](./target.md#6-dispatch-and-shape-scalar-abi)).
+FFI surface (see [target](./target.md)).
 
 ### 7.2 `BufferizePass`
 
