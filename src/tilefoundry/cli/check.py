@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any, Sequence
 import torch
 
 from tilefoundry.cli import data
-from tilefoundry.cli.source import load_namespace, select_ir
+from tilefoundry.cli.source import load_namespace, parse_dims, select_ir, suggested_extents
 from tilefoundry.evaluator.value import to_torch_dtype
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function, canonical_specialization_signature
@@ -165,22 +166,6 @@ def expectations(stated: Sequence[tuple[str, Any]] | None) -> dict[str, tuple[Pr
             made.append(PREDICATES[name](**bounds))
         built[path] = tuple(made)
     return built
-
-
-def parse_dims(stated: Sequence[str] | None) -> dict[str, tuple[int, ...]]:
-    """``NAME=V[,V...]`` arguments as every value each dimension was given."""
-    dims: dict[str, tuple[int, ...]] = {}
-    for entry in stated or ():
-        name, _, values = entry.partition("=")
-        if not name or not values:
-            raise ValueError(f"--dim takes NAME=V[,V...], got {entry!r}")
-        if name in dims:
-            raise ValueError(f"--dim {name} was given twice; list its values as NAME=V,V")
-        try:
-            dims[name] = tuple(int(value) for value in values.split(","))
-        except ValueError:
-            raise ValueError(f"--dim {name}: every value must be an integer, got {values!r}") from None
-    return dims
 
 
 def _combinations(dims: dict[str, tuple[int, ...]]) -> list[dict[str, int]]:
@@ -379,17 +364,60 @@ class RandomWeights:
         raise KeyError(seg)
 
 
-def _read(path: str, device: str) -> torch.Tensor:
-    """One tensor from a file: `.npy`, or anything `torch.load` reads."""
+def _read(path: str, device: str):
+    """One parameter tree from a file, moving every tensor leaf to *device*."""
     found = Path(path).expanduser()
     if found.suffix == ".npy":
         import numpy  # noqa: PLC0415 -- only this path needs it
 
-        return torch.from_numpy(numpy.load(found)).to(device)
-    loaded = torch.load(found, map_location=device, weights_only=True)
-    if not isinstance(loaded, torch.Tensor):
-        raise ValueError(f"{path}: expected one tensor, got {type(loaded).__name__}")
-    return loaded
+        loaded = torch.from_numpy(numpy.load(found))
+    else:
+        loaded = torch.load(found, map_location=device, weights_only=True)
+
+    def visit(value, position: str):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, (list, tuple)):
+            return tuple(visit(item, f"{position}[{index}]") for index, item in enumerate(value))
+        raise ValueError(
+            f"{position}: expected a tensor or nested tuple/list of tensors, "
+            f"got {type(value).__name__}"
+        )
+
+    return visit(loaded, path)
+
+
+def _tensor_leaves(value):
+    """Every tensor in one activation tree, in its written order."""
+    if isinstance(value, torch.Tensor):
+        yield value
+        return
+    for item in value:
+        yield from _tensor_leaves(item)
+
+
+def _tensor_structure(value):
+    """The JSON-safe shape tree that an activation file supplied."""
+    if isinstance(value, torch.Tensor):
+        return {"dtype": str(value.dtype), "shape": list(value.shape)}
+    return [_tensor_structure(item) for item in value]
+
+
+def _dtype_names(values: Sequence[Any]) -> list[str]:
+    """Actual torch dtypes of every tensor across the supplied values."""
+    return [str(tensor.dtype) for value in values for tensor in _tensor_leaves(value)]
+
+
+def _input_files(paths: Sequence[str], activations: Sequence[Any]) -> list[dict[str, Any]]:
+    """The leaf count and structure that each stated activation file supplied."""
+    return [
+        {
+            "path": path,
+            "tensor_count": sum(1 for _ in _tensor_leaves(activation)),
+            "structure": _tensor_structure(activation),
+        }
+        for path, activation in zip(paths, activations, strict=True)
+    ]
 
 
 def _weights_needed(module: Module) -> tuple[str, ...]:
@@ -427,12 +455,6 @@ def _variant(function: Function, dims: dict[str, int]) -> dict[str, Any] | None:
     }
 
 
-def _spread(lo: int, hi: int) -> tuple[int, ...]:
-    """A few extents inside a declared range, for the suggestion that follows it."""
-    candidates = {lo, lo + 1, (lo + hi) // 2, hi - 1}
-    return tuple(sorted(value for value in candidates if lo <= value < hi))
-
-
 def _pin(function: Function, stated: dict[str, int]) -> tuple[dict[str, int], list[dict[str, Any]]]:
     """Every dimension this function states as a range, bound to one extent.
 
@@ -454,7 +476,7 @@ def _pin(function: Function, stated: dict[str, int]) -> tuple[dict[str, int], li
                 "pinned": dim_var.lo,
                 "lo": dim_var.lo,
                 "hi": dim_var.hi,
-                "spread": _spread(dim_var.lo, dim_var.hi),
+                "spread": suggested_extents(dim_var.lo, dim_var.hi),
             }
         )
     unknown = sorted(set(stated) - set(declared))
@@ -502,14 +524,20 @@ def _sides(target: Target, resource, expected: Sequence[str] | None, device: str
     if expected:
         tensors = tuple(_read(path, device) for path in expected)
         one = tensors[0] if len(tensors) == 1 else tensors
-        return candidate, (lambda *_: one), ", ".join(expected)
+        return candidate, (lambda *_: one), ", ".join(expected), loaded.constants
 
     if target.twin is None:
         # Nothing else states what this Module should produce, so only the
         # predicates that judge it on its own are available.
-        return candidate, None, None
+        return candidate, None, None, loaded.constants
     authored = target.module.name if name is None else f"{target.module.name}.{name}"
-    return candidate, evaluator, f"evaluator on {authored}"
+    return candidate, evaluator, f"evaluator on {authored}", loaded.constants
+
+
+def _orchestration_parameter_names(target: Target) -> tuple[str, ...]:
+    """The activations the selected orchestration method actually accepts."""
+    method = target.twin.forward if target.twin is not None else target.module.methods["forward"]
+    return tuple(name for name in inspect.signature(method).parameters if name != "self")
 
 
 def _one_run(
@@ -542,7 +570,7 @@ def _one_run(
         )
 
     generator = torch.Generator(device=device).manual_seed(SEED)
-    activations: tuple[torch.Tensor, ...]
+    activations: tuple[Any, ...]
     if arguments.input:
         activations = tuple(_read(path, device) for path in arguments.input)
         provided = f"{len(activations)} file(s): {', '.join(arguments.input)}"
@@ -553,10 +581,14 @@ def _one_run(
         )
     else:
         if concrete is None:
+            names = _orchestration_parameter_names(target)
             raise ValueError(
-                f"--inputs {arguments.inputs} needs a target whose parameters are "
-                f"declared; {target.module.name!r} runs an orchestration method, so "
-                f"pass its activations with --input=PATH"
+                f"--inputs {arguments.inputs} cannot make activations for "
+                f"{target.module.name!r}: it runs an orchestration method whose "
+                f"parameters have no declared shapes or dtypes. It takes {len(names)} "
+                f"activation parameters in order: {', '.join(names)}. Give one "
+                "--input=PATH per parameter; each file holds one tensor or a nested "
+                "tuple/list of tensors, for example torch.save((...), \"mixer_args.pt\")"
             )
         activations = _random_activations(concrete, generator, device)
         provided = f"random, seed {SEED}"
@@ -567,7 +599,7 @@ def _one_run(
     else:
         weights_from = "the checkpoint" if arguments.ckpt else f"random, seed {SEED}"
 
-    candidate, reference, reference_label = _sides(
+    candidate, reference, reference_label, loaded_weights = _sides(
         target, resource, arguments.expected, device
     )
     report = check(candidate, reference, activations, expect=expect)
@@ -575,7 +607,27 @@ def _one_run(
         "dims": dict(stated),
         "pinned": unstated,
         "variant": None if concrete is None else _variant(function, pinned),
-        "inputs": {"activations": provided, "weights": weights_from},
+        "inputs": {
+            "activations": {
+                "source": provided,
+                "actual_dtypes": _dtype_names(activations),
+                "declared_dtypes": (
+                    []
+                    if concrete is None
+                    else [
+                        parameter.type.dtype.name
+                        for parameter in concrete.params
+                        if not parameter.is_const
+                    ]
+                ),
+                "files": _input_files(arguments.input, activations) if arguments.input else [],
+            },
+            "weights": {
+                "source": weights_from,
+                "actual_dtypes": _dtype_names(tuple(loaded_weights.values())),
+                "declared_dtypes": [type_.dtype.name for type_ in target.module.weights.values()],
+            },
+        },
         "reference": reference_label,
         "outputs": [
             {
@@ -603,6 +655,30 @@ def _one_run(
     }
 
 
+def _shown_dtypes(dtypes: Sequence[str]) -> str:
+    """Dtypes as one readable field, including an honest empty declaration."""
+    return ", ".join(dtypes) if dtypes else "none"
+
+
+def _shown_structure(structure) -> str:
+    """One recursively-loaded input tree, compactly enough for the inputs line."""
+    if isinstance(structure, dict):
+        return f"{structure['dtype']}[{', '.join(str(extent) for extent in structure['shape'])}]"
+    return "(" + ", ".join(_shown_structure(item) for item in structure) + ")"
+
+
+def _shown_files(files: Sequence[dict[str, Any]]) -> str:
+    """Every file's count plus its tensor shape tree, for the text report."""
+    if not files:
+        return ""
+    descriptions = [
+        f"{Path(file['path']).name}: {file['tensor_count']} tensor(s) "
+        f"{_shown_structure(file['structure'])}"
+        for file in files
+    ]
+    return "; files " + "; ".join(descriptions)
+
+
 def _render(target: Target, runs: list[dict[str, Any]], level: dict[str, Any] | None) -> str:
     """The runs as a person reads them: what ran, what it measured, the verdict."""
     where = f"{target.path.name}:{target.selector}" if target.selector else str(target.path.name)
@@ -612,7 +688,16 @@ def _render(target: Target, runs: list[dict[str, Any]], level: dict[str, Any] | 
             lines.append("")
             lines.append(f"  {', '.join(f'{k}={v}' for k, v in run['dims'].items())}")
         lines.append(f"  reference: {run['reference'] or 'none — the candidate alone'}")
-        lines.append(f"  inputs:    {run['inputs']['activations']}; weights {run['inputs']['weights']}")
+        activations = run["inputs"]["activations"]
+        weights = run["inputs"]["weights"]
+        lines.append(
+            f"  inputs:    {activations['source']}; activations actual "
+            f"{_shown_dtypes(activations['actual_dtypes'])} (declared "
+            f"{_shown_dtypes(activations['declared_dtypes'])}); weights "
+            f"{weights['source']} actual {_shown_dtypes(weights['actual_dtypes'])} "
+            f"(declared {_shown_dtypes(weights['declared_dtypes'])})"
+            f"{_shown_files(activations['files'])}"
+        )
         if run["variant"] is not None:
             ranges = ", ".join(
                 f"{r['dim']} in [{r['lo']}, {r['hi']})" for r in run["variant"]["ranges"]
@@ -671,7 +756,7 @@ def _render(target: Target, runs: list[dict[str, Any]], level: dict[str, Any] | 
 def run_check(arguments: argparse.Namespace) -> int:
     """Compare one target against its reference and report every output."""
     expect = expectations(getattr(arguments, "comparison", None))
-    stated = parse_dims(arguments.dim)
+    stated = parse_dims(arguments.dim) or {}
     if arguments.input and arguments.inputs is not None:
         raise ValueError(
             f"--input names the activations and --inputs {arguments.inputs} makes them; "

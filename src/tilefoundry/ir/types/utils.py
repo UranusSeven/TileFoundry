@@ -13,17 +13,23 @@ from .tensor_type import TensorType, TupleType, Type
 def numel(type: Type) -> int:
     """Element count of ``type``, summed over a tuple's leaves.
 
-    A symbolic or non-positive extent is rejected rather than skipped: a size
-    that silently drops a dimension reads as a smaller tensor, not as an
-    unknown one.
+    A symbolic or negative extent is rejected rather than skipped: a size that
+    silently drops a dimension reads as a smaller tensor, not as an unknown
+    one. A concrete zero extent is a zero-sized tensor.
     """
     if isinstance(type, TensorType):
         values = []
         for dim in type.shape:
-            if not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0:
-                raise ValueError(
-                    f"numel: tensor extent {dim!r} is not a concrete positive integer"
+            if not isinstance(dim, int) or isinstance(dim, bool):
+                from .substitute import dim_vars_by_name  # noqa: PLC0415
+
+                names = dim_vars_by_name(dim)
+                hint = (
+                    f"; bind it with --dim {next(iter(names))}=EXTENT" if names else ""
                 )
+                raise ValueError(f"numel: tensor extent {dim!r} is not concrete{hint}")
+            if dim < 0:
+                raise ValueError(f"numel: tensor extent {dim} is negative")
             values.append(dim)
         return math.prod(values)
     if isinstance(type, TupleType):
@@ -116,9 +122,9 @@ def _layout_shape(layout: object) -> tuple:
         return _local_layout_shape(layout)
     if isinstance(layout, (Layout, ComposedLayout)):
         shape = tuple(layout.shape)
-        if any(not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0 for dim in shape):
+        if any(not isinstance(dim, int) or isinstance(dim, bool) or dim < 0 for dim in shape):
             raise ValueError(
-                "local_type_of: local tensor extent is not a concrete positive integer"
+                "local_type_of: local tensor extent is not a concrete non-negative integer"
             )
         return shape
     raise ValueError(

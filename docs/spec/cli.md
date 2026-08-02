@@ -87,6 +87,12 @@ bounds the caller stated.
     declaration order. Output names MUST come from return position: one tensor is
     `output`; a tuple's tensors are `output[0]`, `output[1]`, and so on in return
     order. These are positions, not names authored in the function.
+  - One `--input` file MUST bind one parameter. Its value MAY be a bare tensor or
+    an arbitrarily nested tuple or list of tensors; every leaf MUST be a tensor.
+  - A target whose step is an orchestration method rather than a `@func` MUST
+    refuse `--inputs random` and `--inputs real`, because its activation shapes
+    and dtypes are not declared. The refusal MUST name the parameter count and
+    names in order, and say that one `--input` file binds each parameter.
   - Every output MUST be judged by at least one predicate the caller states, and
     there MUST be no default predicate and no default bound. A bound nobody can
     meet is worse than none: a single `f32`→`bf16` rounding already measures
@@ -111,6 +117,9 @@ bounds the caller stated.
   - Inputs MUST be stated: random, real weights from a checkpoint, or files, and
     no form MAY be the default. Weights MUST come from the same draw on both
     sides, and the report MUST say which form was used and what seed drew it.
+    It MUST also say the actual and declared dtype of every activation and of
+    every weight the selected Module declares, plus the tensor count and shape
+    tree each `--input` file supplied.
   - Reaching one leaf MUST read only that leaf Module's own weights. A comparison
     of one kernel MUST NOT materialise a whole model. A Module is the unit that
     loads, so what a run binds is everything the selected Module declares, not the
@@ -161,7 +170,7 @@ granularity.
   - Its workflow pages are `index`, `migrate`, and `optimize`; causal-LM decode
     sources are listed through `tutorial orchestrator`.
   - A family's list description MUST be the leading docstring of the first file
-    in its package data manifest order.
+    in stable filename order.
 
 ## Models
 
@@ -206,7 +215,7 @@ that runs before it can be read is a reference that decides what it describes.
     count every Module a range stands for rather than the range as one.
   - `--source` MUST print the absolute path of the shipped model directory first,
     followed by one line for every file named in the package data manifest, in
-    manifest order. Each file line MUST give its filename and the first line of
+    a stable filename order. Each file line MUST give its filename and the first line of
     its own docstring, or `-` when it has none. A checkout MUST read that manifest;
     an installation MUST read its model directory, and both MUST name the same
     files.
@@ -214,6 +223,9 @@ that runs before it can be read is a reference that decides what it describes.
     or execute model source. It MUST NOT reformat, regenerate, or copy a shipped
     file: the installed directory is the reference, and a rendered copy is a
     different artifact wearing its name.
+  - A shipped model source directory with `hf_alias.py` MUST carry the executable
+    `run.py` and its `generation.py` decode source, whose shapes MUST come only from
+    that directory's `config.json`.
   - A `NAME` the catalog does not have MUST be refused naming the models it does.
   - The forest and the counts MUST be generated from the models themselves rather
     than maintained beside them, because a hand-kept inventory of trees and numbers
@@ -283,7 +295,9 @@ no ordinary `--target` option.
   - `--json` MUST print the report as JSON instead of text. Both formats MUST
     carry the same conclusions ([analysis §2](./analysis.md#2-authored-hir-metrics)).
   - `--dim NAME=EXTENT` MUST bind one dimension the selection leaves open, and
-    MUST be repeatable to bind several. It MUST be passed through as the
+    MUST be repeatable to bind several. One dimension MUST receive one extent;
+    a comma-separated list of extents for one dimension MUST be rejected because
+    several extents together are a `check` request. It MUST be passed through as the
     operation's `dims` ([analysis §2.2](./analysis.md#2-authored-hir-metrics));
     the CLI MUST NOT specialise the selection itself, because then what it
     printed would be about a program the operation never saw.
@@ -294,8 +308,9 @@ no ordinary `--target` option.
     later occurrence MUST NOT win, because both came from the caller and choosing
     between them silently answers a request that has no answer.
   - With no `--dim`, the selection MUST be analysed as authored. A selection that
-    leaves a dimension open MUST then fail naming the dimension: counting
-    elements requires an extent, and a range is not one.
+    leaves a dimension open MUST then fail naming the dimension, its declared
+    `[lo, hi)` interval, and concrete extents inside that interval the caller can
+    use: counting elements requires an extent, and a range is not one.
   - Every requested analysis MUST be reported together even when each was run at
     the stated extents, which builds one program per analysis. The report MUST
     accept those as one program when they were rebuilt from the same function at
