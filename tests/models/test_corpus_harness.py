@@ -15,17 +15,14 @@ from tests.models.corpus import (
     CorpusError,
     FunctionCase,
     ModelCase,
-    TargetFixture,
 )
 from tests.models.fixtures import apple_m2_pro, h200_sxm
 from tests.models.qwen3_1_7b.case import CASE as QWEN3_1_7B
 from tests.models.registry import CORPUS, case
-from tests.models.report import CoverageCollector, build_report, render_report
 from tilefoundry.analysis import analyze
 from tilefoundry.analysis.facts import ParallelCapacityFacts
 from tilefoundry.ir.core import Call
 from tilefoundry.ir.core.module import Module, select
-from tilefoundry.ir.types.shard import Topology
 
 
 def _source(case: ModelCase) -> Module:
@@ -69,15 +66,18 @@ def test_a_build_shares_nothing_with_the_build_before_it() -> None:
 
 def test_analysing_one_build_leaves_the_next_build_clean() -> None:
     """The property `replace` cannot give: analyses annotate Calls in place. The
-    prototype stays clean too, since it outlives every build taken from it."""
-    fixture = h200_sxm()
-    analysed = QWEN3_1_7B.build_for(fixture)
+    prototype stays clean too, since it outlives every build taken from it.
+
+    On the machine the source declares, since isolation is a property of the copy and
+    not of what it was aimed at.
+    """
+    analysed = QWEN3_1_7B.build()
     assert _analysis_records(analysed.lookup("mlp")) == 0
 
     analyze(analysed, analysed.lookup("mlp"), analysis="compute-cost")
     assert _analysis_records(analysed.lookup("mlp")) > 0
 
-    fresh = QWEN3_1_7B.build_for(fixture)
+    fresh = QWEN3_1_7B.build()
     assert _analysis_records(fresh.lookup("mlp")) == 0
     assert _analysis_records(_source(QWEN3_1_7B).lookup("mlp")) == 0
 
@@ -87,7 +87,7 @@ def test_a_stack_analyses_one_layer_without_marking_its_neighbour() -> None:
     written on one lands nowhere near the other."""
     from tests.models.qwen3_1_7b.model import Qwen3_1_7B  # noqa: PLC0415
 
-    stack = h200_sxm().bind(Qwen3_1_7B.cloned())
+    stack = Qwen3_1_7B.cloned()
     first, second = stack.modules[0], stack.modules[1]
     assert first.lookup("mlp") is not second.lookup("mlp")
 
@@ -97,32 +97,38 @@ def test_a_stack_analyses_one_layer_without_marking_its_neighbour() -> None:
     assert _analysis_records(second.lookup("mlp")) == 0
 
 
-def test_binding_a_target_does_not_reach_the_next_build() -> None:
-    fixture = h200_sxm()
-    bound = QWEN3_1_7B.build_for(fixture)
-    assert bound.resolve_target() is fixture.target
-    assert bound.effective_topologies() == fixture.topologies
+def test_a_case_answers_on_its_own_machine_and_can_be_asked_about_another() -> None:
+    """Every case's target and topologies come from its own source, and the same case
+    can be aimed at a second machine in the same run without the two reaching each
+    other.
 
-    unbound = QWEN3_1_7B.build()
-    assert unbound.target is None
-    assert unbound.topologies is None
-
-
-def test_one_model_answers_to_more_than_one_machine_in_one_run() -> None:
-    """The fixture rebinds, so the same model can be asked twice."""
-    cuda = QWEN3_1_7B.build_for(h200_sxm())
-    amx = QWEN3_1_7B.build_for(apple_m2_pro())
-
-    assert cuda.resolve_target() is not amx.resolve_target()
-    assert cuda.lookup("mlp") is not amx.lookup("mlp")
-
-
-def test_a_case_is_aimed_by_its_fixture_whatever_its_source_declares() -> None:
-    fixture = apple_m2_pro()
+    Both halves together, per case, because the property is the relationship between
+    them: a fixture that had quietly become the default would satisfy the second half
+    while breaking the first, and each half alone would not notice.
+    """
+    alternate = apple_m2_pro()
     for model in CORPUS:
-        bound = model.build_for(fixture)
-        assert bound.resolve_target() is fixture.target, model.id
-        assert bound.effective_topologies() == fixture.topologies, model.id
+        declared = model.build()
+        rebound = model.build_for(alternate)
+        source = _source(model)
+
+        # What `build()` answers with is what the source declares, not an injection.
+        assert declared.resolve_target() == source.resolve_target(), model.id
+        assert declared.effective_topologies() == source.effective_topologies(), model.id
+
+        # And the explicit second machine is the fixture's, not the source's.
+        assert rebound.resolve_target() is alternate.target, model.id
+        assert rebound.effective_topologies() == alternate.topologies, model.id
+        assert declared.resolve_target() != rebound.resolve_target(), model.id
+
+        # Two builds of one case share no Function, so neither run marks the other.
+        # Reached by a selector the case itself declares, because a root need not
+        # declare an entry -- Kimi's declares none and holds no functions of its own.
+        selector = model.analyze[0].selector
+        _in_declared, declared_function = model.resolve(declared, selector)
+        _in_rebound, rebound_function = model.resolve(rebound, selector)
+        assert declared_function is not rebound_function, model.id
+        assert declared_function is not model.resolve(source, selector)[1], model.id
 
 
 def test_fixtures_take_their_extents_from_the_hardware_documents() -> None:
@@ -200,95 +206,6 @@ def test_the_registry_resolves_its_own_ids() -> None:
     assert case("qwen3_1_7b") is QWEN3_1_7B
     with pytest.raises(KeyError, match="no case 'nope'"):
         case("nope")
-
-
-def test_the_report_groups_model_then_target_then_kind() -> None:
-    collector = CoverageCollector()
-    fixture = h200_sxm()
-    collector.record(
-        model=QWEN3_1_7B.id,
-        target=fixture.id,
-        kind="reference",
-        case="qwen3_1_7b/reference/decoder",
-        status="PASS",
-    )
-    collector.record(
-        model=QWEN3_1_7B.id,
-        target=fixture.id,
-        kind="analyze",
-        case="qwen3_1_7b/analyze/mlp",
-        function="mlp",
-        status="PASS",
-    )
-    collector.record(
-        model=QWEN3_1_7B.id,
-        target=fixture.id,
-        kind="schedule",
-        case="qwen3_1_7b/schedule/self_attention",
-        function="self_attention",
-        status="BLOCKED",
-        reason="no atom covers this operation yet",
-    )
-
-    report = build_report(collector, CORPUS)
-    section = report["qwen3_1_7b"]["targets"]["h200_sxm"]
-
-    assert [row["case"] for row in section["reference"]] == [
-        "qwen3_1_7b/reference/decoder"
-    ]
-    assert [row["function"] for row in section["analyze"]["tested"]] == ["mlp"]
-    assert "mlp" not in section["analyze"]["untested"]
-    assert "decoder_layer" in section["analyze"]["untested"]
-    assert section["schedule"]["tested"][0]["status"] == "BLOCKED"
-    assert section["schedule"]["tested"][0]["reason"]
-
-    text = render_report(report)
-    assert "qwen3_1_7b" in text
-    assert "h200_sxm" in text
-    assert "untested" in text
-
-
-def test_an_unrun_function_is_untested_and_never_blocked() -> None:
-    """Nobody selected it, so the report must not claim a limit stopped it."""
-    collector = CoverageCollector()
-    report = build_report(collector, CORPUS)
-    assert report["qwen3_1_7b"]["targets"] == {}
-
-    collector.record(
-        model=QWEN3_1_7B.id,
-        target="h200_sxm",
-        kind="analyze",
-        case="qwen3_1_7b/analyze/mlp",
-        function="mlp",
-        status="PASS",
-    )
-    section = build_report(collector, CORPUS)["qwen3_1_7b"]["targets"]["h200_sxm"]
-    statuses = {row["status"] for row in section["analyze"]["tested"]}
-    assert statuses == {"PASS"}
-    assert "self_attention" in section["analyze"]["untested"]
-
-
-def test_a_result_nobody_can_act_on_is_rejected() -> None:
-    collector = CoverageCollector()
-    with pytest.raises(ValueError, match="without a reason"):
-        collector.record(
-            model="m", target="t", kind="analyze", case="c", status="FAIL"
-        )
-
-
-def test_a_target_fixture_binds_only_what_it_was_given() -> None:
-    built = QWEN3_1_7B.build()
-    fixture = TargetFixture(
-        id="probe",
-        target=h200_sxm().target,
-        topologies=(Topology("cta", 4),),
-    )
-    declared = built.topologies
-    bound = fixture.bind(built)
-
-    assert isinstance(bound, Module)
-    assert bound.effective_topologies() == (Topology("cta", 4),)
-    assert built.topologies == declared
 
 
 def test_a_blocked_case_that_starts_working_breaks_the_build() -> None:

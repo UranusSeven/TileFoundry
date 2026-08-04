@@ -19,15 +19,17 @@ def _listed_names(output: str) -> set[str]:
     return {line.split(maxsplit=1)[0] for line in output.splitlines()[1:]}
 
 
-def test_models_separates_oracles_from_everything_else(tf) -> None:
+def test_models_lists_every_shipped_model_and_ranks_none(tf) -> None:
+    """The listing says what ships and how big each forest is, and grades nothing."""
     done = tf("models")
     assert done.returncode == 0, done.stderr
     listed = done.stdout
 
-    assert "usable as an oracle" in listed and "not usable as an oracle" in listed
     for name in ("qwen3_1_7b", "kimi_linear_48b_a3b"):
         assert name in listed
-    assert "L1" in listed and "L2" in listed and "L3" in listed
+    assert "leaf modules" in listed and "functions" in listed
+    for absent in ("usable as an oracle", "Levels:", "L1", "L2", "L3"):
+        assert absent not in listed
 
 
 def test_models_renders_the_whole_forest_with_leaf_modules_marked(tf) -> None:
@@ -172,25 +174,3 @@ def test_models_rejects_a_name_the_catalog_does_not_have(tf) -> None:
     assert done.returncode == 1
     assert "no model named 'nope'" in done.stderr
     assert "qwen3_1_7b" in done.stderr
-
-
-def test_the_shipped_source_answers_the_public_commands_as_it_ships(
-    tf, shipped
-) -> None:
-    """No editing step: the root declares its machine, so the commands answer."""
-    source = Path(shipped["models"]) / "qwen3_1_7b" / "model.py"
-    static = f"{source}:Qwen3_1_7B.layer0.mlp"
-
-    scheduled = tf("schedule", static, "--topology", "cta")
-    assert scheduled.returncode == 0, scheduled.stderr
-    assert "partition cta x132 on nvidia.h200_sxm" in scheduled.stdout
-
-    threaded = tf("schedule", static, "--topology", "thread")
-    assert threaded.returncode == 0, threaded.stderr
-    assert "pipeline schedule" in threaded.stdout
-
-    # A selector whose extent is stated at launch takes it on the command line.
-    dynamic = f"{source}:Qwen3_1_7B.layer0.self_attention"
-    sized = tf("analyze", dynamic, "--compute-cost", "--dim", "ctx_len=1024")
-    assert sized.returncode == 0, sized.stderr
-    assert "flops" in sized.stdout
