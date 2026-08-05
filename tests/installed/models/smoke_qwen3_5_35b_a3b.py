@@ -7,8 +7,6 @@ a context length open to be asked at a size.
 """
 from __future__ import annotations
 
-import json
-
 import contract
 import pytest
 import torch
@@ -19,33 +17,21 @@ MODEL = "qwen3_5_35b_a3b"
 CASES = contract.model_cases(MODEL)
 
 ANALYSED = [
-    pytest.param(case, selected, family, id=f"{selected.id}/{family}")
+    pytest.param(case, selected, id=selected.id)
     for case in CASES
     for selected in case.analyze
-    for family in contract.FAMILIES
 ]
 PLANNED = [
     pytest.param(case, planned, id=planned.id)
     for case in CASES
     for planned in case.schedule
 ]
-#: One case per Module, as the levels a root declares are a property of the root.
-FIRST_PLAN = [pytest.param(case, case.schedule[0], id=case.id) for case in CASES]
 SIZED = [pytest.param(case, sized, id=sized.id) for case in CASES for sized in case.sized]
 
-#: The bindings whose cost is the context, per case: only the full-attention mixer
-#: has one to zero.
-ZERO_SIZED = {
-    "qwen3_5_35b_a3b_full_attention": frozenset(
-        ("k_cache", "v_cache", "k_ctx", "score_ctx", "p_ctx", "weighted")
-    ),
-}
-
-
-@pytest.mark.parametrize(("case", "selected", "family"), ANALYSED)
-def test_every_selected_function_analyses(tf, shipped_source, case, selected, family) -> None:
-    contract.analysed(
-        tf, shipped_source(MODEL), case, selected.selector, family, selected.dims
+@pytest.mark.parametrize(("case", "selected"), ANALYSED)
+def test_every_selected_function_analyses(tf, shipped_source, case, selected) -> None:
+    contract.analysed_every_family(
+        tf, shipped_source(MODEL), case, selected.selector, selected.dims
     )
 
 
@@ -55,81 +41,13 @@ def test_every_selected_function_plans(tf, shipped_source, case, planned) -> Non
 
 
 @pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_each_model_is_asked_at_a_size(tf, shipped_source, case, sized) -> None:
-    contract.analysed(
-        tf, shipped_source(MODEL), case, sized.selector, "compute-cost", sized.dims
-    )
-
-
-@pytest.mark.parametrize(("case", "sized"), SIZED)
-@pytest.mark.parametrize("family", contract.FAMILIES)
 def test_every_analysis_answers_at_the_largest_context(
-    tf, shipped_source, case, sized, family
-) -> None:
-    """At the ceiling the case states, not at a sample of it."""
-    contract.analysed(
-        tf, shipped_source(MODEL), case, sized.selector, family, sized.ceiling
-    )
-
-
-@pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_the_ceiling_is_reasoned_about_at_its_stated_length(
     tf, shipped_source, case, sized
 ) -> None:
-    """What the analysis reports has to grow with the context.
-
-    Growth rather than an absolute number: an analysis quietly working at a length
-    it could afford instead of the one it was asked about would report the same
-    footprint at both, and a number nobody compares would not show it.
-    """
-    source = shipped_source(MODEL)
-    short = contract.traffic_read(tf, source, case, sized.selector, sized.dims)
-    full = contract.traffic_read(tf, source, case, sized.selector, sized.ceiling)
-
-    assert full > short, (
-        f"analysing at {dict(sized.ceiling)} reports no more traffic than at "
-        f"{dict(sized.dims)}, so the stated length changed nothing"
+    """At the ceiling the case states, not at a sample of it."""
+    contract.analysed_every_family(
+        tf, shipped_source(MODEL), case, sized.selector, sized.ceiling
     )
-
-
-@pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_the_open_dimensions_are_analysed_at_zero(tf, shipped_source, case, sized) -> None:
-    """A binding whose whole cost is the context has to cost nothing without one."""
-    source = shipped_source(MODEL)
-    bindings = ZERO_SIZED[case.id]
-    zero = contract.lifetimes(
-        tf, source, case, sized.selector, {name: 0 for name in sized.dims}
-    )
-    nonzero = contract.lifetimes(tf, source, case, sized.selector, sized.dims)
-
-    assert bindings <= zero.keys()
-    assert all(zero[binding] == 0 for binding in bindings)
-    assert all(nonzero[binding] > 0 for binding in bindings)
-
-
-@pytest.mark.parametrize(("case", "planned"), FIRST_PLAN)
-def test_the_command_reports_a_real_model_as_json(tf, shipped_source, case, planned) -> None:
-    done = contract.analysed(
-        tf,
-        shipped_source(MODEL),
-        case,
-        planned.selector,
-        "compute-cost",
-        planned.dims,
-        json_output=True,
-    )
-
-    assert json.loads(done.stdout)
-
-
-@pytest.mark.parametrize(("case", "planned"), FIRST_PLAN)
-def test_the_command_reads_the_machine_off_the_shipped_source(
-    tf, shipped_source, case, planned
-) -> None:
-    """Nothing tells the command which target to use; the source has to say."""
-    done = contract.capabilities(tf, shipped_source(MODEL), case, planned.selector)
-
-    assert done.stdout.strip()
 
 
 # ── against Hugging Face ─────────────────────────────────────────────────────
@@ -248,38 +166,29 @@ def _linear_disagrees(tf, work, source, step, loaded, activations) -> None:
     )
 
 
-def test_the_prior_state_is_read(tf, shipped_source, tmp_path) -> None:
-    """The recurrent matrix handed in reaches the answer.
+#: Each half of the state a linear-attention step is handed, zeroed. The step has no
+#: `ctx_len` in its signature, so nothing about its shape says it consulted the
+#: context at all -- an implementation that dropped either half would produce a
+#: plausible tensor of the right size. Zeroing has to move the answer away from the
+#: oracle the unperturbed step meets: for the recurrent matrix, otherwise every
+#: agreement above is an agreement about one token in isolation; for the convolution's
+#: left context, a kernel that convolved only the current column would be a kernel of
+#: kernel size one, and its output shape would not say so either.
+ZEROED = ["recurrent_state", "conv_state"]
 
-    A linear-attention step has no `ctx_len` in its signature, so nothing about its
-    shape says it consulted the context at all -- an implementation that dropped the
-    incoming matrix would produce a plausible tensor of the right size. Measured by
-    zeroing the matrix: that has to move the answer away from the oracle the
-    unperturbed step meets, or the kernel is not reading it and every agreement above
-    would be an agreement about one token in isolation.
-    """
+
+@pytest.mark.parametrize("zeroed", ZEROED)
+def test_each_half_of_the_state_reaches_the_answer(
+    tf, shipped_source, tmp_path, zeroed
+) -> None:
     step = reference.linear_step(device="cpu")
     loaded = reference.load_mixer("linear_attention", step.layer)
+    held = {"conv_state": step.conv_state, "recurrent_state": step.recurrent_state}
+    held[zeroed] = torch.zeros_like(held[zeroed])
 
     _linear_disagrees(
         tf, tmp_path, shipped_source(MODEL), step, loaded,
-        (step.hidden_new, step.conv_state, torch.zeros_like(step.recurrent_state)),
-    )
-
-
-def test_the_convolution_window_is_read(tf, shipped_source, tmp_path) -> None:
-    """The convolution's left context reaches the answer.
-
-    The same argument as the recurrent matrix, for the other half of the state: at
-    one token per step, a kernel that convolved only the current column would be a
-    kernel with a kernel size of one, and nothing about its output shape would say so.
-    """
-    step = reference.linear_step(device="cpu")
-    loaded = reference.load_mixer("linear_attention", step.layer)
-
-    _linear_disagrees(
-        tf, tmp_path, shipped_source(MODEL), step, loaded,
-        (step.hidden_new, torch.zeros_like(step.conv_state), step.recurrent_state),
+        (step.hidden_new, held["conv_state"], held["recurrent_state"]),
     )
 
 

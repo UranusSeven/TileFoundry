@@ -17,8 +17,13 @@ permissions:
 # Jobs run directly inside the self-hosted runner container, which carries the
 # toolchain (torch, CUDA, cutlass headers at /opt/cutlass/include, ruff,
 # clang-format, pre-commit). The runner container is launched pinned to one GPU
-# (e.g. --gpus device=4), so no per-job GPU selection is needed. `tilefoundry`
+# (--gpus device=1), so no per-job GPU selection is needed. `tilefoundry`
 # is the runner label — set it in the runner's RUNNER_LABELS at launch.
+#
+# That GPU must be in the default compute mode. Under `Exclusive_Process` only one
+# process may hold a context, and `-n 4` below is four of them: three workers fail
+# to initialise CUDA with `cudaErrorDevicesUnavailable`, which reads like a broken
+# toolchain rather than a busy card.
 jobs:
   lint:
     runs-on: [self-hosted, tilefoundry]
@@ -70,17 +75,23 @@ jobs:
           python -m venv --system-site-packages ${{ runner.temp }}/smoke-${{ github.run_id }}-${{ github.run_attempt }}
           ${{ runner.temp }}/smoke-${{ github.run_id }}-${{ github.run_attempt }}/bin/pip install --no-deps \
             ${{ runner.temp }}/wheel-${{ github.run_id }}-${{ github.run_attempt }}/tilefoundry-*.whl
-      # Default collection misses smoke_*.py, so the pattern is named here.
+      # The image carries pytest without xdist; the editable install that brings it in
+      # is the `test` job's, not this one's.
+      - name: Install pytest-xdist
+        run: pip install 'pytest-xdist>=3'
+      # Default collection misses smoke_*.py, so the pattern is named here. These tests
+      # spend their time in `tilefoundry` subprocesses, so the workers share the
+      # container's cores.
       - name: Verify the installed surface
         env:
           TF_SMOKE_VENV: ${{ runner.temp }}/smoke-${{ github.run_id }}-${{ github.run_attempt }}
         run: >-
-          pytest tests/integration/installed -o python_files='smoke_*.py' -q
+          pytest tests/installed -o python_files='smoke_*.py' -q -n 8
       # Run by the environment above. `--work` holds the emitted source and the
       # canonical store `prepare` writes.
       - name: Decode the published checkpoint with the shipped source
         run: >-
           ${{ runner.temp }}/smoke-${{ github.run_id }}-${{ github.run_attempt }}/bin/python
-          tests/integration/qwen3_1_7b_l3.py
+          tests/installed/qwen3_1_7b_l3.py
           --venv ${{ runner.temp }}/smoke-${{ github.run_id }}-${{ github.run_attempt }}
           --work ${{ runner.temp }}/l3-${{ github.run_id }}-${{ github.run_attempt }}

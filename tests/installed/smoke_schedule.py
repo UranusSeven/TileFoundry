@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import json
 
+#: Stated rather than defaulted: the default worker count sizes itself to the machine.
+_CTA_SOLVER = ("--first-plan", "--solver-workers=2")
+
 
 def test_schedule_answers_at_each_level_the_target_schedules(tf, cmine) -> None:
-    partition = tf("schedule", f"{cmine}:CMine.root", "--topology", "cta")
+    partition = tf("schedule", f"{cmine}:CMine.root", "--topology", "cta", *_CTA_SOLVER)
     assert partition.returncode == 0, partition.stderr
     assert "nvidia.h200_sxm" in partition.stdout
 
