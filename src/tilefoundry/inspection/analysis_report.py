@@ -23,7 +23,6 @@ from tilefoundry.analysis import (
     TrafficBytes,
 )
 from tilefoundry.analysis.api import AnalysisResult
-from tilefoundry.analysis.registry import ANALYSES
 from tilefoundry.analysis.walk import postorder, tensor_types
 from tilefoundry.ir.core import Call, IRMetadata, binding_name, get_metadata
 from tilefoundry.ir.hir.function import Function
@@ -162,23 +161,18 @@ def _call_label(call: Call, index: int) -> str:
 def selected_types(
     results: Sequence[AnalysisResult],
 ) -> tuple[type[IRMetadata], ...]:
-    """Which record types these results may be shown through.
+    """Return record types requested analyses own and actually wrote.
 
-    A requested root pulls its dependencies in, so records land on the IR that
-    nobody asked to see. What is shown is what the *requested* analyses own,
-    intersected with what was actually written: ownership comes from the
-    registrations rather than a hand-kept table, and the intersection keeps a
-    reader from looking for a record that is not there.
-
-    Every rendering of one run goes through here, so the report and the annotated
-    IR cannot make this choice differently.
+    Dependencies can produce records nobody requested. Target-selected Analyzer
+    ownership, rather than a table, selects the display set; filtering actual
+    metadata avoids missing records and keeps report and annotated IR aligned.
     """
     if not results:
         return ()
     target = results[0].module.resolve_target()
     owned: set[type[IRMetadata]] = set()
     for item in results:
-        owned.update(ANALYSES.resolve(target, item.analysis).produces)
+        owned.update(target.get_analyzer(item.analysis).produces)
     order: list[type[IRMetadata]] = []
     for item in results:
         for metadata_type in item.metadata_types:
@@ -401,12 +395,8 @@ def render_text(data: dict[str, object]) -> str:
     if "timeline" in records:
         lines.append(f"theoretical-makespan={records['timeline']['end_ns']}ns")
     for call in data["calls"]:
-        # Only what the annotated program does not already say on the value's own
-        # line. Its flops, its bound and its placement are all there, against the
-        # name that produced them; repeating them here made the report a second
-        # copy of the program, and the copy was the one whose labels are ambiguous.
-        # The per-operand split is not there -- the annotation carries the sum --
-        # so this is where it lives, and text and `--json` still agree.
+        # Report only the per-operand split absent from annotations; value flops,
+        # bound, and placement stay there to avoid ambiguous duplicate labels.
         operands = call.get("compute-cost", {}).get("operands")
         if operands is None:
             continue

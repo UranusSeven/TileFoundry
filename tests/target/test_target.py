@@ -9,58 +9,286 @@ is asked during a compilation.
 
 from __future__ import annotations
 
-from dataclasses import replace
+import typing
+from dataclasses import dataclass, replace
 
 import pytest
 
+from tests.fixtures.demo_ir import build_demo
+from tilefoundry import CompilerOptions, build, func, jit, lower, module
 from tilefoundry.codegen.registry import group_functions_by_target
+from tilefoundry.dsl import Tensor
+from tilefoundry.dsl.tf import matmul
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Sequential
 from tilefoundry.ir.types.shard import Topology
-from tilefoundry.registry import UnknownAlgorithmError
-from tilefoundry.schedule.registry import SCHEDULES
+from tilefoundry.schedule import ScheduleError, schedule
+from tilefoundry.schedule.plan import SchedulePlan
 from tilefoundry.target import (
     AmxTarget,
     CpuTarget,
     CudaTarget,
     Target,
+    TopologyLimitFacts,
+    UnsupportedCapabilityError,
+    register_target,
+    registered_targets,
+    validate_cuda_topology_levels,
 )
 from tilefoundry.target.cuda.spec import installed_architecture as _installed_sm90
+from tilefoundry.target.services import CodeGenerator, Scheduler
 
 
-def test_a_scheduler_is_reached_by_target_type_not_by_target_value() -> None:
-    """Which levels a target can be scheduled at is a property of its type.
+class ExternalCudaTarget(CudaTarget):
+    name = "tests.target.external_cuda"
 
-    A target carrying different hardware facts is still the same kind of machine,
-    so it resolves the same scheduler; a target with no registration resolves
-    none, and says which levels it does serve rather than only that it failed.
-    Nothing about scheduling is stored on the target value, which is why two
-    equal targets stay equal and interchangeable -- codegen groups functions by
-    comparing targets, so a registration reachable by value would split one
-    machine into two.
-    """
-    assert SCHEDULES.selectors_for(CudaTarget) == ("cta", "thread")
-    assert SCHEDULES.selectors_for(AmxTarget) == ("core",)
-    assert SCHEDULES.selectors_for(CpuTarget) == ()
 
-    custom = CudaTarget(
-        "nvidia.h200_sxm",
-        architecture=replace(_installed_sm90(), name="sm_90_custom"),
+@func
+def scheduling_gemm(
+    x: Tensor[(64, 128), "f32"],
+    w: Tensor[(128, 64), "f32"],
+) -> Tensor[(64, 64), "f32"]:
+    return matmul(x, w)
+
+
+@dataclass(frozen=True)
+class _CustomSchedulePlan(SchedulePlan):
+    topology: str
+
+    def verify(self, module, function, topology) -> None:
+        assert topology.name == self.topology
+
+    def to_json(self) -> str:
+        return self.topology
+
+    def render(self) -> str:
+        return self.topology
+
+
+_CUSTOM_SOLVES: list[str] = []
+
+
+def _solve_custom_topology(module, function, target, topology, options):
+    _CUSTOM_SOLVES.append(topology.name)
+    return _CustomSchedulePlan(topology.name)
+
+
+class CustomSchedulerCudaTarget(CudaTarget):
+    name = "tests.target.custom_scheduler_cuda"
+    topology_levels = (*CudaTarget.topology_levels, "custom", "unknown")
+
+    def get_facts(self, facts_type: type, query: object | None = None):
+        if facts_type is TopologyLimitFacts and query in {"custom", "unknown"}:
+            return TopologyLimitFacts(query, 1)
+        return super().get_facts(facts_type, query)
+
+    def get_scheduler(self, topology: str) -> Scheduler:
+        if topology == "custom":
+            return Scheduler("custom", _solve_custom_topology)
+        return super().get_scheduler(topology)
+
+
+class RefusingCudaTarget(CustomSchedulerCudaTarget):
+    name = "tests.target.refusing_cuda"
+
+    def get_scheduler(self, topology: str) -> Scheduler:
+        if topology == "thread":
+            raise UnsupportedCapabilityError(
+                f"{type(self).__name__} ({type(self).name}): no scheduler for "
+                f"{topology!r}"
+            )
+        return super().get_scheduler(topology)
+
+
+def _provider_target(module_name: str, provider_name: str, registered_name: str):
+    return type(
+        provider_name,
+        (Target,),
+        {
+            "__module__": module_name,
+            "__qualname__": provider_name,
+            "name": registered_name,
+        },
     )
-    assert SCHEDULES.resolve(custom, "cta") is SCHEDULES.resolve(CudaTarget("nvidia.h200_sxm"), "cta")
-    assert SCHEDULES.resolve(CudaTarget("nvidia.h200_sxm"), "cta") is not SCHEDULES.resolve(
-        CudaTarget("nvidia.h200_sxm"), "thread"
+
+
+def test_registration_is_one_class_boundary_and_reload_is_idempotent() -> None:
+    registered_name = "tests.target.reload"
+    first = _provider_target("tests.providers.reload", "ReloadTarget", registered_name)
+    second = _provider_target("tests.providers.reload", "ReloadTarget", registered_name)
+
+    assert register_target(first) is first
+    assert register_target(second) is second
+    assert registered_targets()[registered_name] is first
+    assert isinstance(second(), Target)
+    assert {"cpu", "cuda", "amx"} <= registered_targets().keys()
+    with pytest.raises(TypeError):
+        registered_targets()["tests.target.mutation"] = Target
+
+
+def test_target_registration_and_service_annotations_resolve() -> None:
+    assert typing.get_type_hints(register_target)
+    assert typing.get_type_hints(PrimFunction)
+    for getter in (
+        Target.get_analyzer,
+        Target.get_scheduler,
+        Target.get_code_generator,
+    ):
+        assert typing.get_type_hints(getter)
+
+
+def test_cuda_mesh_topology_validation_uses_the_emission_target() -> None:
+    custom = CustomSchedulerCudaTarget("nvidia.h200_sxm")
+
+    validate_cuda_topology_levels(custom, ("custom",))
+    with pytest.raises(ValueError, match=r"supports \{cta, thread, custom, unknown\}"):
+        validate_cuda_topology_levels(custom, ("warp",))
+
+
+def test_registration_rejects_ambiguous_or_invalid_provider_classes() -> None:
+    inherited = type(
+        "InheritedTarget",
+        (CudaTarget,),
+        {"__module__": "tests.providers.inherited"},
+    )
+    empty = _provider_target("tests.providers.empty", "EmptyTarget", "")
+
+    with pytest.raises(ValueError, match="declare a class-level"):
+        register_target(inherited)
+    with pytest.raises(ValueError, match="non-empty"):
+        register_target(empty)
+    with pytest.raises(TypeError, match="Target subclass"):
+        register_target(object)
+    with pytest.raises(TypeError, match="Target subclass"):
+        register_target("tests.target.argument")
+
+    owner = _provider_target(
+        "tests.providers.owner", "OwnedTarget", "tests.target.conflict"
+    )
+    claimant = _provider_target(
+        "tests.providers.claimant", "ClaimantTarget", "tests.target.conflict"
+    )
+    register_target(owner)
+    with pytest.raises(ValueError, match="already owned.*cannot register"):
+        register_target(claimant)
+
+
+def test_authored_target_boundaries_reject_strings_and_keep_exact_instances() -> None:
+    target = CudaTarget("nvidia.h200_sxm")
+    module = Module("exact", (), target=target)
+
+    assert module.target is target
+    assert module.resolve_target() is target
+    with pytest.raises(TypeError, match="Target instance, not a string"):
+        Module("invalid", (), target="cuda")
+    with pytest.raises(TypeError, match="Target instance, not a string"):
+        PrimFunction("invalid", (), Sequential(()), target="cuda")
+
+
+def test_authored_target_boundaries_accept_unregistered_target_instances() -> None:
+    class UnregisteredTarget(Target):
+        name = "tests.target.unregistered"
+
+    target = UnregisteredTarget()
+    module_value = Module("unregistered", (), target=target)
+    function = PrimFunction("unregistered", (), Sequential(()), target=target)
+
+    @module(target=target)
+    class Decorated:
+        def forward(self):
+            return None
+
+    assert module_value.target is target
+    assert function.target is target
+    assert Decorated.target is target
+
+
+def test_lowering_and_codegen_keep_the_external_target_instance() -> None:
+    function, _, _ = build_demo()
+    target = ExternalCudaTarget("nvidia.h200_sxm")
+    module = Module("external", (function,), function.name, target=target)
+
+    lowered = lower(module)
+
+    assert lowered.target is target
+    assert all(fn.target is target for fn in lowered.functions)
+    assert target.get_code_generator() is CudaTarget(
+        "nvidia.h200_sxm"
+    ).get_code_generator()
+
+
+@pytest.mark.parametrize(
+    ("target", "topology", "extent"),
+    (
+        (ExternalCudaTarget("nvidia.h200_sxm"), "thread", 128),
+        (AmxTarget(), "core", 1),
+    ),
+)
+def test_public_schedule_uses_inherited_target_schedulers(
+    target: Target, topology: str, extent: int
+) -> None:
+    scheduled = Module(
+        "inherited_scheduler",
+        (scheduling_gemm,),
+        scheduling_gemm.name,
+        target=target,
+        topologies=(Topology(topology, extent),),
     )
 
-    with pytest.raises(UnknownAlgorithmError, match="no 'cta' registered for Target"):
-        SCHEDULES.resolve(Target("test"), "cta")
-    with pytest.raises(UnknownAlgorithmError, match=r"available: \['core'\]"):
-        SCHEDULES.resolve(AmxTarget(), "amx")
+    result = schedule(scheduled, scheduling_gemm, topology=topology)
 
-    assert CudaTarget("nvidia.h200_sxm") == CudaTarget("nvidia.h200_sxm")
-    assert hash(CudaTarget("nvidia.h200_sxm")) == hash(CudaTarget("nvidia.h200_sxm"))
-    assert AmxTarget() == AmxTarget()
+    assert result.module is scheduled
+    assert result.function is scheduling_gemm
+    assert result.topology == Topology(topology, extent)
+    assert isinstance(result.plan, SchedulePlan)
+
+
+def test_public_schedule_overrides_refuses_and_rejects_unknown_topologies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def scheduled(target: Target, topology: str) -> Module:
+        return Module(
+            "custom_scheduler",
+            (scheduling_gemm,),
+            scheduling_gemm.name,
+            target=target,
+            topologies=(Topology(topology, 1),),
+        )
+
+    _CUSTOM_SOLVES.clear()
+    overridden = scheduled(CustomSchedulerCudaTarget("nvidia.h200_sxm"), "custom")
+    result = schedule(overridden, scheduling_gemm, topology="custom")
+    assert result.plan == _CustomSchedulePlan("custom")
+    assert _CUSTOM_SOLVES == ["custom"]
+
+    solver_calls: list[str] = []
+
+    def unexpected_thread_solver(*args):
+        solver_calls.append("thread")
+        raise AssertionError("refused topology reached a solver")
+
+    monkeypatch.setattr(
+        "tilefoundry.target.cuda.schedule.schedule_thread",
+        unexpected_thread_solver,
+    )
+    refused = scheduled(RefusingCudaTarget("nvidia.h200_sxm"), "thread")
+    with pytest.raises(ScheduleError) as refusal:
+        schedule(refused, scheduling_gemm, topology="thread")
+    assert str(refusal.value) == (
+        "schedule: RefusingCudaTarget (tests.target.refusing_cuda): "
+        "no scheduler for 'thread'"
+    )
+    assert solver_calls == []
+
+    unknown = scheduled(CustomSchedulerCudaTarget("nvidia.h200_sxm"), "unknown")
+    with pytest.raises(ScheduleError) as unknown_error:
+        schedule(unknown, scheduling_gemm, topology="unknown")
+    assert str(unknown_error.value) == (
+        "schedule: CustomSchedulerCudaTarget "
+        "(tests.target.custom_scheduler_cuda): no scheduler for 'unknown'"
+    )
+    assert solver_calls == []
 
 
 def test_static_topologies_use_target_resource_facts() -> None:
@@ -73,10 +301,18 @@ def test_static_topologies_use_target_resource_facts() -> None:
     target.validate_program_topology(Topology("cta", 310_000))
     target.validate_program_topology(Topology("thread", 1024))
     target.validate_program_topology(Topology("cta", None))
+    ExternalCudaTarget("nvidia.h200_sxm").validate_program_topology(
+        Topology("thread", 1024)
+    )
     with pytest.raises(ValueError, match="must be positive"):
         target.validate_program_topology(Topology("cta", 0))
-    with pytest.raises(ValueError, match="1 <= extent <= 1024"):
+    with pytest.raises(ValueError, match="1 <= extent <= 1024") as error:
         target.validate_program_topology(Topology("thread", 1025))
+    assert str(error.value) == (
+        "CudaTarget (cuda): topology 'thread' extent 1025 must satisfy "
+        "1 <= extent <= 1024"
+    )
+    assert len(str(error.value)) < 120
 
 
 def test_group_functions_by_target_fact_matching() -> None:
@@ -93,14 +329,91 @@ def test_group_functions_by_target_fact_matching() -> None:
             architecture=replace(_installed_sm90(), name="sm_90_alt"),
         ),
     )
-    with pytest.raises(ValueError, match="differing Target facts"):
+    with pytest.raises(ValueError, match="mixes unequal device Targets") as error:
         group_functions_by_target(
             Module(name="mixed", functions=(first, second), entry="first")
         )
+    assert "CudaTarget (cuda)" in str(error.value)
+    assert "architecture=" not in str(error.value)
+    assert "device=" not in str(error.value)
+    assert len(str(error.value)) < 300
 
     host = PrimFunction(name="host", params=(), body=body, target=CpuTarget())
     groups = group_functions_by_target(
         Module(name="mixed", functions=(first, host), entry="host")
     )
-    assert tuple(fn.name for fn in groups["cuda"]) == ("first",)
-    assert tuple(fn.name for fn in groups["cpu"]) == ("host",)
+    assert tuple(fn.name for fn in groups[first.target]) == ("first",)
+    assert tuple(fn.name for fn in groups[host.target]) == ("host",)
+
+
+def test_build_rejects_unequal_device_targets_before_emitting() -> None:
+    emitted: list[object] = []
+
+    def unexpected_emit(*args):
+        emitted.append(args)
+        raise AssertionError("unequal device targets reached code generation")
+
+    class FirstDeviceTarget(CudaTarget):
+        name = "tests.target.first_device"
+
+        def get_code_generator(self) -> CodeGenerator:
+            return CodeGenerator(unexpected_emit)
+
+    class SecondDeviceTarget(CudaTarget):
+        name = "tests.target.second_device"
+
+        def get_code_generator(self) -> CodeGenerator:
+            return CodeGenerator(unexpected_emit)
+
+    first_target = FirstDeviceTarget("nvidia.h200_sxm")
+    second_target = SecondDeviceTarget("nvidia.h200_sxm")
+    body = Sequential(body=())
+    first = PrimFunction("first", (), body, target=first_target)
+    second = PrimFunction("second", (), body, target=second_target)
+    host = PrimFunction("host", (), body, target=CpuTarget())
+    mixed = Module("mixed", (first, second, host), "host", target=first_target)
+
+    with pytest.raises(ValueError) as error:
+        build(mixed)
+
+    assert str(error.value) == (
+        "tilefoundry: module 'mixed' mixes unequal device Targets: "
+        "FirstDeviceTarget (tests.target.first_device) (function 'first') vs "
+        "SecondDeviceTarget (tests.target.second_device) (function 'second'); "
+        "multiple device translation units are not supported"
+    )
+    assert emitted == []
+
+
+def test_target_conflict_diagnostics_use_stable_summaries() -> None:
+    function, _, _ = build_demo()
+    declared_target = CudaTarget("nvidia.h200_sxm")
+    explicit_target = CudaTarget(
+        "nvidia.h200_sxm",
+        architecture=replace(_installed_sm90(), name="sm_90_alt"),
+    )
+    module_value = Module(
+        name="conflicting_targets",
+        functions=(function,),
+        entry=function.name,
+        target=declared_target,
+    )
+
+    for invoke, operation in (
+        (lambda: lower(module_value, target=explicit_target), "lower"),
+        (lambda: build(module_value, target=explicit_target), "build"),
+        (
+            lambda: jit(
+                module_value,
+                target=declared_target,
+                options=CompilerOptions(target=explicit_target),
+            ),
+            "jit",
+        ),
+    ):
+        with pytest.raises(ValueError, match=f"tilefoundry.{operation}") as error:
+            invoke()
+        assert "CudaTarget (cuda)" in str(error.value)
+        assert "architecture=" not in str(error.value)
+        assert "device=" not in str(error.value)
+        assert len(str(error.value)) < 220

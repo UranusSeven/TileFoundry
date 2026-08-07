@@ -5,15 +5,7 @@ from __future__ import annotations
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.schedule import ScheduleError, ScheduleOptions
-from tilefoundry.schedule.pipeline import (
-    PipelineFacts,
-    PipelineSchedulePlan,
-    build_pipeline_problem,
-    build_pipeline_program,
-    export_pipeline_plan,
-    solve_pipeline_problem,
-)
-from tilefoundry.schedule.registry import register_schedule
+from tilefoundry.target.services import Scheduler
 
 from .target import AmxTarget
 
@@ -26,8 +18,16 @@ def schedule_core(
     target: AmxTarget,
     topology: object,
     options: object | None = None,
-) -> PipelineSchedulePlan:
+) -> object:
     """Build, close, solve, and export the AMX core pipeline schedule."""
+    from tilefoundry.schedule.pipeline import (  # noqa: PLC0415
+        PipelineFacts,
+        build_pipeline_problem,
+        build_pipeline_program,
+        export_pipeline_plan,
+        solve_pipeline_problem,
+    )
+
     if function is not module.entry_function():
         raise ScheduleError(
             f"{TOPOLOGY} schedule requires the module entry function, got "
@@ -39,13 +39,17 @@ def schedule_core(
             f"{type(options).__name__}"
         )
     program = build_pipeline_program(module, function)
-    facts = target.as_facts(PipelineFacts, program.facts_query(TOPOLOGY))
+    facts = target.get_facts(PipelineFacts, program.facts_query(TOPOLOGY))
     problem = build_pipeline_problem(program, facts, topology)
     solution = solve_pipeline_problem(problem)
     return export_pipeline_plan(program, solution, target)
 
 
-register_schedule(AmxTarget, TOPOLOGY)(schedule_core)
+def amx_scheduler(topology: str) -> Scheduler | None:
+    """Construct the AMX scheduler requested for one topology level."""
+    if topology == TOPOLOGY:
+        return Scheduler(TOPOLOGY, schedule_core)
+    return None
 
 
-__all__ = ["TOPOLOGY", "schedule_core"]
+__all__ = ["TOPOLOGY", "amx_scheduler", "schedule_core"]

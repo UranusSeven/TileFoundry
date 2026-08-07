@@ -3,32 +3,25 @@
 from __future__ import annotations
 
 from tilefoundry.target.amx import AmxTarget, AppleAmx, AppleM2Pro
-from tilefoundry.target.base import Architecture, CpuTarget, Device, Target
+from tilefoundry.target.amx import spec as _amx_spec  # noqa: F401
+from tilefoundry.target.base import (
+    Architecture,
+    Device,
+    Target,
+    UnsupportedCapabilityError,
+    register_target,
+    registered_targets,
+)
+from tilefoundry.target.cpu import CpuTarget
 from tilefoundry.target.cuda import H200SXM, SM90, CudaTarget
 from tilefoundry.target.cuda.spec import H200_SXM_ID
+from tilefoundry.target.facts import TopologyLimitFacts
+from tilefoundry.target.services import Analyzer, Scheduler
 
 
 def _cuda_fallback() -> CudaTarget:
-    """The machine compilation falls back to when a caller names only "cuda"."""
+    """Construct the built-in value used at compiler-owned omitted boundaries."""
     return CudaTarget(H200_SXM_ID)
-
-
-_STRING_TARGETS = {"amx": AmxTarget, "cuda": _cuda_fallback, "cpu": CpuTarget}
-
-
-def resolve_target(target: str | Target) -> Target:
-    """Resolve a backend name or pass through an immutable Target value."""
-    if isinstance(target, Target):
-        return target
-    if isinstance(target, str):
-        factory = _STRING_TARGETS.get(target)
-        if factory is None:
-            raise ValueError(
-                f"unknown target {target!r}; expected one of "
-                f"{sorted(_STRING_TARGETS)} or a Target object"
-            )
-        return factory()
-    raise TypeError(f"target must be a str or Target, got {type(target).__name__}")
 
 
 def default_target() -> Target:
@@ -36,12 +29,11 @@ def default_target() -> Target:
     return _cuda_fallback()
 
 
-def validate_cuda_topology_levels(names) -> None:
+def validate_cuda_topology_levels(target: Target, names) -> None:
     """Validate names at the CUDA lowering boundary.
 
     See docs/spec/target.md § Topology levels.
     """
-    target = _cuda_fallback()
     for name in names:
         if name not in target.topology_levels:
             raise ValueError(
@@ -50,32 +42,9 @@ def validate_cuda_topology_levels(names) -> None:
             )
 
 
-def register_facts_projections() -> None:
-    """Load each backend's Facts projections, which register on import.
-
-    This cannot happen while this package is initialising: a projection names
-    the analysis Facts type it builds, and the analysis layer is built on the IR
-    that is still loading the Target at that point. The compiler entry triggers
-    it once both halves exist.
-    """
-    from tilefoundry.target.amx import facts as amx_facts  # noqa: PLC0415, F401
-    from tilefoundry.target.cuda import facts as cuda_facts  # noqa: PLC0415, F401
-
-
-def register_schedule_algorithms() -> None:
-    """Load each backend's schedulers, which register on import.
-
-    Deferred for the reason the Facts projections are: a scheduler names the
-    public Schedule boundary, which rests on the IR that is still loading this
-    package at the time. Which hardware is schedulable at which level is then
-    exactly the set of registrations these modules make.
-    """
-    from tilefoundry.target.amx import schedule as amx_schedule  # noqa: PLC0415, F401
-    from tilefoundry.target.cuda import schedule as cuda_schedule  # noqa: PLC0415, F401
-
-
 __all__ = [
     "AmxTarget",
+    "Analyzer",
     "AppleAmx",
     "AppleM2Pro",
     "Architecture",
@@ -84,10 +53,12 @@ __all__ = [
     "Device",
     "H200SXM",
     "SM90",
+    "Scheduler",
     "Target",
+    "TopologyLimitFacts",
+    "UnsupportedCapabilityError",
     "default_target",
-    "register_facts_projections",
-    "register_schedule_algorithms",
-    "resolve_target",
+    "register_target",
+    "registered_targets",
     "validate_cuda_topology_levels",
 ]

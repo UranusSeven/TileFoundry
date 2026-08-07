@@ -21,14 +21,7 @@ from tilefoundry.analysis.facts import (
 )
 from tilefoundry.ir.types import DType
 from tilefoundry.schedule.facts import AtomFact
-from tilefoundry.schedule.partition.facts import PartitionFacts, PartitionFactsQuery
-from tilefoundry.schedule.pipeline.facts import (
-    PipelineFacts,
-    PipelineFactsQuery,
-    PipelineInstructionFacts,
-)
 from tilefoundry.schedule.plan import TargetSpecRef
-from tilefoundry.target.facts import register_target_facts
 
 from .atoms import candidate_atoms
 from .target import CudaTarget
@@ -127,12 +120,18 @@ def parallel_capacity(
     return ParallelCapacityFacts(topology="cta", parallel_units=target.device.sm_count)
 
 
-def pipeline_facts(target: CudaTarget, query: PipelineFactsQuery) -> PipelineFacts:
+def pipeline_facts(target: CudaTarget, query: object) -> object:
     """Project every instruction and capacity fact before pipeline solving.
 
     The capacity is per-CTA shared memory and is reported as CTA-scoped, because
     that is whose store it is; the level being decided about is finer.
     """
+    from tilefoundry.schedule.pipeline.facts import (  # noqa: PLC0415
+        PipelineFacts,
+        PipelineFactsQuery,
+        PipelineInstructionFacts,
+    )
+
     if not isinstance(query, PipelineFactsQuery):
         raise TypeError(
             "CudaTarget pipeline facts need a PipelineFactsQuery, got "
@@ -174,7 +173,7 @@ def pipeline_facts(target: CudaTarget, query: PipelineFactsQuery) -> PipelineFac
     )
 
 
-def partition_facts(target: CudaTarget, query: PartitionFactsQuery) -> PartitionFacts:
+def partition_facts(target: CudaTarget, query: object) -> object:
     """Project every rate, capacity, and position count before partitioning.
 
     All of it is what the installed documents state: how many SMs the device has,
@@ -182,6 +181,11 @@ def partition_facts(target: CudaTarget, query: PartitionFactsQuery) -> Partition
     of that machine to occupy is the caller's to decide, so no policy is encoded
     here. After this call the partition holds numbers, not a target.
     """
+    from tilefoundry.schedule.partition.facts import (  # noqa: PLC0415
+        PartitionFacts,
+        PartitionFactsQuery,
+    )
+
     if not isinstance(query, PartitionFactsQuery):
         raise TypeError(
             "CudaTarget partition facts need a PartitionFactsQuery, got "
@@ -203,13 +207,6 @@ def partition_facts(target: CudaTarget, query: PartitionFactsQuery) -> Partition
             sorted(device.dense_flops_per_second.items(), key=lambda item: item[0].name)
         ),
     )
-
-
-register_target_facts(CudaTarget, MemoryHierarchyFacts, memory_hierarchy)
-register_target_facts(CudaTarget, ThroughputFacts, throughput)
-register_target_facts(CudaTarget, ParallelCapacityFacts, parallel_capacity)
-register_target_facts(CudaTarget, PipelineFacts, pipeline_facts)
-register_target_facts(CudaTarget, PartitionFacts, partition_facts)
 
 
 __all__ = [

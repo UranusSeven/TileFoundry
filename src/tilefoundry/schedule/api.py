@@ -22,11 +22,11 @@ from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.specialize import SpecializationError, specialize_concretely
 from tilefoundry.ir.types.shape_helpers import static_dim_value
 from tilefoundry.ir.types.shard import Topology
-from tilefoundry.registry import UnknownAlgorithmError
+from tilefoundry.target import Target, UnsupportedCapabilityError
+from tilefoundry.target.services import Scheduler
 
 from .errors import ScheduleError
 from .plan import SchedulePlan
-from .registry import SCHEDULES, ScheduleAlgorithm
 
 
 @dataclass(frozen=True)
@@ -75,11 +75,11 @@ def _topology(module: Module, name: str) -> Topology:
     return level
 
 
-def _algorithm(target: object, topology: str) -> ScheduleAlgorithm:
-    """The algorithm bound to *topology* under *target*'s exact type."""
+def _algorithm(target: Target, topology: str) -> Scheduler:
+    """The scheduler selected by the resolved Target for *topology*."""
     try:
-        return SCHEDULES.resolve(target, topology)
-    except UnknownAlgorithmError as error:
+        return target.get_scheduler(topology)
+    except UnsupportedCapabilityError as error:
         raise ScheduleError(f"schedule: {error}") from None
 
 
@@ -141,6 +141,8 @@ def schedule(
             raise ScheduleError(f"schedule: {error}") from None
 
     target = module.resolve_target()
+    for declared_topology in module.effective_topologies():
+        target.validate_program_topology(declared_topology)
     level = _topology(module, topology)
     algorithm = _algorithm(target, topology)
     resolved_options = _options(options)

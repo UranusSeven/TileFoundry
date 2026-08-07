@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
-from tilefoundry.ir.types.shard import Topology
-from tilefoundry.target.base import Architecture, Device, Target
+from tilefoundry.target.base import (
+    Architecture,
+    Device,
+    _BuiltinAnalysisTarget,
+    register_target,
+)
+from tilefoundry.target.facts import TopologyLimitFacts, facts_result
 from tilefoundry.target.hardware.registry import check_compatible, select
+from tilefoundry.target.services import Scheduler
+from tilefoundry.utils.python_source import PythonExpr
 
 
+@register_target
 @dataclass(frozen=True, init=False)
-class AmxTarget(Target):
+class AmxTarget(_BuiltinAnalysisTarget):
     """AMX target composed from one architecture and one device."""
 
-    name: str = field(default="amx", init=False)
+    name: ClassVar[str] = "amx"
     architecture: Architecture = field(init=False)
     device: Device = field(init=False)
     # Identity and digest record where a value came from, not what it says, so
@@ -44,7 +53,6 @@ class AmxTarget(Target):
         )
         if architecture.id is not None and device.id is not None:
             check_compatible(architecture, device)
-        object.__setattr__(self, "name", "amx")
         object.__setattr__(self, "architecture", architecture.value)
         object.__setattr__(self, "device", device.value)
         object.__setattr__(self, "architecture_id", architecture.id)
@@ -52,50 +60,81 @@ class AmxTarget(Target):
         object.__setattr__(self, "architecture_digest", architecture.digest)
         object.__setattr__(self, "device_digest", device.digest)
 
+    def get_facts(self, facts_type: type, query: object | None = None):
+        """Project AMX hardware through the facts this Target owns."""
+        if facts_type is TopologyLimitFacts:
+            if query == "core":
+                return facts_result(
+                    self,
+                    facts_type,
+                    TopologyLimitFacts(
+                        "core", self.device.performance_core_count
+                    ),
+                )
+            if query == "amx":
+                return facts_result(
+                    self,
+                    facts_type,
+                    TopologyLimitFacts(
+                        "amx", self.architecture.topology_limit("amx")
+                    ),
+                )
+            return super().get_facts(facts_type, query)
+
+        from tilefoundry.analysis.facts import (  # noqa: PLC0415
+            MemoryHierarchyFacts,
+            ParallelCapacityFacts,
+            ThroughputFacts,
+        )
+        from tilefoundry.target.amx.facts import (  # noqa: PLC0415
+            memory_hierarchy,
+            parallel_capacity,
+            throughput,
+        )
+
+        if facts_type is MemoryHierarchyFacts:
+            return facts_result(self, facts_type, memory_hierarchy(self, query))
+        if facts_type is ThroughputFacts:
+            return facts_result(self, facts_type, throughput(self, query))
+        if facts_type is ParallelCapacityFacts:
+            return facts_result(self, facts_type, parallel_capacity(self, query))
+
+        from tilefoundry.schedule.pipeline import PipelineFacts  # noqa: PLC0415
+
+        if facts_type is PipelineFacts:
+            from tilefoundry.target.amx.facts import pipeline_facts  # noqa: PLC0415
+
+            return facts_result(self, facts_type, pipeline_facts(self, query))
+        return super().get_facts(facts_type, query)
+
+    def get_scheduler(self, topology: str) -> Scheduler:
+        """Select the AMX core scheduler."""
+        from tilefoundry.target.amx.schedule import amx_scheduler  # noqa: PLC0415
+
+        scheduler = amx_scheduler(topology)
+        if scheduler is not None:
+            return scheduler
+        return super().get_scheduler(topology)
+
+    def _python_import_module(self) -> str:
+        if type(self) is AmxTarget:
+            return "tilefoundry.target.amx"
+        return super()._python_import_module()
+
+    def to_python(self) -> PythonExpr:
+        if type(self) is AmxTarget and self.architecture_id and self.device_id:
+            return PythonExpr(
+                ("from tilefoundry.target.amx import AmxTarget",),
+                "AmxTarget()",
+            )
+        return super().to_python()
+
     @property
     def arch(self) -> str:
         """Return the architecture name used by compilation."""
         return self.architecture.name
 
-    @property
-    def topology_levels(self) -> tuple[str, ...]:
-        """Return program topology levels admitted by AMX compilation."""
-        return ("core", "amx")
-
-    def topology_limit(self, name: str) -> int:
-        """Return a topology limit for one AMX level."""
-        if name == "core":
-            return self.device.performance_core_count
-        if name == "amx":
-            return self.architecture.topology_limit("amx")
-        raise ValueError(
-            f"{self!r}: unsupported topology level {name!r}; "
-            f"supported levels are {self.topology_levels}"
-        )
-
-    def validate_program_topology(self, topology: Topology) -> None:
-        """Validate one declared program topology against AMX facts."""
-        if topology.name not in self.topology_levels:
-            raise ValueError(
-                f"{self!r}: unsupported topology level {topology.name!r}; "
-                f"supported levels are {self.topology_levels}"
-            )
-        if not isinstance(topology.size, int) or isinstance(topology.size, bool):
-            raise ValueError(
-                f"{self!r}: topology {topology.name!r} requires a positive "
-                f"static integer extent, got {topology.size!r}"
-            )
-        if topology.size < 1:
-            raise ValueError(
-                f"{self!r}: topology {topology.name!r} extent {topology.size} "
-                "must be positive"
-            )
-        limit = self.topology_limit(topology.name)
-        if topology.size > limit:
-            raise ValueError(
-                f"{self!r}: topology {topology.name!r} extent {topology.size} "
-                f"must satisfy 1 <= extent <= {limit}"
-            )
+    topology_levels: ClassVar[tuple[str, ...]] = ("core", "amx")
 
 
 __all__ = ["AmxTarget"]
