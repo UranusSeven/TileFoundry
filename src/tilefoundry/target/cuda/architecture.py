@@ -1,7 +1,9 @@
-"""SM90 compilation capabilities.
+"""CUDA compilation capabilities.
 
-Every value is built from the installed ``nvidia.sm90`` document; this module
-holds the shape of an SM90 value, never a copy of its numbers.
+One value type answers for every CUDA architecture. What separates sm_90 from
+sm_100 is what their installed documents record, not a class per architecture:
+the numbers live in the documents, so a type carrying none of them would only
+restate an identity the value already holds.
 """
 
 from __future__ import annotations
@@ -13,11 +15,11 @@ from tilefoundry.target.base import Architecture
 
 
 @dataclass(frozen=True)
-class SM90(Architecture):
-    """SM90 compilation identity and structural capabilities.
+class CudaArchitecture(Architecture):
+    """What one CUDA architecture states about itself.
 
-    The per-SM limits live here rather than on a device: they are properties
-    of the microarchitecture, so every product built on SM90 shares them.
+    The per-SM limits live here rather than on a device: they are properties of
+    the microarchitecture, so every product built on it shares them.
     """
 
     name: str
@@ -34,18 +36,24 @@ class SM90(Architecture):
     # this figure rather than a constant of its own.
     unified_l1_shared_per_sm_bytes: int
     registers_per_sm_32bit: int
+    # None where the MMA accumulates in registers, so there is no separate store
+    # to state a capacity for.
+    tensor_memory_per_cta_bytes: int | None
 
     def _python_import_module(self) -> str:
-        if type(self) is SM90:
+        # The package re-exports this type, so a rendered constructor imports it
+        # from there. A provider's own subclass lives elsewhere and keeps its own
+        # module.
+        if type(self) is CudaArchitecture:
             return "tilefoundry.target.cuda"
         return super()._python_import_module()
 
     def supports_compute_dtype(self, dtype: DType) -> bool:
-        """Return whether SM90 has a compute instruction for ``dtype``."""
+        """Return whether this architecture has a compute instruction for ``dtype``."""
         return dtype in self.supported_compute_dtypes
 
     def topology_limit(self, name: str) -> int:
-        """Return the structural limit for an SM90 topology level."""
+        """Return the structural limit for a CUDA topology level."""
         if name == "thread":
             return self.max_threads_per_cta
         raise ValueError(
@@ -53,4 +61,4 @@ class SM90(Architecture):
         )
 
 
-__all__ = ["SM90"]
+__all__ = ["CudaArchitecture"]

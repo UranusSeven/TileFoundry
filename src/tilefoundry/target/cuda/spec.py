@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from tilefoundry.ir.types import DType
-from tilefoundry.target.cuda.architecture import SM90
-from tilefoundry.target.cuda.device import H200SXM
+from tilefoundry.target.cuda.architecture import CudaArchitecture
+from tilefoundry.target.cuda.device import CudaDevice
 from tilefoundry.target.hardware.envelope import (
     HardwareDocument,
     SchemaValidationError,
@@ -12,13 +12,24 @@ from tilefoundry.target.hardware.envelope import (
 from tilefoundry.target.hardware.registry import HARDWARE_SPECS, HardwareSpecRegistry
 from tilefoundry.target.hardware.schema import SchemaReader
 
-ARCHITECTURE_SCHEMA = "tilefoundry.cuda.architecture/v1"
-DEVICE_SCHEMA = "tilefoundry.cuda.device/v1"
+# One document format per kind: every CUDA architecture document states the same
+# fact paths and so does every device document, which is what lets one schema
+# validate them all, and what makes a product's capability a recorded value
+# rather than a case in code.
+ARCHITECTURE_SCHEMA = "tilefoundry.cuda.architecture/v2"
+DEVICE_SCHEMA = "tilefoundry.cuda.device/v2"
 
 SM90_ID = "nvidia.sm90"
+SM100_ID = "nvidia.sm100"
 H200_SXM_ID = "nvidia.h200_sxm"
+B200_SXM_ID = "nvidia.b200_sxm"
 
 _PACKAGE = "tilefoundry.target.hardware"
+
+# The compute DTypes a CUDA device document states a dense peak rate for. A
+# product whose tensor cores have no mode for one of them records it
+# unavailable, so the absence is a statement rather than a missing key.
+_THROUGHPUT_DTYPE_NAMES = ("f32", "f16", "bf16", "fp8e4m3", "f4e2m1")
 
 
 def _dtypes(names: tuple[str, ...], document: HardwareDocument) -> tuple[DType, ...]:
@@ -34,8 +45,8 @@ def _dtypes(names: tuple[str, ...], document: HardwareDocument) -> tuple[DType, 
     return tuple(resolved)
 
 
-def build_sm90(document: HardwareDocument) -> SM90:
-    """Build the immutable SM90 value from its installed document."""
+def build_cuda_architecture(document: HardwareDocument) -> CudaArchitecture:
+    """Build the immutable CUDA architecture value from its installed document."""
     reader = SchemaReader(document)
     max_threads_per_cta = reader.integer(
         "compute.max_threads_per_cta", unit="thread"
@@ -44,7 +55,7 @@ def build_sm90(document: HardwareDocument) -> SM90:
         "compute.max_threads_per_warp", unit="thread"
     )
     max_warps_per_cta = reader.integer("compute.max_warps_per_cta", unit="count")
-    architecture = SM90(
+    architecture = CudaArchitecture(
         name=reader.text("identity.name"),
         supported_compute_dtypes=_dtypes(
             reader.names("instruction.compute_dtypes"), document
@@ -66,6 +77,9 @@ def build_sm90(document: HardwareDocument) -> SM90:
             "memory.unified_l1_shared.per_sm", unit="byte"
         ),
         registers_per_sm_32bit=reader.integer("memory.register.per_sm", unit="register"),
+        tensor_memory_per_cta_bytes=reader.optional_integer(
+            "memory.tensor.per_cta", unit="byte"
+        ),
     )
     reader.declared_unavailable("memory.shared.bandwidth")
     reader.declared_unavailable("memory.register.bandwidth")
@@ -96,14 +110,15 @@ def build_sm90(document: HardwareDocument) -> SM90:
     return architecture
 
 
-def build_h200_sxm(document: HardwareDocument) -> H200SXM:
-    """Build the immutable H200 SXM value from its installed document."""
+def build_cuda_device(document: HardwareDocument) -> CudaDevice:
+    """Build the immutable CUDA device value from its installed document."""
     reader = SchemaReader(document)
-    dense_flops = tuple(
-        (getattr(DType, name), reader.integer(f"throughput.{name}", unit="flop/s"))
-        for name in ("f32", "f16", "bf16", "fp8e4m3")
-    )
-    device = H200SXM(
+    dense_flops: list[tuple[DType, int]] = []
+    for dtype_name in _THROUGHPUT_DTYPE_NAMES:
+        peak = reader.optional_integer(f"throughput.{dtype_name}", unit="flop/s")
+        if peak is not None:
+            dense_flops.append((getattr(DType, dtype_name), peak))
+    device = CudaDevice(
         name=reader.text("identity.name"),
         sm_count=reader.integer("compute.sm_count", unit="count"),
         hbm_capacity_bytes=reader.integer("memory.hbm.capacity", unit="byte"),
@@ -111,7 +126,7 @@ def build_h200_sxm(document: HardwareDocument) -> H200SXM:
             "memory.hbm.bandwidth", unit="byte/s"
         ),
         l2_capacity_bytes=reader.optional_integer("memory.l2.capacity", unit="byte"),
-        _dense_flops=dense_flops,
+        _dense_flops=tuple(dense_flops),
     )
     reader.declared_unavailable("memory.l2.bandwidth")
     reader.close()
@@ -121,20 +136,12 @@ def build_h200_sxm(document: HardwareDocument) -> H200SXM:
 def install(registry: HardwareSpecRegistry | None = None) -> None:
     """Register the CUDA schemas and documents into *registry*."""
     into = HARDWARE_SPECS if registry is None else registry
-    into.register_schema(ARCHITECTURE_SCHEMA, build_sm90)
-    into.register_schema(DEVICE_SCHEMA, build_h200_sxm)
+    into.register_schema(ARCHITECTURE_SCHEMA, build_cuda_architecture)
+    into.register_schema(DEVICE_SCHEMA, build_cuda_device)
     into.install(SM90_ID, _PACKAGE, "nvidia_sm90.toml")
+    into.install(SM100_ID, _PACKAGE, "nvidia_sm100.toml")
     into.install(H200_SXM_ID, _PACKAGE, "nvidia_h200_sxm.toml")
-
-
-def installed_architecture() -> SM90:
-    """The installed SM90 architecture value."""
-    return HARDWARE_SPECS.resolve(SM90_ID).value
-
-
-def installed_device() -> H200SXM:
-    """The installed H200 SXM device value."""
-    return HARDWARE_SPECS.resolve(H200_SXM_ID).value
+    into.install(B200_SXM_ID, _PACKAGE, "nvidia_b200_sxm.toml")
 
 
 install()
@@ -142,12 +149,12 @@ install()
 
 __all__ = [
     "ARCHITECTURE_SCHEMA",
+    "B200_SXM_ID",
     "DEVICE_SCHEMA",
     "H200_SXM_ID",
+    "SM100_ID",
     "SM90_ID",
-    "build_h200_sxm",
-    "build_sm90",
+    "build_cuda_architecture",
+    "build_cuda_device",
     "install",
-    "installed_architecture",
-    "installed_device",
 ]
