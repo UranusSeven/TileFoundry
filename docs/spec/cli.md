@@ -303,6 +303,8 @@ no ordinary `--target` option.
   - Output MUST report the analyses that were requested. A dependency that ran
     because a requested root needed it MUST appear in the executed list and MUST
     NOT have its own measurements reported.
+  - The report's `target` field MUST be the concrete Target value's `identity`,
+    so two products served by one Target class remain distinguishable.
   - On success, text output begins with the `#`-headed report followed by
     annotated HIR. On inference, verification, or analysis failure, stdout MUST
     be empty and stderr MUST report the source location, binding where
@@ -379,19 +381,61 @@ The same Module scheduled at a level it also declares answers with that level's
 own algorithm and that algorithm's own Plan, which reads differently because it
 decided different things.
 
-## Inspect Capabilities
+## Target
 
-`inspect capabilities` with no `SOURCE` lists the installed architecture and
-device documents, including each document's compatibility declarations, and the
-target names a Module may declare. It also states how to ask for one selection.
+`target list` prints every Target value constructible in the current
+environment. Each row contains its exact `identity` and a Python expression
+that reconstructs an equal value; the required imports follow the rows. Values
+made available by an explicit addition are marked, and the persistent entries
+and their absolute sources are listed separately.
 
-With a `SOURCE`, it resolves the target from the selected Module and prints the
-installed compact hardware capability record. It does not emit compiler
-operation coverage. The record names both the architecture and the device
-document behind the target, each with its content digest, then every recorded
-fact by its path. A fact identifies its unit, the conditions it holds under,
-its source, and its origin — vendor-published, measured on the described host,
-cited from a reference, derived, or a reading no source states. A fact with no
-usable value is reported as unavailable rather than given a placeholder number.
-A target composed from a directly supplied value has no installed document to
-report, and the command says so instead of naming the resource it resembles.
+`target show IDENTITY` addresses those same rows by exact identity. For a
+document-backed Target it prints the architecture and device documents retained
+by the value, each with its digest, then every recorded fact by path. A fact
+identifies its unit, conditions, source, and origin. A fact with no usable value
+is reported as unavailable rather than given a placeholder number.
+
+For a Target without retained documents, `target show` prints only its identity,
+its reconstructing expression, and `facts: unavailable`. It does not query or
+attempt to enumerate `get_facts`: a Target exposes facts on demand but has no
+interface that claims to list every Facts projection it supports.
+
+- constraints:
+  - Target discovery MUST be an explicit `target add` operation. Installing a
+    Python distribution MUST NOT implicitly register a Target through package
+    metadata or entry points.
+  - `target add --document PATH` MUST parse a complete hardware document, find
+    the Target that owns its schema, validate and adopt it, and persist its
+    absolute source path and content digest. Adding a device whose declared
+    architecture is unavailable MUST fail naming the architecture to add first.
+  - Without `--document`, `target add` MUST import a module name unless the
+    argument ends in `.py` or names an existing file. A file source MUST be
+    stored as an absolute path, loaded under its filename stem, executed on
+    every command that loads the registry, and reported as such when added.
+    Only one file source with a given stem may be added; a collision MUST fail
+    naming the absolute path that already occupies that module name. A stem
+    already occupied by any other importable module MUST likewise be rejected
+    without replacing that module in `sys.modules`.
+  - Every command MUST replay the registry before doing its own work, so an
+    added Target is equally available to inspection, analysis, and scheduling.
+    A missing or changed source MUST produce a warning naming that entry while
+    valid entries continue to load and the requested command continues.
+  - The default writable registry MUST be
+    `<sys.prefix>/share/tilefoundry/registry.toml`. It MUST NOT use checkout
+    data-file discovery or a user-global directory. `--registry PATH` MUST
+    override it without reading or writing the default path.
+  - A document entry MUST retain its original bytes at its source: replay MUST
+    compare the content digest and MUST NOT silently adopt changed contents or
+    store a private copy. Adding the document again is the explicit update.
+  - Every available Target identity MUST be unique across registered provider
+    classes and device documents. A document ID already in a `HardwareSpec`
+    MUST retain the document-duplicate diagnostic; a Target identity collision
+    MUST instead name the value and provider that already occupy it.
+  - `target remove` MUST accept a document ID, a module name, or any identity
+    loaded from that module. Removing a module MUST report every identity it
+    removes, and the next command MUST no longer load those values.
+  - Every expression printed by `target list` MUST be executable with the
+    accompanying imports and MUST reconstruct the Target named by that row.
+  - `target show` MUST accept every identity printed by `target list`. An
+    unknown identity MUST fail naming the identities currently available.
+  - `inspect` MUST NOT remain as a second Target inspection command.

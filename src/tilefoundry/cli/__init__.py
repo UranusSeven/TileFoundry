@@ -12,12 +12,17 @@ from tilefoundry.cli.analyze import guidance as analyze_guidance
 from tilefoundry.cli.check import add_arguments as add_check_arguments
 from tilefoundry.cli.check import guidance as check_guidance
 from tilefoundry.cli.check import run_check
-from tilefoundry.cli.inspect import run_capabilities
 from tilefoundry.cli.models import run_models
 from tilefoundry.cli.schedule import guidance as schedule_guidance
 from tilefoundry.cli.schedule import run_schedule
 from tilefoundry.cli.source import load_authored_ir, one_extent_per_dim, parse_dims
 from tilefoundry.cli.spec import read_spec, run_spec, spec_path
+from tilefoundry.cli.target import load_registrations, registry_path
+from tilefoundry.cli.target import run_add_document as run_target_add_document
+from tilefoundry.cli.target import run_add_module as run_target_add_module
+from tilefoundry.cli.target import run_list as run_target_list
+from tilefoundry.cli.target import run_remove as run_target_remove
+from tilefoundry.cli.target import run_show as run_target_show
 from tilefoundry.cli.tutorial import PAGES, run_tutorial
 from tilefoundry.ir.core import VerifyError
 from tilefoundry.schedule import ScheduleError
@@ -36,14 +41,14 @@ _COMMANDS = {
     # HIR does not mistake Analyze or Schedule for a command belonging to that step.
     "analyze": "report what a program costs: flops, traffic, bounds, timing",
     "schedule": "propose a plan for one topology level: placement and timing",
-    "inspect": "inspect installed target facts",
+    "target": "list, show, add, or remove compilation targets",
 }
 
-_INSPECT_COMMANDS = {
-    "capabilities": (
-        "the facts a selection's target was composed from, or the installed "
-        "hardware documents there are"
-    ),
+_TARGET_COMMANDS = {
+    "list": "list every available target as reconstructing Python",
+    "show": "show the documents retained by one target identity",
+    "add": "add one Target provider or hardware document",
+    "remove": "remove one entry shown by target list",
 }
 
 
@@ -75,54 +80,53 @@ def overview() -> str:
         f"TileFoundry — {_project_summary()}\n"
         f"\n"
         f"Usage:\n"
-        f"  tilefoundry <command> [options]\n"
+        f"  tilefoundry [--registry PATH] <command> [options]\n"
         f"\n"
         f"Common commands:\n"
         f"{commands}\n"
         f"\n"
         f"Options:\n"
+        f"  --registry PATH  use this installation registry instead\n"
         f"  -h, --help  print this, or a command's own help after the command\n"
     )
 
 
-def _inspect_overview() -> str:
-    """What ``tilefoundry inspect`` prints without a subcommand."""
-    width = max(len(name) for name in _INSPECT_COMMANDS)
+def _target_overview() -> str:
+    """What ``tilefoundry target`` prints without a subcommand."""
+    width = max(len(name) for name in _TARGET_COMMANDS)
     commands = "\n".join(
-        f"  {name:<{width}}  {description}"
-        for name, description in _INSPECT_COMMANDS.items()
+        f"  {name:<{width}}  {description}" for name, description in _TARGET_COMMANDS.items()
     )
     return (
-        f"tilefoundry inspect — {_COMMANDS['inspect']}\n"
+        f"tilefoundry target — {_COMMANDS['target']}\n"
         f"\n"
         f"Usage:\n"
-        f"  tilefoundry inspect <command> [options]\n"
+        f"  tilefoundry [--registry PATH] target <command> [options]\n"
         f"\n"
         f"Commands:\n"
         f"{commands}\n"
         f"\n"
         f"Options:\n"
+        f"  --registry PATH  use this installation registry instead\n"
         f"  -h, --help  print this, or a command's own help after the command\n"
     )
 
 
-def _add_source_argument(
-    parser: argparse.ArgumentParser, *, optional: bool = False
-) -> None:
-    arguments = {
-        "metavar": "SOURCE",
-        "help": "model.py[:Module[.child_module...][.function]]",
-    }
-    if optional:
-        arguments["nargs"] = "?"
+def _add_source_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "source",
-        **arguments,
+        metavar="SOURCE",
+        help="model.py[:Module[.child_module...][.function]]",
     )
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = _Parser(prog="tilefoundry")
+    parser.add_argument(
+        "--registry",
+        metavar="PATH",
+        help="override this installation's target registry",
+    )
     # Not required: naming no command is how the overview is asked for.
     commands = parser.add_subparsers(dest="command", parser_class=_Parser)
 
@@ -244,12 +248,20 @@ def build_parser() -> argparse.ArgumentParser:
         "searching the whole budget for the best one",
     )
 
-    inspect = commands.add_parser("inspect", help=_COMMANDS["inspect"])
-    inspect_commands = inspect.add_subparsers(dest="inspect_command", parser_class=_Parser)
-    capabilities = inspect_commands.add_parser(
-        "capabilities", help=_INSPECT_COMMANDS["capabilities"]
+    target = commands.add_parser("target", help=_COMMANDS["target"])
+    target_commands = target.add_subparsers(dest="target_command", parser_class=_Parser)
+    target_commands.add_parser("list", help=_TARGET_COMMANDS["list"])
+    target_show = target_commands.add_parser("show", help=_TARGET_COMMANDS["show"])
+    target_show.add_argument("identity", metavar="IDENTITY")
+    target_add = target_commands.add_parser("add", help=_TARGET_COMMANDS["add"])
+    target_add.add_argument(
+        "--document",
+        action="store_true",
+        help="add a hardware document instead of a Target provider module",
     )
-    _add_source_argument(capabilities, optional=True)
+    target_add.add_argument("source", metavar="MODULE|PATH")
+    target_remove = target_commands.add_parser("remove", help=_TARGET_COMMANDS["remove"])
+    target_remove.add_argument("name", metavar="NAME")
 
     return parser
 
@@ -259,6 +271,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command is None:
         sys.stdout.write(overview())
         return 0
+    try:
+        registrations = load_registrations(registry_path(args.registry))
+    except (OSError, TypeError, ValueError) as error:
+        print(f"tilefoundry: error: {error}", file=sys.stderr)
+        return 1
+    for warning in registrations.warnings:
+        print(f"tilefoundry: warning: {warning}", file=sys.stderr)
     if args.command == "models":
         try:
             return run_models(args.name, source=args.source)
@@ -283,12 +302,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         except Exception as error:
             print(f"tilefoundry check: error: {error}", file=sys.stderr)
             return 1
-    if args.command == "inspect":
-        if args.inspect_command is None:
-            sys.stdout.write(_inspect_overview())
+    if args.command == "target":
+        if args.target_command is None:
+            sys.stdout.write(_target_overview())
             return 0
         try:
-            return run_capabilities(args.source)
+            if args.target_command == "list":
+                return run_target_list(registrations)
+            if args.target_command == "show":
+                return run_target_show(args.identity)
+            if args.target_command == "add":
+                if args.document:
+                    return run_target_add_document(args.source, registrations)
+                return run_target_add_module(args.source, registrations)
+            return run_target_remove(args.name, registrations)
         except Exception as error:
             print(f"tilefoundry: error: {error}", file=sys.stderr)
             return 1
@@ -313,9 +340,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"tilefoundry: error: {error}", file=sys.stderr)
             return 1
 
-    analyses = tuple(
-        name for name in _ANALYSES if getattr(args, name.replace("-", "_"))
-    )
+    analyses = tuple(name for name in _ANALYSES if getattr(args, name.replace("-", "_")))
     if not analyses:
         analyses = _ANALYSES
     try:

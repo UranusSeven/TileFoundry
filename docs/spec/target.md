@@ -17,6 +17,13 @@ class Target:
     """Identify a compilation backend."""
 
     name: ClassVar[str]
+    topology_levels: ClassVar[tuple[str, ...]]
+
+    @property
+    def identity(self) -> str: ...
+
+    @classmethod
+    def available(cls) -> tuple[Target, ...]: ...
 
     def get_analyzer(self, selector: str) -> Analyzer: ...
     def get_scheduler(self, topology: str) -> Scheduler: ...
@@ -35,6 +42,23 @@ def registered_targets() -> Mapping[str, type[Target]]: ...
 ```
 
 - constraints:
+  - A custom Target MUST use one of two modes. A document-backed product adds
+    complete Architecture and Device documents to an existing Target class; it
+    MUST NOT add a product-specific Target subclass. A new backend implements
+    the Target interface directly and answers its hardware through `get_facts`;
+    it need not expose Architecture, Device, or hardware documents.
+  - Inheriting bare Architecture or Device values and injecting them into an
+    existing document-backed Target is not a supported custom Target mode. It
+    bypasses both document schema validation and the `facts_result` projection
+    boundary.
+  - `Target.get_analyzer` MUST select the standard compute-cost, memory,
+    roofline, and timeline analyzers for every Target. Those algorithms consume
+    only requested Facts, so a backend reuses them by answering `get_facts`, not
+    by inheriting a backend-specific analysis base class. A missing Facts
+    projection MUST fail when the selected analyzer requests it.
+  - `facts_result`, `TargetFactsError`, `TopologyLimitFacts`,
+    `MemoryHierarchyFacts`, `ThroughputFacts`, and `ParallelCapacityFacts` MUST
+    be importable from `tilefoundry.target` for provider implementations.
   - `name` MUST be a non-empty class variable declared directly by every
     concrete registered Target class. It is the stable class registration
     identity, not a backend-family selector and not an instance value field.
@@ -46,6 +70,12 @@ def registered_targets() -> Mapping[str, type[Target]]: ...
     provider claiming the same name MUST fail rather than replace the owner.
   - `registered_targets()` MUST expose one read-only `name -> class` view. The
     view MAY be used for inspection but MUST NOT construct a Target.
+  - `identity` MUST name one concrete Target value. It MUST be the device
+    document ID for a document-backed Target and the registered class `name`
+    for a Target with no device document.
+  - `available()` MUST return every value of that registered class which can be
+    constructed in the current environment. A class with no hardware documents
+    MUST return its one parameterless value by default.
   - Authored Target parameters MUST accept a constructed Target instance or
     their documented omitted state. A string MUST fail and MUST NOT be resolved
     through registration.
@@ -71,7 +101,14 @@ class Architecture:
 ```
 
 - constraints:
-  - Concrete architecture values MUST be immutable.
+  - `Architecture` is a Target-level marker for the architecture-side value
+    passed into a Facts projection and for its Python reconstruction support;
+    it is not a provider extension point.
+  - A document-backed Target MUST accept direct values only through its
+    backend-specific concrete Architecture type. A further product adds a
+    document of that backend's schema; a further backend implements `Target`
+    and `get_facts` directly.
+  - Concrete backend architecture values MUST be immutable.
   - `name` MUST be the stable architecture identity used by compilation.
   - `max_threads_per_cta` MUST describe the architecture's static CTA thread
     limit when the architecture has a CTA thread level.
@@ -87,7 +124,14 @@ class Device:
 ```
 
 - constraints:
-  - Concrete device values MUST be immutable and describe one device.
+  - `Device` is a Target-level marker for the device-side value passed into a
+    Facts projection and for its Python reconstruction support; it is not a
+    provider extension point.
+  - A document-backed Target MUST accept direct values only through its
+    backend-specific concrete Device type. A further product adds a document
+    of that backend's schema; a further backend implements `Target` and
+    `get_facts` directly.
+  - Concrete backend device values MUST be immutable and describe one device.
   - `name` MUST be the stable product identity.
   - Device-specific capacity, bandwidth, and compute-throughput facts belong
     to concrete subclasses.
@@ -116,8 +160,8 @@ class CudaTarget(Target):
 
     def __init__(
         self,
-        device: Device | str,
-        architecture: Architecture | str | None = None,
+        device: Device | str | Path,
+        architecture: Architecture | str | Path | None = None,
         *,
         arch: str | None = None,
     ) -> None: ...
@@ -156,6 +200,9 @@ class CudaTarget(Target):
     and no architecture or device type of its own. The services and Facts are
     selected by the value already, and the numbers are in the documents, so
     either addition would carry nothing.
+  - `CudaTarget.available()` MUST contain one value per device document whose
+    sole compatible architecture document is available. Its `identity` MUST be
+    that device document's ID.
   - CUDA MUST select the pipeline Scheduler at `thread` and the partition
     Scheduler at `cta` through `get_scheduler`. A CUDA subclass MUST inherit
     those services through ordinary Python inheritance unless it overrides or
@@ -283,14 +330,6 @@ class CudaArchitecture(Architecture):
   - No field MAY carry a default: every value comes from the installed document
     ([§10](#10-installed-hardware-resources)), so the type declares shape and
     never content.
-  - A provider MAY subclass it to carry a fact of its own hardware that this
-    shape does not model. The added fields are subject to the same rule: they
-    state what a document records, not a number written in Python.
-  - Any value a CUDA Target projects Facts from MUST answer for every field
-    declared here, whether it subclasses this type or `Architecture` directly
-    ([§1.1](#11-architecture)). The projection reads them by name, so a value
-    missing one is a Facts request that fails rather than a level reported
-    without a capacity.
 
 #### 4.1.1 SM90
 
@@ -535,8 +574,8 @@ class AmxTarget(Target):
 
     def __init__(
         self,
-        architecture: Architecture | str | None = None,
-        device: Device | str | None = None,
+        device: Device | str | Path | None = None,
+        architecture: Architecture | str | Path | None = None,
     ) -> None: ...
 
     def topology_limit(self, name: str) -> int: ...
@@ -548,11 +587,16 @@ class AmxTarget(Target):
 ```
 
 - constraints:
-  - `architecture` and `device` MUST accept an installed document ID or a
-    concrete value, on the same terms as [§4](#4-cudatarget).
+  - `device` and `architecture` MUST accept an installed document ID, a
+    document path, or a concrete value, on the same terms as
+    [§4](#4-cudatarget). An omitted architecture MUST be read from the device
+    document's sole compatibility declaration.
   - `AmxTarget()` MUST select the installed `apple.amx` and `apple.m2_pro`
     documents, and `arch` MUST equal
     `architecture.name`.
+  - `AmxTarget.available()` MUST contain one value per device document whose
+    sole compatible architecture document is available. Its `identity` MUST be
+    that device document's ID.
   - `topology_levels` MUST be `("core", "amx")`: the performance core one tile
     stream runs on, and the AMX unit inside that core which issues one atom.
   - `topology_limit("core")` MUST equal `device.performance_core_count` and
@@ -588,6 +632,11 @@ Architecture and Device documents are the canonical authored hardware
 database, and the only place a hardware number is written. Each is a complete
 document in its own right; a target is the pair composed through a declared
 compatibility, never a single combined record.
+
+Each document belongs to the Target class that understands its versioned
+schema. The class declares one `HardwareSpec` containing its immutable schema
+builders and the package holding its built-in documents. There is no
+cross-backend hardware registry.
 
 ### 10.1 Document envelope
 
@@ -647,14 +696,32 @@ conditions = "No validated number."
 ### 10.2 Registry and resolution
 
 - constraints:
-  - `HardwareSpecRegistry` MUST resolve documents by exact ID. There MUST be no
-    search path, no overlay, and no partial document.
+  - A Target class that consumes hardware documents MUST declare one
+    `HardwareSpec`. Its package MUST contain that Target's built-in documents,
+    and its schema mapping MUST state every document format the Target accepts.
+  - A `HardwareSpec` MUST resolve its documents by exact ID. There MUST be no
+    cross-backend document table, search path, overlay, or partial document.
+    Built-in package documents MAY be scanned lazily, but resolution MUST NOT
+    depend on a previously constructed Target instance.
   - A schema name carries a version. Requiring a leaf a previous version did not
     MUST take a new version, because a document written against the old one no
     longer loads and the failure is otherwise a missing fact rather than a
     contract that moved.
-  - A target package MUST register its typed schemas and installed documents as
-    an import side effect, into the same shared registry.
+  - A Target's schema mapping is fixed by its class. A complete document MAY be
+    adopted as another product only when its schema is in that mapping; adding
+    another schema is adding a backend, not adding a hardware product.
+  - Explicitly registered documents MUST be routed to the one registered Target
+    class that declares their schema in its own `HardwareSpec`. An inherited
+    reference to another Target's `HardwareSpec` MUST NOT claim that schema.
+    Removing such a document MUST discard its resolved cache entry as well as
+    its ID, without changing the Target's built-in package data.
+  - An adopted device document MUST NOT become available until its declared
+    architecture document is present in the same `HardwareSpec`. Explicit
+    registration MUST reject that incomplete pair and name the architecture
+    document required first.
+  - Device document IDs and every provider Target identity share one uniqueness
+    boundary. A collision MUST fail before persistent registration and name the
+    existing Target value; it MUST NOT choose one source by load order.
   - A schema MAY validate the documents of several products when they state the
     same fact paths, and MUST build one value type from all of them. A product is
     what its document records, so a schema MUST NOT select a type by the identity
@@ -674,11 +741,12 @@ conditions = "No validated number."
     composed value, so a compiled artifact can name the exact resources it was
     built against. Editing any recorded value or its evidence MUST change the
     digest.
-  - A custom document MUST be loadable through an explicit path API, MUST be
-    complete, and MUST NOT enter the installed-ID namespace, so it can neither
-    shadow nor replace an installed resource.
-  - Unknown IDs, unknown schemas, unmodelled or malformed facts, malformed
-    envelopes, duplicate registrations, and incompatible pairs MUST each raise
+  - A Target constructor MUST accept a custom document through a filesystem
+    path. The document MUST be complete, retain its declared ID and digest, and
+    MUST NOT enter that Target's available-ID namespace, so it can neither
+    shadow nor replace an available resource.
+  - Unknown IDs, unsupported schemas, unmodelled or malformed facts, malformed
+    envelopes, duplicate document IDs, and incompatible pairs MUST each raise
     their own actionable diagnostic rather than one shared parse failure.
   - Reporting the resources behind a target MUST name both documents and their
     digests. A target composed from a directly supplied value has no document to

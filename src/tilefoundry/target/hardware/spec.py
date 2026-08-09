@@ -6,7 +6,6 @@ from tilefoundry.target.hardware.envelope import (
     HardwareDocument,
     UnknownDocumentError,
 )
-from tilefoundry.target.hardware.registry import HARDWARE_SPECS
 
 
 def hardware_documents(target: object) -> tuple[HardwareDocument, HardwareDocument]:
@@ -16,9 +15,9 @@ def hardware_documents(target: object) -> tuple[HardwareDocument, HardwareDocume
     selected from the installed namespace has no document to report, and says
     so rather than guessing which installed resource it resembles.
     """
-    architecture_id = getattr(target, "architecture_id", None)
-    device_id = getattr(target, "device_id", None)
-    if architecture_id is None or device_id is None:
+    architecture_document = getattr(target, "_architecture_document", None)
+    device_document = getattr(target, "_device_document", None)
+    if architecture_document is None or device_document is None:
         architecture = getattr(getattr(target, "architecture", None), "name", "unknown")
         device = getattr(getattr(target, "device", None), "name", "unknown")
         raise UnknownDocumentError(
@@ -26,16 +25,11 @@ def hardware_documents(target: object) -> tuple[HardwareDocument, HardwareDocume
             f"device={device!r}, architecture={architecture!r}: this target was "
             "composed from directly supplied values"
         )
-    return (
-        HARDWARE_SPECS.document(architecture_id),
-        HARDWARE_SPECS.document(device_id),
-    )
+    return architecture_document, device_document
 
 
 def format_capabilities(
     documents: tuple[HardwareDocument, HardwareDocument],
-    *,
-    grid_cta_count: int | None = None,
 ) -> str:
     """Format the stable, intentionally compact capabilities report."""
     architecture, device = documents
@@ -44,7 +38,6 @@ def format_capabilities(
         f"  digest: {architecture.digest}",
         f"device: {device.id}",
         f"  digest: {device.digest}",
-        f"grid_cta_count: {grid_cta_count if grid_cta_count is not None else 'unspecified'}",
         "facts:",
     ]
     for document in (architecture, device):

@@ -3,26 +3,47 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
+from tilefoundry.target.amx.architecture import AppleAmx
+from tilefoundry.target.amx.device import AppleM2Pro
+from tilefoundry.target.amx.spec import (
+    ARCHITECTURE_SCHEMA,
+    DEVICE_SCHEMA,
+    build_apple_amx,
+    build_apple_m2_pro,
+)
 from tilefoundry.target.base import (
     Architecture,
     Device,
-    _BuiltinAnalysisTarget,
+    HardwareSpec,
+    Target,
+    _architecture_of,
+    _available_device_ids,
+    check_compatible,
     register_target,
+    select,
 )
 from tilefoundry.target.facts import TopologyLimitFacts, facts_result
-from tilefoundry.target.hardware.registry import check_compatible, select
+from tilefoundry.target.hardware.envelope import HardwareDocument
 from tilefoundry.target.services import Scheduler
 from tilefoundry.utils.python_source import PythonExpr
 
 
 @register_target
 @dataclass(frozen=True, init=False)
-class AmxTarget(_BuiltinAnalysisTarget):
+class AmxTarget(Target):
     """AMX target composed from one architecture and one device."""
 
     name: ClassVar[str] = "amx"
+    hardware: ClassVar[HardwareSpec] = HardwareSpec(
+        package="tilefoundry.target.amx.hardware",
+        schemas={
+            ARCHITECTURE_SCHEMA: build_apple_amx,
+            DEVICE_SCHEMA: build_apple_m2_pro,
+        },
+    )
     architecture: Architecture = field(init=False)
     device: Device = field(init=False)
     # Identity and digest record where a value came from, not what it says, so
@@ -33,23 +54,47 @@ class AmxTarget(_BuiltinAnalysisTarget):
     device_id: str | None = field(default=None, init=False, compare=False)
     architecture_digest: str | None = field(default=None, init=False, compare=False)
     device_digest: str | None = field(default=None, init=False, compare=False)
+    _architecture_document: HardwareDocument | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+    _device_document: HardwareDocument | None = field(
+        default=None, init=False, compare=False, repr=False
+    )
+
+    @property
+    def identity(self) -> str:
+        return self.device_id or self.name
+
+    @classmethod
+    def available(cls) -> tuple[AmxTarget, ...]:
+        return tuple(cls(device_id) for device_id in _available_device_ids(cls.hardware))
 
     def __init__(
         self,
-        architecture: Architecture | str | None = None,
-        device: Device | str | None = None,
+        device: Device | str | Path | None = None,
+        architecture: Architecture | str | Path | None = None,
     ) -> None:
-        from .spec import APPLE_AMX_ID, APPLE_M2_PRO_ID  # noqa: PLC0415
+        from .spec import APPLE_M2_PRO_ID  # noqa: PLC0415
 
+        device = APPLE_M2_PRO_ID if device is None else device
+        if architecture is None:
+            architecture = _architecture_of(
+                device,
+                device_type=AppleM2Pro,
+                role="AmxTarget.device",
+                hardware=self.hardware,
+            )
         architecture = select(
-            APPLE_AMX_ID if architecture is None else architecture,
-            Architecture,
+            architecture,
+            AppleAmx,
             role="AmxTarget.architecture",
+            hardware=self.hardware,
         )
         device = select(
-            APPLE_M2_PRO_ID if device is None else device,
-            Device,
+            device,
+            AppleM2Pro,
             role="AmxTarget.device",
+            hardware=self.hardware,
         )
         if architecture.id is not None and device.id is not None:
             check_compatible(architecture, device)
@@ -59,6 +104,8 @@ class AmxTarget(_BuiltinAnalysisTarget):
         object.__setattr__(self, "device_id", device.id)
         object.__setattr__(self, "architecture_digest", architecture.digest)
         object.__setattr__(self, "device_digest", device.digest)
+        object.__setattr__(self, "_architecture_document", architecture.document)
+        object.__setattr__(self, "_device_document", device.document)
 
     def get_facts(self, facts_type: type, query: object | None = None):
         """Project AMX hardware through the facts this Target owns."""
@@ -124,8 +171,8 @@ class AmxTarget(_BuiltinAnalysisTarget):
     def to_python(self) -> PythonExpr:
         if type(self) is AmxTarget and self.architecture_id and self.device_id:
             return PythonExpr(
-                ("from tilefoundry.target.amx import AmxTarget",),
-                "AmxTarget()",
+                ("from tilefoundry.target import AmxTarget",),
+                f'AmxTarget("{self.device_id}")',
             )
         return super().to_python()
 
