@@ -1,14 +1,14 @@
 """What a function needs from the memory hierarchy, and whether it fits.
 
-The lifetimes and peaks are read from the authored program; whether a peak fits
-is asked against the target's levels. The two are kept apart in the record so a
-caller can see which of the numbers would survive a change of hardware.
+Lifetime order is read from the authored program, while residency bytes are
+projected to the owner of each explicit memory level. Whether they fit is asked
+against the target's levels. These remain separate in the record so a caller can
+see the measured footprint and the capacity finding independently.
 
-Overflow is not one verdict. A level a program places values in by name either
-has room or the program is invalid, so exceeding it fails the analysis. A cache
-the program never allocated in cannot be overflowed in that sense -- a working
-set larger than the cache runs, just slower -- so that finding is reported as an
-advisory and nothing more.
+Overflow is not one verdict. One value larger than an explicit level cannot be
+placed by any schedule, so it fails the analysis. A peak depends on the order in
+which values are held and a cache working set affects speed rather than program
+validity, so both are advisories.
 """
 
 from __future__ import annotations
@@ -26,11 +26,16 @@ from tilefoundry.ir.core import (
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.tensor.reshape import Reshape
-from tilefoundry.ir.hir.tensor.transpose import Transpose
+from tilefoundry.ir.types import Type, local_type_of
+from tilefoundry.ir.types.shard import Topology
 from tilefoundry.target import Target
 
 from .errors import AnalysisError
-from .facts import ImplicitMemoryLevelFacts, MemoryHierarchyFacts
+from .facts import (
+    TARGET_MEMORY_OWNER,
+    ImplicitMemoryLevelFacts,
+    MemoryHierarchyFacts,
+)
 from .metadata import (
     ComputeCostMetadata,
     LevelFootprint,
@@ -64,10 +69,10 @@ class _Residency:
 def _is_view(expr: Expr) -> bool:
     """Whether *expr* aliases its operand rather than allocating.
 
-    A reshape or a transpose describes the same bytes differently. Charging it
-    for its result would count one buffer twice.
+    Reshape re-indexes the same elements. Other operations produce values at
+    addresses of their own; buffer aliasing may optimize those later.
     """
-    return isinstance(expr, Call) and isinstance(expr.target, (Reshape, Transpose))
+    return isinstance(expr, Call) and isinstance(expr.target, Reshape)
 
 
 def _label(expr: Expr, position: int) -> str:
@@ -114,13 +119,19 @@ def _unique_labels(order: list[Expr]) -> dict[int, str]:
     return labels
 
 
-def _residencies(fn: Function) -> tuple[tuple[_Residency, ...], int]:
+def _residencies(
+    fn: Function,
+    *,
+    facts: MemoryHierarchyFacts,
+    topology_levels: tuple[str, ...],
+    topologies: tuple[Topology, ...],
+) -> tuple[tuple[_Residency, ...], int]:
     """Every allocation resident in *fn*, with the length of its value order.
 
     Parameters are part of the order and start at its beginning: the function
     did not produce them, so they are already resident when it is entered. A
-    parameter declared constant is a weight, and a weight is never reclaimable
-    -- it stays resident past its last reader, for the whole function.
+    function cannot reclaim storage its caller owns, so every parameter stays
+    resident past its last reader for the whole function.
     """
     order: list[Expr] = [
         *fn.params,
@@ -143,12 +154,24 @@ def _residencies(fn: Function) -> tuple[tuple[_Residency, ...], int]:
     for expr in order:
         if _is_view(expr):
             continue
-        persistent = isinstance(expr, Var) and expr.is_const
-        for level, amount in bytes_by_storage(expr.type).items():
+        persistent = isinstance(expr, Var)
+        for storage in bytes_by_storage(expr.type):
+            declared = facts.explicit(storage)
+            type_ = (
+                expr.type
+                if declared is None
+                else _type_at_owner(
+                    expr.type,
+                    owner=declared.owner,
+                    topology_levels=topology_levels,
+                    topologies=topologies,
+                )
+            )
+            amount = bytes_by_storage(type_)[storage]
             result.append(
                 _Residency(
                     binding=labels[id(expr)],
-                    level=level,
+                    level=storage,
                     bytes=amount,
                     defined_at=position[id(expr)],
                     last_used_at=(
@@ -158,6 +181,34 @@ def _residencies(fn: Function) -> tuple[tuple[_Residency, ...], int]:
                 )
             )
     return tuple(result), len(order)
+
+
+def _type_at_owner(
+    type_: Type,
+    *,
+    owner: str,
+    topology_levels: tuple[str, ...],
+    topologies: tuple[Topology, ...],
+) -> Type:
+    """Project *type_* through every declared split no finer than *owner*."""
+    if owner == TARGET_MEMORY_OWNER:
+        return type_
+    try:
+        owner_index = topology_levels.index(owner)
+    except ValueError:
+        available = ", ".join((TARGET_MEMORY_OWNER, *topology_levels))
+        raise ValueError(
+            f"memory owner {owner!r} is not declared by the target; "
+            f"available owners are {available}"
+        ) from None
+    projection_levels = tuple(
+        topology.name
+        for topology in topologies
+        if topology_levels.index(topology.name) <= owner_index
+    )
+    if not projection_levels:
+        return type_
+    return local_type_of(type_, level=projection_levels[-1], topologies=topologies)
 
 
 def _peaks(
@@ -192,7 +243,10 @@ def _function_traffic(fn: Function) -> tuple[tuple[str, TrafficBytes], ...]:
 
 
 def _explicit_footprint(
-    fn: Function, peaks: dict[str, int], persistent: dict[str, int],
+    fn: Function,
+    residencies: tuple[_Residency, ...],
+    peaks: dict[str, int],
+    persistent: dict[str, int],
     facts: MemoryHierarchyFacts,
 ) -> tuple[LevelFootprint, ...]:
     """One footprint row per level the function places values in.
@@ -209,14 +263,44 @@ def _explicit_footprint(
             persistent_bytes=persistent.get(level, 0),
             capacity_bytes=None if declared is None else declared.capacity_bytes,
         )
-        if row.exceeds_capacity:
+        oversized = next(
+            (
+                item
+                for item in residencies
+                if item.level == level
+                and row.capacity_bytes is not None
+                and item.bytes > row.capacity_bytes
+            ),
+            None,
+        )
+        if oversized is not None:
             raise AnalysisError(
-                f"function {fn.name!r}: {level} needs {row.peak_bytes} B at its "
-                f"peak, which exceeds the {row.capacity_bytes} B the target "
-                f"states for that level"
+                f"function {fn.name!r}: value {oversized.binding!r} needs "
+                f"{oversized.bytes} B in {level}, which exceeds the "
+                f"{row.capacity_bytes} B the target states for that level"
             )
         rows.append(row)
     return tuple(rows)
+
+
+def _explicit_peak_advisories(
+    facts: MemoryHierarchyFacts, peaks: dict[str, int]
+) -> tuple[str, ...]:
+    """Explicit-level peaks that exceed capacity under this walk's order."""
+    notes: list[str] = []
+    for level in sorted(peaks):
+        declared = facts.explicit(level)
+        if (
+            declared is not None
+            and declared.capacity_bytes is not None
+            and peaks[level] > declared.capacity_bytes
+        ):
+            notes.append(
+                f"{level} peak is {peaks[level]} B under this walk's value "
+                f"order, exceeding its {declared.capacity_bytes} B capacity; "
+                "the peak is order-dependent and is not a bound over schedules"
+            )
+    return tuple(notes)
 
 
 def _implicit_capacity(
@@ -290,8 +374,8 @@ def _division_advisory(
 def _advisories(
     facts: MemoryHierarchyFacts, peaks: dict[str, int]
 ) -> tuple[str, ...]:
-    """Findings about the caches, none of which invalidate the program."""
-    notes: list[str] = []
+    """Order and cache findings, none of which invalidate the program."""
+    notes = list(_explicit_peak_advisories(facts, peaks))
     for level in facts.implicit_levels:
         notes.extend(
             note
@@ -308,12 +392,27 @@ def analyze_memory(
     module: Module,
     function: Function,
     target: Target,
+    level: str | None = None,
     options: object | None = None,
 ) -> None:
     """Attach one memory record to every Function reachable from *function*."""
     facts = target.get_facts(MemoryHierarchyFacts)
+    topologies = tuple(
+        topology
+        if topology.size is not None
+        else Topology(topology.name, target.topology_limit(topology.name))
+        for topology in module.effective_topologies()
+    )
     for fn in reachable_functions(function):
-        residencies, length = _residencies(fn)
+        try:
+            residencies, length = _residencies(
+                fn,
+                facts=facts,
+                topology_levels=target.topology_levels,
+                topologies=topologies,
+            )
+        except ValueError as error:
+            raise AnalysisError(str(error)) from None
         peaks = _peaks(residencies, length)
         persistent: dict[str, int] = {}
         for item in residencies:
@@ -322,7 +421,9 @@ def analyze_memory(
         attach(
             fn,
             MemoryMetadata(
-                footprint=_explicit_footprint(fn, peaks, persistent, facts),
+                footprint=_explicit_footprint(
+                    fn, residencies, peaks, persistent, facts
+                ),
                 traffic=_function_traffic(fn),
                 lifetimes=tuple(
                     ValueLifetime(

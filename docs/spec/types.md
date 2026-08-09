@@ -75,9 +75,10 @@ class TensorType:
     unmaterialized value MUST be resolved to a concrete residency (or otherwise
     materialized) before codegen consumes it. `None` is unchanged — a tensor with
     no memory space (a shape-element scalar), distinct from `umat`.
-  - For plain `Layout` / `ComposedLayout`, `len(shape)` MUST equal
-    `layout.domain_rank`; consumers use this common contract rather than
-    inspecting a `ComposedLayout` component.
+  - For plain `Layout` / `ComposedLayout`, `layout.shape` MUST have the same rank
+    and logical extents as `shape`; the layout describes the value whose type
+    carries it. Consumers use this common contract rather than inspecting a
+    `ComposedLayout` component.
   - For `ShardLayout`, `TensorType.shape` remains the logical shape;
     `ShardLayout.layout.shape` is the sharding-internal / per-shard
     layout shape and need not match `shape` axis-by-axis. `Reshard`
@@ -97,11 +98,15 @@ dispatch is described in
 ### 2.1 Recursive local projection
 
 ```python
-def local_type_of(type: Type) -> Type:
-    """Project every tensor leaf to its per-shard local type.
+def local_type_of(
+    type: Type, *, level: str, topologies: tuple[Topology, ...]
+) -> Type:
+    """Project every tensor leaf to what one unit of a topology level holds.
 
     Args:
         type: Type to project.
+        level: Topology level whose unit is being projected.
+        topologies: Ordered declared topology levels with resolved extents.
 
     Returns:
         The recursively projected type.
@@ -112,7 +117,20 @@ def local_type_of(type: Type) -> Type:
 - constraints:
   - `local_type_of` MUST recursively project every tensor leaf and rebuild
     `TupleType` structure.
-  - A resolved nested `ShardLayout` MUST be applied exactly once per layer.
+  - A `Split` at `level` or a coarser topology level MUST divide; a finer
+    `Split`, `Broadcast`, and `Partial` MUST NOT divide.
+  - Each resolved nested `ShardLayout` MUST be applied exactly once per layer.
+    A mesh axis's stated extent MUST take precedence; only an axis whose extent
+    is launch-provided MAY use the corresponding resolved topology extent, and
+    that division MUST round up. A stated static extent that does not divide the
+    split dimension MUST still raise. A Mesh with launch-provided extents on
+    more than one `Split` axis MUST raise: one topology level supplies one
+    parallel width and states no way to assign it among those axes.
+  - Every axis of a Mesh carrying one topology MUST be read at that topology
+    level. A Mesh carrying multiple topologies remains a valid Mesh, but local
+    projection MUST reject it when asking for a position count by topology name
+    rather than assign one of its layout axes to a guessed level
+    ([shard §5](./shard.md#5-mesh)).
   - The result MUST remain an ordinary IR Type and MUST NOT introduce a
     schedule-specific tensor type.
   - Unresolved layouts and local extents that are not concrete non-negative

@@ -34,7 +34,19 @@ def test_builtin_targets_own_their_facts_projections() -> None:
 
     assert throughput.memory_bandwidth_bytes_per_second == 4_800_000_000_000
     assert memory.explicit("gmem").capacity_bytes == cuda.device.hbm_capacity_bytes
+    assert {
+        level.name: level.owner for level in memory.explicit_levels
+    } == {
+        "gmem": "target",
+        "smem": "cta",
+        "rmem": "thread",
+        "tmem": "cta",
+    }
     assert AmxTarget().get_facts(ThroughputFacts).bandwidth_level == "gmem"
+    assert {
+        level.name: level.owner
+        for level in AmxTarget().get_facts(MemoryHierarchyFacts).explicit_levels
+    } == {"host": "target", "gmem": "target", "rmem": "amx"}
 
 
 def test_two_cuda_products_project_the_hardware_each_one_is() -> None:
@@ -82,6 +94,8 @@ def test_topology_limits_are_target_facts_and_base_validation_is_inherited() -> 
     assert cuda.get_facts(TopologyLimitFacts, "thread").max_static_extent == 1024
     assert amx.get_facts(TopologyLimitFacts, "core").max_static_extent == 8
     assert amx.get_facts(TopologyLimitFacts, "amx").max_static_extent == 1
+    assert cuda.topology_limit("cta") == cuda.device.sm_count == 132
+    assert cuda.topology_limit("thread") == cuda.architecture.max_threads_per_cta
 
     @dataclass(frozen=True)
     class _DirectTarget(Target):

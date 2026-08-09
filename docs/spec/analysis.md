@@ -340,14 +340,14 @@ class ComputeCostMetadata(IRMetadata):
 
     Attributes:
         flops: attribute; Flop count per compute DType name, sorted by name.
+        flops_per_unit: attribute; Flop count performed by one unit of the analysed topology level.
         traffic: attribute; TrafficBytes per storage level name.
-        execution_count: attribute; How many times the call runs.
         operands: attribute; TrafficBytes per operand, positional against (*call.args, call); present only for a direct primitive call.
     """
 
     flops: tuple[tuple[str, int], ...] = ()
+    flops_per_unit: tuple[tuple[str, int], ...] = ()
     traffic: tuple[tuple[str, TrafficBytes], ...] = ()
-    execution_count: int = 1
     operands: tuple[TrafficBytes, ...] = ()
 
 class LevelFootprint:
@@ -405,13 +405,13 @@ class RooflineMetadata(IRMetadata):
     Attributes:
         compute_ns: attribute; Time the flops imply at the target's rates.
         memory_ns: attribute; Time the traffic implies at the target's bandwidth.
-        theoretical_ns: attribute; The bound the two imply.
+        ideal_ns: attribute; The ideal bound the two imply.
         bound_by: attribute; Which resource set the bound.
     """
 
     compute_ns: int = 0
     memory_ns: int = 0
-    theoretical_ns: int = 0
+    ideal_ns: int = 0
     bound_by: str = "none"
 
 class TimelineMetadata(IRMetadata):
@@ -441,16 +441,15 @@ class TimelineMetadata(IRMetadata):
   - A `Function`-attached record MUST NOT be read as data the Function
     inherently carries. It states what one analysis found when a call reached
     that function, and there MUST be no cross-call cache behind it.
-  - `ComputeCostMetadata` MUST be derivable from the authored program alone. Its
-    flops MUST come from the op's registered cost evaluator
-    ([visitor-registry](./visitor-registry.md)) scaled by the execution count,
-    and its bytes from the logical types the operands and result carry. It MUST
-    NOT read any Target fact, so one authored call carries the same record on
-    every backend. An op with no registered cost evaluator MUST raise
-    `AnalysisError`.
-  - The execution count MUST be the product of the execution-topology extents the
-    call's value meshes carry and the owning Module declares. Conflicting extents
-    for one topology name MUST raise rather than be reconciled.
+  - `ComputeCostMetadata.flops` and its bytes MUST be derivable from the authored
+    program alone. Flops MUST come from the op's registered cost evaluator
+    ([visitor-registry](./visitor-registry.md)) over the types as written, and
+    bytes from the logical types the operands and result carry. `flops_per_unit`
+    MUST come from the same evaluator over types projected to the analysed level.
+    Only that field MAY read the target, and only to resolve a launch-provided
+    mesh extent through `topology_limit`; that per-unit projection MUST round up
+    to the largest share one unit performs in a wave. An op with no registered
+    cost evaluator MUST raise `AnalysisError`.
   - `ValueLifetime.binding` MUST identify one value within its function. An
     authored name does not: the parser attaches an assignment's name to every
     nested expression of its right-hand side, so several values answer to one name
@@ -476,11 +475,14 @@ class TimelineMetadata(IRMetadata):
     omit the operand breakdown for such a call rather than emit it empty.
   - `MemoryMetadata` MUST be attached per `Function`: a peak is a property of the
     whole function's live ranges and belongs to no single expression.
-  - Parameters MUST be resident from the start of the value order. A parameter
-    declared constant is a weight and MUST be `persistent`, held past its last
-    reader for the whole function; every other value MUST be measured by first
-    definition and last use. A pure view — a reshape or a transpose — MUST
-    allocate nothing.
+  - Parameters MUST be resident from the start of the value order and MUST be
+    `persistent`, held for the whole function: a function cannot reclaim storage
+    its caller owns. Every non-parameter allocation MUST be measured by first
+    definition and last use.
+  - `Reshape` MUST allocate nothing: it re-indexes the same elements. `Slice`
+    and `Transpose` MUST allocate their results. Analysis MUST NOT infer buffer
+    aliasing from layouts; whether an optimization later makes values share a
+    buffer is not an analysis-owned decision.
   - `RooflineMetadata` MUST be computed from the recorded work rather than from a
     second reading of the program. On a `Function` the compute and memory times
     MUST each be summed over the function before being compared, because
@@ -504,7 +506,7 @@ Each owns one record type and declares what it needs.
 
 | Selector | Requires | Owns | Rests on |
 |---|---|---|---|
-| `compute-cost` | — | `ComputeCostMetadata` | the authored program only |
+| `compute-cost` | — | `ComputeCostMetadata` | the authored program; `topology_limit` for a launch-provided per-unit extent |
 | `memory` | `compute-cost` | `MemoryMetadata` | `MemoryHierarchyFacts` |
 | `roofline` | `memory`, `compute-cost` | `RooflineMetadata` | `ThroughputFacts` |
 | `timeline` | `roofline` | `TimelineMetadata` | `ParallelCapacityFacts` |
@@ -516,8 +518,10 @@ Each owns one record type and declares what it needs.
     analyzer, and MUST NOT resolve an undeclared Target to a default.
   - A family MUST read a dependency's record rather than recompute what it
     states. A number with two derivations has two answers.
-  - Logical work and lifetime MUST remain target-independent. Physical capacity,
-    hierarchy relationships, and throughput comparisons are target-aware.
+  - Global logical work and lifetime MUST remain target-independent.
+    `flops_per_unit` MAY depend on a target's parallel width when a mesh extent is
+    launch-provided. Physical capacity, hierarchy relationships, and throughput
+    comparisons are target-aware.
 
 ### 2.3 Memory hierarchy facts
 
@@ -535,11 +539,13 @@ class ExplicitMemoryLevelFacts:
         name: attribute; The storage level name.
         capacity_bytes: attribute; Stated capacity, or None when unknown.
         scope: attribute; The topology level the capacity is stated per.
+        owner: attribute; The topology whose units own separate values, or target.
     """
 
     name: str
     capacity_bytes: int | None
     scope: str
+    owner: str
 
 class ImplicitMemoryLevelFacts:
     """A level traffic passes through without being placed there.
@@ -596,10 +602,23 @@ class MemoryHierarchyFacts:
   - An implicit level MUST NOT be given a capacity of its own where its usable
     capacity depends on the program. That capacity MUST be derived from the
     sharing edge and the sharing level's measured peak.
-  - Exceeding an explicit level's stated capacity MUST raise `AnalysisError`: the
-    program placed more there than the level holds. Exceeding an implicit level's
-    capacity MUST be recorded as an advisory and MUST NOT fail the call, because
-    a working set larger than a cache still runs.
+  - Every explicit level MUST carry an `owner` supplied by the Target. Its value
+    MUST be one of that Target's declared topology names, or the reserved word
+    `target` when all of its units share one allocation. An implicit cache MUST
+    NOT carry an owner: program values are never resident there, and cache
+    advisories compare capacity scopes instead.
+  - A residency MUST be projected through every declared split at or coarser
+    than its explicit level's owner. A `target`-owned residency MUST remain
+    global. The analysis MUST NOT derive ownership from the storage-level name
+    or from `scope`; in particular, CUDA register capacity is stated per SM while
+    register values are owned by threads.
+  - One value exceeding an explicit level's stated capacity MUST raise
+    `AnalysisError`: no schedule can place that value there. A measured peak
+    exceeding the capacity MUST instead be recorded as an advisory and MUST NOT
+    fail the call. The peak holds under the value order the analysis walked; it
+    is order-dependent and is not a bound over schedules. Exceeding an implicit
+    level's capacity MUST likewise be recorded as an advisory and MUST NOT fail
+    the call, because a working set larger than a cache still runs.
 
 ### 2.4 Throughput and parallel-capacity facts
 
@@ -654,6 +673,7 @@ class AnalysisResult:
         module: attribute; Source Module.
         function: attribute; Function that received records.
         analysis: attribute; Requested root analysis.
+        level: attribute; Topology level whose unit the per-unit quantities describe, or None.
         executed: attribute; Analyses executed in dependency order.
         metadata_types: attribute; Metadata classes actually written.
     """
@@ -661,6 +681,7 @@ class AnalysisResult:
     module: "Module"
     function: "Function"
     analysis: str
+    level: str | None
     executed: tuple[str, ...]
     metadata_types: tuple[type[IRMetadata], ...]
 
@@ -670,6 +691,7 @@ def analyze(
     function: "Function",
     *,
     analysis: str,
+    level: str | None = None,
     options: object | None = None,
     dims: "Mapping[str, int] | None" = None,
 ) -> AnalysisResult: ...
@@ -678,6 +700,10 @@ def analyze(
 - constraints:
   - One call MUST select exactly one root analysis. A caller wanting several
     roots MUST call the operation once per root.
+  - `level` MUST name one effective Module topology. When omitted, it MUST
+    default to the coarsest effective topology; when the Module declares none,
+    it MUST remain `None` and no per-unit projection divides. `AnalysisResult.level`
+    MUST record the resolved answer.
   - The Function MUST be one the Module owns: one it declares, or a
     specialization variant of one it declares
     ([core-ir §1](./core-ir.md#1-module)). A Function derived by specialising one
@@ -737,6 +763,10 @@ def analyze(
 ### 3.1 Target-selected Analyzers
 
 ```python
+AnalysisCallable = Callable[
+    [Module, Function, Target, str | None, object | None], None
+]
+
 class Analyzer:
     """Describe one Target-selected analysis.
 
@@ -758,6 +788,9 @@ class Target:
 ```
 
 - constraints:
+  - `AnalysisCallable` MUST receive the Module, Function, exact Target, resolved
+    topology level, and caller options in that order. The level MAY be `None`
+    only when the Module declares no topology; options MAY be `None`.
   - Analyze MUST obtain every root and dependency from the same exact Target
     instance through `get_analyzer`.
   - A Target subclass MUST inherit its base Analyzers through normal Python

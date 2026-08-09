@@ -29,12 +29,14 @@ from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.walk import postorder
 from tilefoundry.dsl import ConstTensor, Mesh, Tensor, Topology, tf
 from tilefoundry.inspection.analysis_report import render_json, render_text, report
-from tilefoundry.ir.core import Call, get_metadata
+from tilefoundry.ir.core import Call, Var, get_metadata
 from tilefoundry.ir.hir.sharding.reshard import Reshard
-from tilefoundry.ir.types import DType, numel
+from tilefoundry.ir.hir.tensor.slice import Slice
+from tilefoundry.ir.types import DType, make_tensor_type, numel
 from tilefoundry.target import AmxTarget, CudaTarget
 from tilefoundry.visitor_registry import cost_evaluator_registry
-from tilefoundry.visitor_registry.contexts import Cost
+from tilefoundry.visitor_registry.contexts import Cost, CostContext, TrafficBytes
+from tilefoundry.visitor_registry.visitors import CostEvaluator
 
 
 @module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 4),))
@@ -98,6 +100,28 @@ class _Allocated:
         return tf.add(source, tf.zeros(shape=(64,), dtype="f32"))
 
 
+@module(entry="row", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+class _MovementCosts:
+
+    @func
+    def row(source: Tensor[(1024, 2048), "f32"]):
+        return source[0:256, :]
+
+    @func
+    def column(source: Tensor[(1024, 2048), "f32"]):
+        return source[:, 0:512]
+
+    @func
+    def materialized(source: Tensor[(1024, 2048), "f32"]):
+        transposed = tf.transpose(source, perm=(1, 0))
+        return tf.reshape(transposed, new_shape=(1024 * 2048,))
+
+    @func
+    def copied(source: Tensor[(1024, 2048), "f32"]):
+        selected = source[0:256, :]
+        return tf.concat(selected, selected, axis=0)
+
+
 @module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
 class _BatchedOnTheRight:
 
@@ -118,6 +142,51 @@ class _Gathered:
         rows: ConstTensor[(4,), "i32"],
     ):
         return tf.gather(table, rows, axis=0)
+
+
+@module(entry="plain", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 132),))
+class _MatmulLayouts:
+
+    @func
+    def plain(
+        lhs: Tensor[(1056, 2048), "bf16"],
+        rhs: ConstTensor[(2048, 6600), "bf16"],
+    ):
+        return tf.matmul(lhs, rhs)
+
+    @func
+    def split(
+        lhs: Tensor[(1056, 2048), "bf16"],
+        rhs: ConstTensor[(2048, 6600), "bf16"],
+    ):
+        with Mesh(("cta",), layout=(132,), names=("tile",)) as cta:
+            local_lhs = tf.reshard(lhs, (1056 @ cta.tile, 2048), "gmem")
+            local_rhs = tf.reshard(rhs, (2048, 6600), "gmem")
+            return tf.matmul(local_lhs, local_rhs)
+
+    @func
+    def broadcast(
+        lhs: Tensor[(1056, 2048), "bf16"],
+        rhs: ConstTensor[(2048, 6600), "bf16"],
+    ):
+        with Mesh(("cta",), layout=(132,), names=("tile",)) as _cta:
+            local_lhs = tf.reshard(lhs, (1056, 2048), "gmem")
+            local_rhs = tf.reshard(rhs, (2048, 6600), "gmem")
+            return tf.matmul(local_lhs, local_rhs)
+
+
+@module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 4),))
+class _NestedSplitAdd:
+
+    @func
+    def block(source: Tensor[(256,), "f32"]):
+        with Mesh(("cta",), layout=(4,), names=("tile",)) as cta:
+            local = tf.reshard(source, (256 @ cta.tile,), "gmem")
+            return tf.add(local, local)
+
+    @func
+    def main(source: Tensor[(256,), "f32"]):
+        return block(source)
 
 
 @func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 168),))
@@ -157,11 +226,20 @@ def _multi_topology_mesh(source: Tensor[(4,), "f32"]):
         return tf.add(local, local)
 
 
-@func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("thread", 4),))
-def _oversized_shared(source: Tensor[(131072,), "f32"]):
-    with Mesh(("thread",), layout=(4,), names=("lane",)) as thread:
-        local = tf.reshard(source, (131072 @ thread.lane,), "smem")
-        return tf.add(local, local)
+@module(entry="split", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 132),))
+class _SharedTile:
+
+    @func
+    def split(source: Tensor[(1056, 6600), "f32"]):
+        with Mesh(("cta",), layout=(132,), names=("tile",)) as cta:
+            local = tf.reshard(source, (1056 @ cta.tile, 6600), "smem")
+            return tf.add(local, local)
+
+    @func
+    def broadcast(source: Tensor[(1056, 6600), "f32"]):
+        with Mesh(("cta",), layout=(132,), names=("tile",)) as _cta:
+            local = tf.reshard(source, (1056, 6600), "smem")
+            return tf.add(local, local)
 
 
 @func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("thread", 4),))
@@ -199,33 +277,27 @@ def _cost_of(function) -> ComputeCostMetadata:
     return record
 
 
-def test_compute_cost_scales_leaf_work_by_the_whole_execution_mesh() -> None:
-    """One authored call runs once per point of the topology hierarchy."""
-    _, entry = _run(_thread_sharded, "compute-cost")
+def test_compute_cost_stops_at_the_selected_topology_level() -> None:
+    entry = _entry(_thread_sharded)
+    cta_result = analyze(_thread_sharded, entry, analysis="compute-cost")
 
     record = get_metadata(_calls(entry)[-1], ComputeCostMetadata)
     assert record is not None
-    assert record.execution_count == 8
-    assert record.flops == (("f32", 16),)
+    assert cta_result.level == "cta"
+    assert record.flops == (("f32", 8),)
+    assert record.flops_per_unit == (("f32", 8),)
+    traffic = record.traffic
+
+    thread_result = analyze(_thread_sharded, entry, analysis="compute-cost", level="thread")
+    record = get_metadata(_calls(entry)[-1], ComputeCostMetadata)
+    assert record is not None
+    assert thread_result.level == "thread"
+    assert record.flops == (("f32", 8),)
+    assert record.flops_per_unit == (("f32", 2),)
+    assert record.traffic == traffic
 
 
-def test_a_call_no_mesh_placed_runs_once_and_costs_the_same_on_either_machine() -> None:
-    """An unsharded type states the whole tensor, so nothing multiplies it.
-
-    The two readings of a tensor type are what makes this a real question. A
-    sharded type states the extent one point holds, so recovering the whole means
-    multiplying by the hierarchy -- which is what the test above measures. An
-    unsharded type already states the whole, and folding the hierarchy into it reads
-    the second as the first: an authored norm over `hidden` elements comes back
-    multiplied by every thread the target declares, in units the traffic beside it
-    is not counted in.
-
-    Which is also why the same program is asked of two unrelated machines here:
-    the work count is a property of the program. It used to be four times too
-    large on either target -- the same four times, so an equality between the two
-    still held while the number said the work of an unsharded add depended on how
-    many blocks the target declares.
-    """
+def test_an_unsharded_call_reports_the_same_global_and_per_unit_work() -> None:
     cuda_entry = _CudaAdd.entry_function()
     amx_entry = _AmxAdd.entry_function()
 
@@ -235,25 +307,67 @@ def test_a_call_no_mesh_placed_runs_once_and_costs_the_same_on_either_machine() 
     call = _calls(cuda_entry)[-1]
     record = get_metadata(call, ComputeCostMetadata)
     assert record is not None
-    assert record.execution_count == 1
     assert record.flops == (("f32", numel(call.type)),)
+    assert record.flops_per_unit == record.flops
     assert _cost_of(cuda_entry) == _cost_of(amx_entry)
+
+
+def test_matmul_layout_changes_only_the_per_unit_work() -> None:
+    records = []
+    functions = {function.name: function for function in _MatmulLayouts.functions}
+    for function in (functions["plain"], functions["split"], functions["broadcast"]):
+        analyze(_MatmulLayouts, function, analysis="roofline")
+        call = _calls(function)[-1]
+        cost = get_metadata(call, ComputeCostMetadata)
+        bound = get_metadata(call, RooflineMetadata)
+        assert cost is not None and bound is not None
+        records.append((cost, bound))
+
+    (plain_cost, plain_bound), (split_cost, split_bound), (
+        broadcast_cost,
+        broadcast_bound,
+    ) = records
+    assert [record.flops for record, _bound in records] == [
+        (("bf16", 28_547_481_600),),
+    ] * 3
+    assert [record.flops_per_unit for record, _bound in records] == [
+        (("bf16", 28_547_481_600),),
+        (("bf16", 216_268_800),),
+        (("bf16", 28_547_481_600),),
+    ]
+    assert split_cost.traffic == plain_cost.traffic == broadcast_cost.traffic
+    assert split_bound == plain_bound == broadcast_bound
+    assert plain_bound.ideal_ns == 28_851
+
+
+def test_function_call_carries_the_callee_per_unit_work() -> None:
+    entry = _NestedSplitAdd.entry_function()
+    analyze(_NestedSplitAdd, entry, analysis="compute-cost")
+
+    record = get_metadata(_calls(entry)[-1], ComputeCostMetadata)
+    assert record is not None
+    assert record.flops == (("f32", 256),)
+    assert record.flops_per_unit == (("f32", 64),)
 
 
 def test_a_launch_provided_topology_uses_its_mesh_layout_for_analysis() -> None:
     """A dynamic launch declares its positions in the mesh layout, not Topology."""
     _, entry = _run(_launch_provided_tiles, "timeline")
 
-    record = get_metadata(_calls(entry)[-1], TimelineMetadata)
-    assert record is not None
-    assert record.grid_units == 8
-    assert record.waves == 1
+    call = _calls(entry)[-1]
+    cost = get_metadata(call, ComputeCostMetadata)
+    placement = get_metadata(call, TimelineMetadata)
+    assert cost is not None and placement is not None
+    assert cost.flops == (("f32", 8 * 128),)
+    assert cost.flops_per_unit == (("f32", 128),)
+    assert placement.grid_units == 8
+    assert placement.waves == 1
 
 
 def test_analysis_refuses_a_position_count_for_a_multi_topology_mesh() -> None:
     with pytest.raises(
         AnalysisError,
-        match=r"per-topology position count requires one Mesh topology.*\('cta', 'thread'\)",
+        match="one mesh names multiple topology levels",
     ):
         _run(_multi_topology_mesh, "compute-cost")
 
@@ -342,35 +456,156 @@ def test_an_evaluator_that_misses_an_operand_is_refused(monkeypatch) -> None:
         _run(_wide_grid, "compute-cost")
 
 
-def test_memory_holds_a_weight_resident_past_its_last_reader() -> None:
-    """AC-1-2: a constant weight is never reclaimable within the function, while
-    an ordinary value is live only between its definition and its last use."""
+def test_memory_holds_parameters_resident_past_their_last_reader() -> None:
+    """A function cannot reclaim storage its caller handed to it."""
     entry = _WeightedAdd.entry_function()
     analyze(_WeightedAdd, entry, analysis="memory")
 
     record = get_metadata(entry, MemoryMetadata)
     assert record is not None
-    weights = [item for item in record.lifetimes if item.persistent]
+    held = [item for item in record.lifetimes if item.persistent]
     ordinary = [item for item in record.lifetimes if not item.persistent]
-    assert [item.binding for item in weights] == ["weight"]
-    assert ordinary, "the other values are still measured by their live ranges"
-
-    # The weight is read early and still held to the end; an ordinary value that
-    # is read as early releases at that point.
-    (held,) = weights
-    assert held.last_used_at == max(item.last_used_at for item in record.lifetimes)
-    assert any(item.last_used_at < held.last_used_at for item in ordinary)
-    assert any(item.last_used_at > item.defined_at for item in ordinary)
+    assert [item.binding for item in held] == ["source", "weight"]
+    assert ordinary, "body allocations are still measured by their live ranges"
+    assert all(
+        item.last_used_at == max(row.last_used_at for row in record.lifetimes)
+        for item in held
+    )
 
 
-def test_an_addressable_level_that_overflows_fails_the_analysis() -> None:
-    """AC-1-3: too much shared memory is an invalid program, not a warning."""
-    with pytest.raises(AnalysisError, match="smem needs"):
-        _run(_oversized_shared, "memory")
+def test_movement_costs_follow_each_operations_materialization() -> None:
+    functions = {function.name: function for function in _MovementCosts.functions}
+
+    for name in ("row", "column"):
+        function = functions[name]
+        analyze(_MovementCosts, function, analysis="compute-cost")
+        (move,) = _calls(function)
+        record = get_metadata(move, ComputeCostMetadata)
+        assert record is not None
+        kept = 256 * 2048 * 4
+        assert record.traffic_at("gmem") == TrafficBytes(read=kept, write=kept)
+
+    materialized = functions["materialized"]
+    analyze(_MovementCosts, materialized, analysis="memory")
+    transpose, reshape = _calls(materialized)
+    transpose_cost = get_metadata(transpose, ComputeCostMetadata)
+    reshape_cost = get_metadata(reshape, ComputeCostMetadata)
+    assert transpose_cost is not None
+    moved = 1024 * 2048 * 4
+    assert transpose_cost.traffic_at("gmem") == TrafficBytes(
+        read=moved, write=moved
+    )
+    assert reshape_cost is not None
+    assert reshape_cost.traffic_at("gmem").total_bytes == 0
+    footprint = get_metadata(materialized, MemoryMetadata)
+    assert footprint is not None
+    assert any(not item.persistent and item.bytes == moved for item in footprint.lifetimes)
+
+    copied = functions["copied"]
+    analyze(_MovementCosts, copied, analysis="compute-cost")
+    selected, concat = _calls(copied)
+    selected_cost = get_metadata(selected, ComputeCostMetadata)
+    concat_cost = get_metadata(concat, ComputeCostMetadata)
+    assert selected_cost is not None
+    selected_bytes = 256 * 2048 * 4
+    assert selected_cost.traffic_at("gmem") == TrafficBytes(
+        read=selected_bytes, write=selected_bytes
+    )
+    assert concat_cost is not None
+    assert concat_cost.traffic_at("gmem") == TrafficBytes(
+        read=2 * selected_bytes,
+        write=2 * selected_bytes,
+    )
+
+
+def test_runtime_slice_costs_the_selected_region() -> None:
+    source = Var(type=make_tensor_type((1024, 2048)), name="source")
+    runtime_end = Var(type=make_tensor_type((), DType.i64), name="end")
+    output = make_tensor_type((256, 2048))
+    call = Call(
+        type=output,
+        target=Slice(
+            begin=(0, 0), end=(runtime_end, 2048), strides=(1, 1)
+        ),
+        args=(source,),
+    )
+
+    cost = CostEvaluator(CostContext(selected_output_type=output)).visit_Call(call)
+
+    kept = 256 * 2048 * 4
+    assert cost.traffic == (
+        TrafficBytes(read=kept),
+        TrafficBytes(write=kept),
+    )
+
+
+def test_a_sharded_shared_tile_fits_once_and_advises_on_its_peak() -> None:
+    functions = {function.name: function for function in _SharedTile.functions}
+    split = functions["split"]
+    analyze(_SharedTile, split, analysis="memory")
+
+    record = get_metadata(split, MemoryMetadata)
+    assert record is not None
+    smem = next(item for item in record.footprint if item.level == "smem")
+    assert smem.capacity_bytes == 232_448
+    assert smem.peak_bytes == 422_400
+    assert max(
+        item.bytes for item in record.lifetimes if item.level == "smem"
+    ) == 211_200
+    assert any(
+        "smem peak is 422400 B" in note
+        and "order-dependent" in note
+        and "not a bound" in note
+        for note in record.advisories
+    )
+
+    with pytest.raises(AnalysisError, match=r"27878400 B in smem"):
+        analyze(_SharedTile, functions["broadcast"], analysis="memory")
+
+
+def test_memory_footprints_follow_the_owner_recorded_by_the_target() -> None:
+    matmul = next(fn for fn in _MatmulLayouts.functions if fn.name == "split")
+    analyze(_MatmulLayouts, matmul, analysis="memory")
+    gmem = get_metadata(matmul, MemoryMetadata)
+    assert gmem is not None
+    gmem_lifetimes = {
+        item.binding: item.bytes for item in gmem.lifetimes if item.level == "gmem"
+    }
+    assert gmem_lifetimes["local_lhs"] == gmem_lifetimes["lhs"] == 4_325_376
+
+    shared = next(fn for fn in _SharedTile.functions if fn.name == "split")
+    analyze(_SharedTile, shared, analysis="memory")
+    cta_owned = get_metadata(shared, MemoryMetadata)
+    assert cta_owned is not None
+    assert next(
+        item.bytes
+        for item in cta_owned.lifetimes
+        if item.binding == "local" and item.level == "smem"
+    ) == 211_200
+
+    thread_shared = _entry(_modest_shared)
+    analyze(_modest_shared, thread_shared, analysis="memory")
+    still_cta_owned = get_metadata(thread_shared, MemoryMetadata)
+    assert still_cta_owned is not None
+    assert next(
+        item.bytes
+        for item in still_cta_owned.lifetimes
+        if item.binding == "local" and item.level == "smem"
+    ) == 4_096
+
+    registers = _entry(_thread_sharded)
+    analyze(_thread_sharded, registers, analysis="memory")
+    thread_owned = get_metadata(registers, MemoryMetadata)
+    assert thread_owned is not None
+    assert next(
+        item.bytes
+        for item in thread_owned.lifetimes
+        if item.binding == "local" and item.level == "rmem"
+    ) == 8
 
 
 def test_a_cache_too_small_is_advisory_and_only_where_the_scopes_agree() -> None:
-    """AC-1-3: an over-full cache costs speed, so the analysis still succeeds.
+    """An over-full cache costs speed, so the analysis still succeeds.
 
     And it is only reported where the comparison means something. A per-SM
     capacity set against a whole-device footprint exceeds it for almost any
@@ -388,8 +623,8 @@ def test_a_cache_too_small_is_advisory_and_only_where_the_scopes_agree() -> None
 
 
 def test_a_shared_block_reports_what_the_program_leaves_the_cache() -> None:
-    """AC-1-5: the sharing edge is what makes L1's usable size depend on the
-    program, and that division is reportable without any working set."""
+    """The sharing edge makes L1's usable size depend on the program, and that
+    division is reportable without any working set."""
     _, entry = _run(_modest_shared, "memory")
 
     record = get_metadata(entry, MemoryMetadata)
@@ -405,8 +640,7 @@ def test_a_shared_block_reports_what_the_program_leaves_the_cache() -> None:
 
 
 def test_roofline_reads_the_recorded_work_and_aggregates_before_dividing() -> None:
-    """AC-1-4: the bound follows whatever compute-cost recorded, at the rate the
-    target states.
+    """The bound follows whatever compute-cost recorded, at the target's rate.
 
     Aggregating the work first is what keeps the bound a lower bound. Each call's
     own bound rounds up to whole nanoseconds; adding those up would charge the
@@ -439,7 +673,7 @@ def test_roofline_reads_the_recorded_work_and_aggregates_before_dividing() -> No
     ]
     assert len(per_call) > 1
     assert whole.compute_ns < sum(item.compute_ns for item in per_call)
-    assert whole.theoretical_ns == max(whole.compute_ns, whole.memory_ns)
+    assert whole.ideal_ns == max(whole.compute_ns, whole.memory_ns)
 
 
 def test_timeline_credits_an_unplaced_call_with_one_position() -> None:
@@ -476,7 +710,7 @@ def test_a_reshard_ends_the_execution_unit_on_both_sides() -> None:
 
 
 def test_the_gpu_memory_graph_is_not_a_tree() -> None:
-    """AC-1-5: L1 caches L2, L2 caches GMEM, and L1 shares a block with SMEM.
+    """L1 caches L2, L2 caches GMEM, and L1 shares a block with SMEM.
 
     The shared edge is what makes the graph non-hierarchical: smem is an
     addressable level and l1 a cache, yet neither contains the other. A machine
