@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""CLI to pre-populate the viewer's vendored JS cache (e.g. on an offline
-machine). Thin shim over :func:`tilefoundry.inspection.viewer.assets.ensure_assets`
+"""Populate the viewer's vendored JavaScript cache.
+
+This is a thin shim over :func:`tilefoundry.inspection.viewer.assets.ensure_assets`
 so the manifest + verification logic has a single home inside the package
 (importable when tilefoundry is pip-installed; ``scripts/`` is not packaged).
 
@@ -10,6 +11,7 @@ Usage:
 With no ``--cache-dir`` the default cache root is used
 (``$TILEFOUNDRY_VIEWER_ASSET_DIR`` → ``$XDG_CACHE_HOME``/``~/.cache``).
 """
+
 from __future__ import annotations
 
 import argparse

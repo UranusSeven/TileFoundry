@@ -33,7 +33,6 @@ def _structural_equal(a, b) -> bool:
         for pi in type(a.target).params():
             if pi.kind == "attribute":
                 if getattr(a.target, pi.name, None) != getattr(b.target, pi.name, None):
-                    # Best-effort tuple compare for layouts / nested attrs.
                     if not _attr_equal(
                         getattr(a.target, pi.name, None),
                         getattr(b.target, pi.name, None),
@@ -42,7 +41,9 @@ def _structural_equal(a, b) -> bool:
         return _structural_equal(a.type, b.type)
     if isinstance(a, TensorType):
         return (
-            a.shape == b.shape and a.dtype == b.dtype and a.storage == b.storage
+            a.shape == b.shape
+            and a.dtype == b.dtype
+            and a.storage == b.storage
             and _attr_equal(a.layout, b.layout)
         )
     return a == b
@@ -56,16 +57,16 @@ def _attr_equal(a, b) -> bool:
     if isinstance(a, tuple):
         return len(a) == len(b) and all(_attr_equal(aa, bb) for aa, bb in zip(a, b))
     if hasattr(a, "__dataclass_fields__"):
-        return all(
-            _attr_equal(getattr(a, f), getattr(b, f)) for f in a.__dataclass_fields__
-        )
+        return all(_attr_equal(getattr(a, f), getattr(b, f)) for f in a.__dataclass_fields__)
     return a == b
 
 
 def test_canonical_roundtrip_preserves_topologies_and_compiles() -> None:
-    """Round-trip is structurally equal + printed text is valid Python +
-    the owning module's topology declaration survives."""
+    """Test canonical roundtrip preserves topologies and compiles.
 
+    Round-trip is structurally equal + printed text is valid Python +
+    the owning module's topology declaration survives.
+    """
     mod1 = build_demo_canonical()
     src = as_script(mod1)
     compile(src, "<test>", "exec")

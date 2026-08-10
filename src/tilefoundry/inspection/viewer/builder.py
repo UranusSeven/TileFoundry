@@ -42,10 +42,13 @@ from .palette import (
 
 
 def _renderable_functions(root) -> list[tuple[str, "HirFunction"]]:
-    """The ``(label, function)`` units to draw. A dispatch prototype (body
+    """The ``(label, function)`` units to draw.
+
+    The ``(label, function)`` units to draw. A dispatch prototype (body
     ``None``) is expanded to its variants — each labelled by its canonical
     specialization signature — so the graph shows the executable bodies, never a
-    bodyless prototype."""
+    bodyless prototype.
+    """
     from tilefoundry.ir.core.module import Module  # noqa: PLC0415 — avoid import cycle
     from tilefoundry.ir.hir.function import (  # noqa: PLC0415
         Function as _HirFunction,
@@ -67,7 +70,9 @@ def _renderable_functions(root) -> list[tuple[str, "HirFunction"]]:
 
 
 def _collect_view_meshes(root) -> dict[int, "Mesh"]:
-    """Collect unique ``Mesh`` objects referenced anywhere in *root* — params,
+    """Collect unique ``Mesh`` objects referenced anywhere in *root*.
+
+    Collect unique ``Mesh`` objects referenced anywhere in *root* — params,
     return type, every node's result type, and ``Reshard`` layout attrs.
 
     The viewer renders shard sugar on intermediate node result types too, so it
@@ -106,8 +111,8 @@ class DetailIndex:
     mesh_name_map: dict[int, str] = field(default_factory=dict)
 
     def add(self, visual_id: str, ref: DetailRef) -> None:
-        # Distinct visual_id per emit; collisions surface as test
-        # failures rather than silent overwrite.
+
+
         if visual_id in self.entries:
             raise ValueError(f"DetailIndex: duplicate visual_id {visual_id!r}")
         self.entries[visual_id] = ref
@@ -122,9 +127,12 @@ _CONST_DTYPE_SUFFIX: dict[str, str] = {
 
 
 def _format_constant(c: Constant) -> str:
-    """Compact constant rendering (ported from the old viewer's pretty
+    """Compact constant rendering (ported from the old viewer's pretty view).
+
+    Compact constant rendering (ported from the old viewer's pretty
     view). Scalars: ``const(1)`` / ``const(1.0f)``; sequences:
-    ``const([1.0f, 2.0f, ...])`` truncated to the first 8 elements."""
+    ``const([1.0f, 2.0f, ...])`` truncated to the first 8 elements.
+    """
     ty = getattr(c, "type", None)
     suffix = (
         _CONST_DTYPE_SUFFIX.get(ty.dtype.name, "")
@@ -151,9 +159,12 @@ def _format_constant(c: Constant) -> str:
 
 
 def _shard_layout_text(sl: ShardLayout, mesh_name_map: dict[int, str] | None) -> str:
-    """Render a bare ``ShardLayout`` attr (e.g. a ``Reshard`` layout) through the
+    """Shard layout text.
+
+    Render a bare ``ShardLayout`` attr (e.g. a ``Reshard`` layout) through the
     canonical sugar core, falling back to the verbose ``ShardLayout(...)`` form
-    when the mesh is unnamed or the layout is not sugar-expressible."""
+    when the mesh is unnamed or the layout is not sugar-expressible.
+    """
     mesh_name = mesh_name_map.get(id(sl.mesh)) if mesh_name_map else None
     if mesh_name and getattr(sl.mesh, "names", None):
         mesh_unique = mesh_name_map is not None and len(mesh_name_map) == 1
@@ -164,9 +175,12 @@ def _shard_layout_text(sl: ShardLayout, mesh_name_map: dict[int, str] | None) ->
 
 
 def _pretty_attr_value(value, *, full: bool = False, mesh_name_map: dict[int, str] | None = None) -> str:
-    """Readable rendering of an Op attribute value — pretty constants /
+    """Readable rendering of an Op attribute value.
+
+    Readable rendering of an Op attribute value — pretty constants /
     tuples / lists / types instead of raw ``repr``. ``full`` selects the
-    canonical type form (detail panel) vs the compact one (graph label)."""
+    canonical type form (detail panel) vs the compact one (graph label).
+    """
     if isinstance(value, Constant):
         return _format_constant(value)
     if isinstance(value, DType):
@@ -192,10 +206,13 @@ def _pretty_attr_value(value, *, full: bool = False, mesh_name_map: dict[int, st
 def _op_attributes(
     target, *, full: bool = False, mesh_name_map: dict[int, str] | None = None
 ) -> list[tuple[str, str]]:
-    """The Op's non-input (attribute) params as ``(name, pretty-value)``
+    """Op attributes.
+
+    The Op's non-input (attribute) params as ``(name, pretty-value)``
     pairs — e.g. ``("axis", "2")`` / ``("begin", "(const(0), ...)")``.
     ``full`` selects canonical (detail) vs compact (graph) type text.
-    Empty when the Op has no attributes or doesn't expose ``params()``."""
+    Empty when the Op has no attributes or doesn't expose ``params()``.
+    """
     try:
         pdefs = type(target).params()
     except (AttributeError, TypeError):
@@ -211,16 +228,12 @@ def _op_attributes(
 
 
 def _format_dim(dim) -> list[Span]:
-    """Render a shape dim as inline spans, driven by the same
-    ``python_printer._DIM_INFIX_OPS`` / ``_DIM_FUNC_OPS`` tables that
-    ``shape_entry_str`` uses — so a compact graph label renders
-    ``DimFloorDiv`` / ``DimMod`` / ``min`` / ``max`` exactly like the
-    canonical [inspection §2.3](docs/spec/inspection.md#23-dsl-text-forms) text instead of a raw ``Call`` repr. ``DimVar`` gets a
-    colored ``<FONT>`` wrap; bare ``int`` stays plain.
+    """Render a shape dimension as inline viewer spans.
 
-    Every ``DimVar`` renders in the same ``DIMVAR_COLOR`` — the colour
-    marks the *token class* (this is a dynamic dim), not the specific
-    symbol. Which symbol it is lives in the text + detail panel.
+    Share arithmetic syntax with the canonical Python printer. Dimension
+    variables use one token-class color while their text and detail identify the
+    symbol; integers remain plain.
+    See [inspection §2.3](docs/spec/inspection.md#23-dsl-text-forms).
     """
     if isinstance(dim, DimVar):
         return [Span(text=dim.name, color=DIMVAR_COLOR, bold=True)]
@@ -247,9 +260,12 @@ def _format_dim(dim) -> list[Span]:
 
 
 def _shard_inline(ty: TensorType, mesh_name_map: dict[int, str] | None):
-    """Compact shard decomposition for *ty*: ``(split_ref_by_tensor_axis,
+    """Compact shard decomposition for *ty*.
+
+    Compact shard decomposition for *ty*: ``(split_ref_by_tensor_axis,
     partials)`` or ``None`` when there is no named sugar-expressible shard
-    layout (caller renders the plain shape)."""
+    layout (caller renders the plain shape).
+    """
     layout = getattr(ty, "layout", None)
     if not isinstance(layout, ShardLayout):
         return None
@@ -260,18 +276,17 @@ def _shard_inline(ty: TensorType, mesh_name_map: dict[int, str] | None):
 
 
 def _compact_type_spans(ty, mesh_name_map: dict[int, str] | None = None) -> list[Span]:
-    """The **compact** pretty mode (spec [inspection §2.3](docs/spec/inspection.md#23-dsl-text-forms)) as inline coloured spans —
-    DimVar / storage tinted for the graph node label. ``type_to_compact_pretty``
-    joins these to plain text.
+    """Render compact graph-label types as colored inline spans.
 
-    A sharded tensor inlines each ``Split`` on its tensor axis
-    (``size @ mesh.axis``) and appends a ``{mesh.axis @ P("reduction")}`` suffix
-    for ``Partial`` value states; layouts that cannot be inlined fall back to the
-    canonical annotation text."""
+    Tint dimension variables and storage, inline shard splits on tensor axes,
+    and append partial states. Layouts that cannot be inlined use canonical
+    annotation text. ``type_to_compact_pretty`` joins spans as plain text.
+    See [inspection §2.3](docs/spec/inspection.md#23-dsl-text-forms).
+    """
     if isinstance(ty, TensorType):
         inline = _shard_inline(ty, mesh_name_map)
         if isinstance(ty.layout, ShardLayout) and inline is None:
-            # Sharded but not compactly inlinable → canonical fallback text.
+
             return [Span(text=type_to_canonical_pretty(ty, mesh_name_map=mesh_name_map))]
         split_ref, partials = inline if inline is not None else ({}, [])
         dtype = ty.dtype.name if hasattr(ty.dtype, "name") else str(ty.dtype)
@@ -291,8 +306,8 @@ def _compact_type_spans(ty, mesh_name_map: dict[int, str] | None = None) -> list
             spans.append(Span(text=str(storage), color=storage_color(str(storage)), bold=True))
         return spans
     if isinstance(ty, TupleType):
-        # Render compactly as ``⟨T0, T1, ...⟩``; callers wanting a
-        # vertical multi-line tuple build their own rows.
+
+
         spans: list[Span] = [Span(text="⟨")]
         for i, sub in enumerate(ty.fields):
             if i:
@@ -304,15 +319,12 @@ def _compact_type_spans(ty, mesh_name_map: dict[int, str] | None = None) -> list
 
 
 def type_to_compact_pretty(ty, mesh_name_map: dict[int, str] | None = None) -> str:
-    """**Compact** pretty mode (spec [inspection §2.3](docs/spec/inspection.md#23-dsl-text-forms)) as plain text — e.g.
-    ``bf16[4 @ trd.l, 64] {trd.t @ P("sum")} @smem`` — for the graph node label."""
+    """Render [inspection §2.3](docs/spec/inspection.md#23-dsl-text-forms) compact text."""
     return "".join(s.text for s in _compact_type_spans(ty, mesh_name_map))
 
 
 def type_to_canonical_pretty(ty, mesh_name_map: dict[int, str] | None = None) -> str:
-    """**Canonical** pretty mode (spec [inspection §2.3](docs/spec/inspection.md#23-dsl-text-forms)) — the round-trippable DSL
-    annotation ``Tensor[(1, 2, CTX_LEN + 1, 256), "bf16", ...]`` (with shard
-    layout / non-default storage when present) — for the detail panel."""
+    """Render [inspection §2.3](docs/spec/inspection.md#23-dsl-text-forms) canonical text."""
     if isinstance(ty, TensorType):
         return _tensor_annotation(ty, mesh_name_map=mesh_name_map)
     if isinstance(ty, TupleType):
@@ -334,7 +346,9 @@ def _returns_of(ty, mesh_name_map: dict[int, str] | None = None) -> list[dict]:
 def format_detail(
     visual_id: str, ref: "DetailRef", mesh_name_map: dict[int, str] | None = None
 ) -> dict:
-    """Format a detail-panel payload from a ``DetailRef`` on demand (no
+    """Format a detail-panel payload from a ``DetailRef`` on demand.
+
+    Format a detail-panel payload from a ``DetailRef`` on demand (no
     pre-baked JSON in the index). Shape:
     ``{id, kind, name, params:[{name,type}], returns:[{idx,type}], attrs:[{key,value}]}``.
 
@@ -357,7 +371,7 @@ def format_detail(
         name = expr.name
         returns = _returns_of(expr.type, mm)
     elif isinstance(expr, Constant):
-        name = _format_constant(expr)  # pretty value, e.g. const([1.0f, 2.0f])
+        name = _format_constant(expr)
         returns = _returns_of(expr.type, mm)
     elif isinstance(expr, HirTuple):
         name = "Tuple"
@@ -401,14 +415,14 @@ class ViewerBuilder:
     def __init__(self, root, collapsed: set[str] | None = None) -> None:
         self.root = root
         self.collapsed = set(collapsed or ())
-        # Per-view mesh-name map, shared by the compact graph labels and the
-        # on-demand detail panel (carried on the index).
+
+
         self.mesh_name_map = _mesh_name_map(_collect_view_meshes(root))
         self.index = DetailIndex(mesh_name_map=self.mesh_name_map)
-        # id(Call) -> per-output-slot producer refs. For a collapsed
-        # function call these are the stand-in node's ``:out<i>`` ports;
-        # for an expanded one they are the real body producer nodes (the
-        # expanded header has no output port — see _emit_function_region).
+
+
+
+
         self._call_outputs: dict[int, list[str]] = {}
 
     def build(self) -> graphviz.Digraph:
@@ -419,9 +433,9 @@ class ViewerBuilder:
         g.attr("edge", color="#555555", arrowsize="0.58", penwidth="1.0")
 
         if isinstance(self.root, (Module, HirFunction)):
-            # Top-level region: no outer consumer, so outputs are unused. A
-            # dispatch prototype is expanded to its variants (each labelled by
-            # its specialization signature).
+
+
+
             for i, (label, fn) in enumerate(_renderable_functions(self.root)):
                 self._emit_function_region(g, fn, call_path=(label,), local_idx=i)
         else:
@@ -439,14 +453,20 @@ class ViewerBuilder:
 
     @staticmethod
     def _output_arity(ty) -> int:
-        """Number of result slots a value of type ``ty`` exposes — one per
-        ``TupleType`` field, else a single output."""
+        """Number of result slots a value of type ``ty`` exposes.
+
+        Number of result slots a value of type ``ty`` exposes — one per
+        ``TupleType`` field, else a single output.
+        """
         return len(ty.fields) if isinstance(ty, TupleType) else 1
 
     @staticmethod
     def _output_marker_row(slot: int, width: int) -> Cell:
-        """Bottom ``out<i>`` marker row appended to a region's real return
-        producer node (instead of a separate anchor node)."""
+        """Bottom ``out<i>`` marker row appended to a region's real return producer node.
+
+        Bottom ``out<i>`` marker row appended to a region's real return
+        producer node (instead of a separate anchor node).
+        """
         return Cell(
             text=f"▼ out{slot}", colspan=(width if width > 1 else None),
             bgcolor="#e7efe1", color=MUTED, align="CENTER", font_size=10,
@@ -454,9 +474,12 @@ class ViewerBuilder:
 
     @staticmethod
     def _out_port_cells(n_out: int, width: int) -> list[Cell]:
-        """Quiet ``:out<i>`` anchor cells (one per result slot) whose
+        """Out port cells.
+
+        Quiet ``:out<i>`` anchor cells (one per result slot) whose
         colspans sum to ``width`` so the row never goes ragged (ragged
-        HTML-table rows make ``dot`` warn)."""
+        HTML-table rows make ``dot`` warn).
+        """
         cells = []
         for i in range(n_out):
             if n_out <= width:
@@ -470,9 +493,9 @@ class ViewerBuilder:
             )
         return cells
 
-    # ------------------------------------------------------------------
-    # Function region — unified emitter (Call-of-Function == standalone)
-    # ------------------------------------------------------------------
+
+
+
     def _emit_function_region(
         self,
         g: graphviz.Digraph,
@@ -482,24 +505,19 @@ class ViewerBuilder:
         local_idx: int,
         call_args: tuple | None = None,
     ) -> tuple[str, list[str]]:
-        """Emit a Function region. Returns ``(node_vid, outputs)`` where
-        ``node_vid`` is the title-row node (carrying the input ports) and
-        ``outputs`` is the per-result-slot producer ref an outer consumer
-        attaches to.
+        """Emit a function region and return its title node and output refs.
 
-        Output ports belong only to the **collapsed** stand-in node — it
-        *is* the result producer, so it carries ``:out<i>``. When
-        **expanded**, the header has no output port; the body's real
-        producer node(s) carry the return value directly, so consumers
-        connect to them (wiring body producers back up to a header port
-        would read as the function depending on itself)."""
+        The collapsed stand-in owns output ports because it is the producer.
+        Expanded regions expose actual body producers; routing them through the
+        header would visually introduce a self-dependency.
+        """
         region_vid = self._visual_id(call_path, f"r{local_idx}")
         node_vid = self._visual_id(call_path, f"fn{local_idx}")
         is_collapsed = region_vid in self.collapsed
         n_out = self._output_arity(fn.return_type)
-        depth = (len(call_path) - 1) // 2  # nesting level (root = 0)
+        depth = (len(call_path) - 1) // 2
 
-        # Title node
+
         self._emit_function_node(g, fn, node_vid, region_vid, call_path, collapsed=is_collapsed)
         self.index.add(
             node_vid,
@@ -512,11 +530,11 @@ class ViewerBuilder:
         )
 
         if is_collapsed:
-            # Stand-in node carries the outputs on its own ports.
+
             return node_vid, [f"{node_vid}:out{i}" for i in range(n_out)]
 
-        # Expanded: wrap children in a subgraph cluster, tinted by nesting
-        # depth (an independent visual channel) so layers read at a glance.
+
+
         cluster_name = f"cluster_{region_vid}"
         with g.subgraph(name=cluster_name) as sub:
             sub.attr(
@@ -526,18 +544,18 @@ class ViewerBuilder:
             )
             visited: dict[int, str] = {}
             for i, param in enumerate(fn.params):
-                # Body param reads come from the header's *out* port row
-                # (``:pout<i>``), kept distinct from the *in* port row where
-                # the external caller connects (``:pin<i>``). Splitting the
-                # two faces stops one port being both an external sink and
-                # an internal source, which untangles the edges.
+
+
+
+
+
                 visited[id(param)] = f"{node_vid}:pout{i}"
             inner_local_counter = [0]
-            # ``return (a, b, ...)`` Tuple is the return bundle itself, so
-            # each element's producer is an output slot. The real producer
-            # node gets an ``out<i>`` marker row appended directly to it
-            # (no separate anchor node); the
-            # outer consumer attaches to that producer node.
+
+
+
+
+
             elements = fn.body.elements if isinstance(fn.body, HirTuple) else (fn.body,)
             outputs: list[str] = []
             direct_output_nodes: list[str] = []
@@ -547,12 +565,12 @@ class ViewerBuilder:
                     local_counter=inner_local_counter, output_slot=slot,
                 )
                 outputs.append(ref)
-                # Nested-call outputs live inside a sub-cluster; only rank
-                # nodes that are direct children of *this* cluster, else a
-                # cross-cluster rank constraint distorts the layout.
+
+
+
                 if not (isinstance(elem, Call) and isinstance(elem.target, HirFunction)):
                     direct_output_nodes.append(ref.split(":")[0])
-            # Align this region's own output producers on one bottom rank.
+
             if len(direct_output_nodes) > 1:
                 with sub.subgraph() as rank:
                     rank.attr(rank="same")
@@ -571,19 +589,22 @@ class ViewerBuilder:
         *,
         collapsed: bool,
     ) -> None:
-        """Title-row node. Toggle port + clickable title cell + per-param
+        """Title-row node.
+
+        Title-row node. Toggle port + clickable title cell + per-param
         ports. When expanded the params span two rows — row 1 ``:pin<i>``
         (the external caller connects) and row 2 ``:pout<i>`` (the body
         reads the param) — so one port is never both an external sink and
         an internal source (untangles the edges).
-        Collapsed has no body, so it shows only the ``:pin<i>`` row."""
+        Collapsed has no body, so it shows only the ``:pin<i>`` row.
+        """
         icon = "▶" if collapsed else "▼"
         n_params = len(fn.params)
         two_row = (not collapsed) and n_params > 0
         span = 2 if two_row else None
 
         title = Table(cellpadding=6, bgcolor=PAPER, color=HAIR)
-        # Row 1: toggle + title (rowspan when two-row) + per-param IN ports.
+
         title.add_row(
             Cell(
                 text=icon, port="toggle", href="javascript:void(0)",
@@ -605,7 +626,7 @@ class ViewerBuilder:
                 for i, p in enumerate(fn.params)
             ],
         )
-        # Row 2 (expanded only): per-param OUT ports feeding the body.
+
         if two_row:
             title.add_row(
                 *[
@@ -614,8 +635,8 @@ class ViewerBuilder:
                     for i in range(n_params)
                 ]
             )
-        # Each IN-port cell is its own DetailIndex entry so a click on the
-        # param port opens its own detail row.
+
+
         for i, p in enumerate(fn.params):
             self.index.add(
                 f"{node_vid}__p{i}",
@@ -625,7 +646,7 @@ class ViewerBuilder:
                 ),
             )
 
-        # Return-type row (always rendered, matches a Call op's title contract).
+
         width = 2 + n_params
         title.add_row(
             Cell(
@@ -634,18 +655,18 @@ class ViewerBuilder:
             )
         )
 
-        # Output-port row: ONLY on the collapsed stand-in node, which is
-        # itself the result producer. An expanded header has no output
-        # port — the body's real producer nodes carry the return value
-        # (else body→header edges read as a self-dependency).
+
+
+
+
         if collapsed:
             title.add_row(*self._out_port_cells(self._output_arity(fn.return_type), width))
 
         g.node(node_vid, label=title.to_html())
 
-    # ------------------------------------------------------------------
-    # Generic Expr walker
-    # ------------------------------------------------------------------
+
+
+
     def _walk_expr(
         self,
         g: graphviz.Digraph,
@@ -656,7 +677,9 @@ class ViewerBuilder:
         local_counter: list[int],
         output_slot: int | None = None,
     ) -> str:
-        """Emit ``expr`` (and its dependencies) into ``g``. Returns the
+        """Emit ``expr`` (and its dependencies) into ``g``.
+
+        Emit ``expr`` (and its dependencies) into ``g``. Returns the
         DOT id (possibly with ``:port`` suffix) that an outer Call can
         attach an edge to.
 
@@ -673,7 +696,7 @@ class ViewerBuilder:
             )
 
         if isinstance(expr, Var):
-            # Param Vars are pre-populated in ``visited`` by the caller.
+
             local = f"v{local_counter[0]}"
             local_counter[0] += 1
             vid = self._visual_id(call_path, local)
@@ -713,7 +736,7 @@ class ViewerBuilder:
                 local_counter=local_counter, output_slot=output_slot,
             )
 
-        # Fallback: emit a labelled node so the graph stays connected.
+
         local = f"x{local_counter[0]}"
         local_counter[0] += 1
         vid = self._visual_id(call_path, local)
@@ -739,9 +762,9 @@ class ViewerBuilder:
         local_counter: list[int],
         output_slot: int | None = None,
     ) -> str:
-        # Function-call: route through the unified function-region emitter
-        # in a deeper call_path. A nested call's output is already marked
-        # inside its own region, so ``output_slot`` is not re-applied here.
+
+
+
         if isinstance(call.target, HirFunction):
             inner_idx = local_counter[0]
             local_counter[0] += 1
@@ -750,24 +773,24 @@ class ViewerBuilder:
                 g, call.target, call_path=inner_path, local_idx=inner_idx,
                 call_args=call.args,
             )
-            # Walk args + wire each one into the inner function's external
-            # input port ``:pin<i>`` (the top param row).
+
+
             for i, arg in enumerate(call.args):
                 src = self._walk_expr(
                     g, arg, call_path=call_path, visited=visited, local_counter=local_counter
                 )
                 g.edge(src, f"{inner_vid}:pin{i}")
-            # The call's outputs are whatever the region exposed: the
-            # collapsed stand-in's ``:out<i>`` ports, or (expanded) the
-            # real body producer node(s). A consuming ``TupleGetItem``
-            # resolves the right slot via ``_call_outputs``; a single-output
-            # direct consumer uses ``outputs[0]``.
+
+
+
+
+
             self._call_outputs[id(call)] = outputs
             result_ref = outputs[0]
             visited[id(call)] = result_ref
             return result_ref
 
-        # Op call: emit a single node with a title row + per-arg ports.
+
         local = f"c{local_counter[0]}"
         local_counter[0] += 1
         vid = self._visual_id(call_path, local)
@@ -786,9 +809,9 @@ class ViewerBuilder:
                 cellpadding=8,
             )
         ]
-        # Per-operand port labels use the Op's declared input param names
-        # (e.g. ``lhs`` / ``rhs`` for ``Binary``), so the title row reads
-        # like the Op signature rather than ``in0 / in1 / ...``.
+
+
+
         try:
             input_param_names = [p.name for p in type(call.target).params() if p.kind == "input"]
         except (AttributeError, TypeError):
@@ -810,10 +833,10 @@ class ViewerBuilder:
             )
         tbl.add_row(*cells)
         width = 1 + len(call.args)
-        # Field/attr row(s): the Op's non-input (attribute) params, e.g.
-        # ``axis: 2`` / ``new_shape: ...`` / ``dtype: ...``. Kept separate
-        # from the input ports above and the result row below so inputs and
-        # attributes read distinctly.
+
+
+
+
         for key, val in _op_attributes(call.target, mesh_name_map=self.mesh_name_map):
             tbl.add_row(
                 Cell(text=f"{key}: {val}", colspan=width, color=MUTED,
@@ -828,23 +851,23 @@ class ViewerBuilder:
                 font_size=12,
             )
         )
-        # Multi-output ops (e.g. one returning a packed K/V tuple) expose
-        # ``:out<i>`` ports so a consuming ``TupleGetItem`` can read the
-        # specific field. Single-output ops need none — the node *is* the
-        # value, and consumers attach to the bare node id.
+
+
+
+
         n_out = self._output_arity(call.type)
         if n_out > 1:
             tbl.add_row(*self._out_port_cells(n_out, width))
-        # If this op is the enclosing function's return producer, mark it
-        # with a bottom ``out<i>`` row (no separate anchor node).
+
+
         if output_slot is not None:
             tbl.add_row(self._output_marker_row(output_slot, width))
         g.node(vid, label=tbl.to_html())
         visited[id(call)] = vid
 
-        # Walk args + wire edges. ``TupleGetItem`` reads field ``index`` of
-        # a multi-output producer, so its edge originates from that
-        # producer's specific output slot.
+
+
+
         tuple_index = (
             call.target.index if _op_display_name(call.target) == "TupleGetItem" else None
         )
@@ -853,11 +876,11 @@ class ViewerBuilder:
                 g, arg, call_path=call_path, visited=visited, local_counter=local_counter
             )
             if tuple_index is not None and i == 0:
-                # A function call records per-slot producers in
-                # ``_call_outputs`` (collapsed → ``:out<i>`` ports,
-                # expanded → real body producers). Other multi-output
-                # producers (ops, value-Tuples) carry ``:out<i>`` ports on
-                # the bare node.
+
+
+
+
+
                 outs = self._call_outputs.get(id(arg))
                 if outs is not None:
                     src = outs[tuple_index]
@@ -876,10 +899,13 @@ class ViewerBuilder:
         visited: dict[int, str],
         local_counter: list[int],
     ) -> str:
-        """Emit a value-form ``Tuple`` bundler. Each element flows into an
+        """Emit a value-form ``Tuple`` bundler.
+
+        Emit a value-form ``Tuple`` bundler. Each element flows into an
         ``:in<i>`` port; a consuming ``TupleGetItem`` reads field ``i`` from
         the matching ``:out<i>`` port. (A ``return (...)`` Tuple is handled
-        directly by ``_emit_function_region`` and never reaches here.)"""
+        directly by ``_emit_function_region`` and never reaches here.)
+        """
         local = f"t{local_counter[0]}"
         local_counter[0] += 1
         vid = self._visual_id(call_path, local)

@@ -5,6 +5,7 @@ plausible TIR: a rebound Var makes two distinct buffers one name, a declared typ
 that disagrees with its value places a tensor in the wrong memory, and an
 allocation nested inside another expression has no defined lifetime.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -31,9 +32,12 @@ def _pf(*stmts) -> PrimFunction:
 
 
 def test_letstmt_requires_a_fresh_var_anywhere_in_the_function():
-    """Binding the same Var object twice must raise whether the second binding is
+    """Test letstmt requires a fresh var anywhere in the function.
+
+    Binding the same Var object twice must raise whether the second binding is
     nested inside the first or a sibling of it — fresh-Var applies across the whole
-    function, not merely within the current lexical scope."""
+    function, not merely within the current lexical scope.
+    """
     rmem = make_tensor_type((4,), storage="rmem")
     v = Var(type=rmem, name="v")
 
@@ -53,16 +57,19 @@ def test_letstmt_rejects_type_mismatch():
     """var.type must equal type_of(value)."""
     t_reg = make_tensor_type((4,), storage="rmem")
     t_shared = make_tensor_type((4,), DType.f32, storage="smem")
-    v = Var(type=t_shared, name="v")  # declared shared
+    v = Var(type=t_shared, name="v")
     with pytest.raises(VerifyError, match="!= value.type"):
-        verify_prim_function(_pf(_let(v, _alloc_call(t_reg))))  # value type is reg
+        verify_prim_function(_pf(_let(v, _alloc_call(t_reg))))
 
 
 def test_letstmt_rejects_alloc_nested_in_other_expr():
-    """Call(AllocTensor, ...) may only appear directly as
-    LetStmt.value, never nested inside another Expr operand."""
+    """Call may only appear directly as LetStmt.value, never nested inside another Expr operand.
+
+    Call(AllocTensor, ...) may only appear directly as
+    LetStmt.value, never nested inside another Expr operand.
+    """
     t_scalar = TensorType.scalar(DType.f32)
-    # Illegal nesting: PtrOf(AllocTensor(...)).
+
     nested = Call(
         type=t_scalar,
         target=PtrOf(),

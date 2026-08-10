@@ -31,9 +31,12 @@ def _default_device() -> str:
 
 
 def _bind_dim_vars(params, values) -> dict[str, int]:
-    """Map each ``DimVar`` appearing directly as a parameter-shape axis to the
+    """Bind dim vars.
+
+    Map each ``DimVar`` appearing directly as a parameter-shape axis to the
     concrete size of the matching argument. Conflicting bindings for the same
-    name raise ``EvalError``."""
+    name raise ``EvalError``.
+    """
     binding: dict[str, int] = {}
     for p, v in zip(params, values):
         shape = getattr(p.type, "shape", None)
@@ -112,16 +115,19 @@ class Evaluator(ExprVisitor):
                 f"{len(callee.params)} args, got {len(arg_exprs)}"
             )
         args = [self.visit(a) for a in arg_exprs]
-        # A dispatch prototype (body is None) selects a variant by the runtime
-        # argument shapes; its own None body is never evaluated.
+
+
         target = _select_variant(callee, args) if callee.variants else callee
         sub_env = {id(param): arg for param, arg in zip(target.params, args)}
         sub_dim_env = _bind_dim_vars(target.params, args)
         return Evaluator(sub_env, self.device, sub_dim_env).visit(target.body)
 
     def _resolve_loop_field(self, dim, what: str) -> int:
-        """Resolve a ``GridRegionExpr`` ``extent`` / ``step`` ``ShapeDim`` to a
-        concrete ``int`` against the current DimVar bindings; fail closed."""
+        """Resolve loop field.
+
+        Resolve a ``GridRegionExpr`` ``extent`` / ``step`` ``ShapeDim`` to a
+        concrete ``int`` against the current DimVar bindings; fail closed.
+        """
         if isinstance(dim, bool):
             raise EvalError(f"evaluator: GridRegion {what} must be an integer")
         if isinstance(dim, int):
@@ -164,7 +170,7 @@ class Evaluator(ExprVisitor):
             return env
 
         if not region.carried_args:
-            # No-carry loop: the value is the final body evaluation.
+
             last = None
             for i in indices:
                 last = Evaluator(
@@ -243,8 +249,8 @@ def evaluate(fn_or_call, *inputs, backend: str = "torch", device: str | None = N
             )
             for param, arg in zip(fn.params, inputs)
         ]
-        # A dispatch prototype selects a variant by the input shapes; its own
-        # None body is never evaluated.
+
+
         target = _select_variant(fn, values) if fn.variants else fn
         env = {id(param): value for param, value in zip(target.params, values)}
         dim_env = _bind_dim_vars(target.params, values)

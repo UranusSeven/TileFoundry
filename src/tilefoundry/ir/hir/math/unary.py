@@ -29,16 +29,20 @@ from tilefoundry.visitor_registry.isl_utility import to_domain
 @register_op
 class Unary(Op):
     """Value-form pointwise unary operation."""
+
     x = ParamDef(kind="input", pattern=Tensor)
     kind = ParamDef(kind="attribute", annotation=UnaryKind)
 
 
 @register_type_relation(Unary)
 def _unary_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Forward access relation for the elementwise Unary (kind-dispatched --
+    """Forward access relation for the elementwise Unary (kind-dispatched.
+
+    Forward access relation for the elementwise Unary (kind-dispatched --
     neg/abs/not/relu/square/rsqrt/exp/log all share this shape): single
     input, no broadcast, no reduction -- the iteration domain is the input
-    shape and both the input map and the output map are the identity."""
+    shape and both the input map and the output map are the identity.
+    """
     (x,) = input_types
     domain, param_map = to_domain(x.shape)
     dims = [f"d{i}" for i in range(len(x.shape))]
@@ -47,13 +51,20 @@ def _unary_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
     return AccessRelationResult(domain=domain, maps=(ident, ident), param_map=param_map)
 
 
-# Monotone non-decreasing: commutes with max/min, not sum.
-_MONOTONE_INCREASING = frozenset({
-    UnaryKind.EXP, UnaryKind.LOG, UnaryKind.RELU,
-    UnaryKind.CEIL, UnaryKind.ROUND, UnaryKind.EXP2, UnaryKind.LOG2,
-})
-# Linear negation: commutes with sum, not max/min (reverses order).
+_MONOTONE_INCREASING = frozenset(
+    {
+        UnaryKind.EXP,
+        UnaryKind.LOG,
+        UnaryKind.RELU,
+        UnaryKind.CEIL,
+        UnaryKind.ROUND,
+        UnaryKind.EXP2,
+        UnaryKind.LOG2,
+    }
+)
+
 _LINEAR = frozenset({UnaryKind.NEG})
+
 
 @register_typeinfer(Unary)
 def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
@@ -77,6 +88,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         storage=x_ty.storage,
     )
 
+
 @register_eval(Unary)
 def _eval_unary(ctx):
 
@@ -90,8 +102,6 @@ def _eval_unary(ctx):
         UnaryKind.EXP: torch.exp,
         UnaryKind.LOG: torch.log,
         UnaryKind.CEIL: torch.ceil,
-        # Banker's rounding (round-half-to-even), matching torch.round's own
-        # semantics -- not "round half away from zero".
         UnaryKind.ROUND: torch.round,
         UnaryKind.EXP2: torch.exp2,
         UnaryKind.LOG2: torch.log2,

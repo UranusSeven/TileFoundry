@@ -1,4 +1,5 @@
 """SymbolRef — a module-symbol reference to a callee PrimFunction."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,7 +16,9 @@ class SymbolRef(Expr):
 
 
 def symbol_call(callee, args) -> "Evaluate":  # noqa: F821 -- lazy Evaluate
-    """Build ``Evaluate(SymbolRef(callee), args)`` — a Stmt-position call of a
+    """Build ``Evaluate(SymbolRef(callee), args)``.
+
+    Build ``Evaluate(SymbolRef(callee), args)`` — a Stmt-position call of a
     callee ``PrimFunction`` by symbol.
     """
     from tilefoundry.ir.tir.stmts import Evaluate  # noqa: PLC0415

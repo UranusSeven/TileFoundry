@@ -1,4 +1,6 @@
-"""End-to-end (parse + evaluate) tests for the unified ``range`` / ``tile``
+"""Define test grid region range nested behavior.
+
+End-to-end (parse + evaluate) tests for the unified ``range`` / ``tile``
 loop surface, nested GridRegions, and dim-expression loop bounds.
 
 ``range`` and ``tile`` share one loop domain ``(start, extent, step)`` and lower
@@ -7,6 +9,7 @@ to the same ``GridRegionExpr``; they differ only in the loop-var binding
 ``for`` loops produce nested GridRegions, and loop bounds accept dim expressions
 (e.g. ``C // N``) resolved at evaluate time.
 """
+
 from __future__ import annotations
 
 import torch
@@ -34,8 +37,7 @@ def _range_start_step(x: Tensor[(_M,), "f32"]) -> Tensor[(), "f32"]:
 
 @func
 def _nested_sum(x: Tensor[(_M, _K), "f32"]) -> Tensor[(), "f32"]:
-    # `total` is bound before the outer loop and rebound ONLY inside the inner
-    # loop — exercises the recursive carry scan + nested GridRegions.
+
     total = tf.reduce(x, axes=(0, 1), keepdim=False, kind=_SUM)
     total = tf.full_like(total, value=0.0)
     for r in range(_M):  # noqa: F821
@@ -55,8 +57,11 @@ def _dim_expr_half_sum(x: Tensor[(_M,), "f32"]) -> Tensor[(), "f32"]:
 
 
 def test_range_start_step():
-    """The three-argument `range` surface: a scalar loop var over a DimVar extent
-    with a non-unit start and step, none of which is unrolled."""
+    """The three-argument `range` surface.
+
+    The three-argument `range` surface: a scalar loop var over a DimVar extent
+    with a non-unit start and step, none of which is unrolled.
+    """
     n = 7
     x = torch.arange(n, dtype=torch.float32)
     out = evaluate(_range_start_step, x, device="cpu")
@@ -76,11 +81,6 @@ def test_dim_expression_extent():
     assert torch.allclose(out.reshape(()), x[: n // 2].sum()), (n, out)
 
 
-# ── interleaved two-partial reduction == flat reduction --------------------
-# The split-KV decomposition relies on: partition the reduction axis across
-# `NUM_SPLITS` partials (partial p owns indices ≡ p mod N), reduce each
-# independently, then combine. For a plain sum this must equal the flat sum.
-
 _NSPLIT = 2
 
 
@@ -94,12 +94,12 @@ def _interleaved_two_partial_sum(x: Tensor[(_M,), "f32"]) -> Tensor[(), "f32"]:
         for i in tile(_M // _NSPLIT):  # noqa: F821 — inner: this partial's indices
             idx = p + i * _NSPLIT
             pacc = pacc + tf.gather(x, idx, axis=0)
-        g = g + pacc  # combine partials
+        g = g + pacc
     return g
 
 
 def test_interleaved_partial_reduction_equals_flat():
-    n = 6  # multiple of NUM_SPLITS
+    n = 6
     x = torch.randn(n)
     out = evaluate(_interleaved_two_partial_sum, x, device="cpu")
     assert torch.allclose(out.reshape(()), x.sum(), atol=1e-4), (n, out)

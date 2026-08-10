@@ -5,9 +5,10 @@ new axis, or when a ``Split``-bound position divides across a new-axis boundary
 at a point its bound mesh extent evenly divides (``Split`` relocates to the
 mesh-extent-sized sub-position, keeping local extent 1, with any remainder
 carried forward as a plain layout position); a reshape that cannot be expressed
-either way fails closed (no fake layout). See ``docs/spec/hir.md`` [hir §1.3](docs/spec/hir.md#13-op)
-``Reshape``.
+either way fails closed (no fake layout). See
+[hir §1.3](docs/spec/hir.md#13-op) ``Reshape``.
 """
+
 from __future__ import annotations
 
 import torch
@@ -40,22 +41,26 @@ def _reshape(new_shape):
 
 
 def _split_mesh_axes(ty) -> set:
-    """Mesh axes carrying a genuine `Split` in *ty*'s output layout — the
+    """Mesh axes carrying a genuine `Split` in *ty*'s output layout.
+
+    Mesh axes carrying a genuine `Split` in *ty*'s output layout — the
     public "did the sharding survive" signal, independent of which layout
-    position a `Split` happens to reference internally."""
+    position a `Split` happens to reference internally.
+    """
     return {i for i, a in enumerate(ty.layout.attrs) if isinstance(a, Split)}
 
 
 def _partial_reductions(ty) -> dict:
-    """Mesh axes carrying a `Partial` in *ty*'s output layout, keyed by mesh
-    axis and valued by reduction op."""
+    """Partial reductions.
+
+    Mesh axes carrying a `Partial` in *ty*'s output layout, keyed by mesh
+    axis and valued by reduction op.
+    """
     return {i: a.reduction for i, a in enumerate(ty.layout.attrs) if isinstance(a, Partial)}
 
 
 def test_plain_c_order_layout_is_derived_when_reshape_is_a_view():
-    source = make_tensor_type(
-        (16, 8), layout=Layout(shape=(16, 8), strides=(8, 1))
-    )
+    source = make_tensor_type((16, 8), layout=Layout(shape=(16, 8), strides=(8, 1)))
     ty = infer_call(_reshape((8, 16)), source)
 
     assert ty.layout == Layout(shape=(8, 16), strides=(16, 1))
@@ -63,17 +68,18 @@ def test_plain_c_order_layout_is_derived_when_reshape_is_a_view():
 
 
 def test_noncontiguous_plain_layout_is_not_claimed_as_a_reshape_view():
-    source = make_tensor_type(
-        (8, 16), layout=Layout(shape=(8, 16), strides=(1, 8))
-    )
+    source = make_tensor_type((8, 16), layout=Layout(shape=(8, 16), strides=(1, 8)))
 
     assert infer_call(_reshape((128,)), source).layout is None
 
 
 def test_straddling_split_fails_closed():
-    """layout position 0 (size 6) would divide across the new size-3 boundary,
+    """Test straddling split fails closed.
+
+    Layout position 0 (size 6) would divide across the new size-3 boundary,
     but the mesh extent (2) does not divide the outer sub-factor (3) -> the
-    split genuinely straddles a device boundary and stays rejected."""
+    split genuinely straddles a device boundary and stays rejected.
+    """
     run_typeinfer_case(
         TypeInferCase(
             "straddle_fails_closed",
@@ -84,11 +90,6 @@ def test_straddling_split_fails_closed():
     )
 
 
-# ── sharded carries ───────────────────────────────────────────────────────
-# Each case checks output shape and which mesh axes stay `Split` / `Partial`,
-# not the internal layout factorization a valid `Reshape` might produce.
-
-
 def test_merge_carries():
     """Merge: layout (16, 8) -> (128,); the Split-bound mesh axis survives."""
     ty = infer_call(_reshape((128,)), make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(0),)))
@@ -97,9 +98,12 @@ def test_merge_carries():
 
 
 def test_split_remaps_partial_carries():
-    """On a two-axis mesh, the `Split` mesh axis survives the reshape while
+    """On a two-axis mesh, the `Split` mesh axis survives the reshape while the `Partial` mesh axis.
+
+    On a two-axis mesh, the `Split` mesh axis survives the reshape while
     the `Partial` mesh axis — a value state with no layout axis of its own —
-    carries through unchanged."""
+    carries through unchanged.
+    """
     ty = infer_call(
         _reshape((1, 32, 128)),
         make_shard_tensor_type((32, 128), mesh=make_mesh((2, 2)), attrs=(Split(0), Partial("sum"))),
@@ -110,9 +114,12 @@ def test_split_remaps_partial_carries():
 
 
 def test_split_divides_carries():
-    """layout position 0 (size 16) divides across the new size-4 boundary: the
+    """Layout position 0 (size 16) divides across the new size-4 boundary.
+
+    Layout position 0 (size 16) divides across the new size-4 boundary: the
     outer sub-factor (4) is exactly the mesh extent, so the Split-bound mesh
-    axis survives with local extent 1 ([shard §7.1.1](docs/spec/shard.md#711-layoutshape))."""
+    axis survives with local extent 1 ([shard §7.1.1](docs/spec/shard.md#711-layoutshape)).
+    """
     ty = infer_call(_reshape((4, 32)), make_shard_tensor_type((16, 8), mesh=_M, attrs=(Split(0),)))
     assert tuple(ty.shape) == (4, 32)
     assert _split_mesh_axes(ty) == {0}
@@ -120,14 +127,18 @@ def test_split_divides_carries():
 
 
 def test_reshape_then_reshard_rmem_no_split_aliasing():
-    """A flat split dim (4096) splits into (32, 128): the outer sub-factor (32)
+    """A flat split dim (4096) splits into (32, 128).
+
+    A flat split dim (4096) splits into (32, 128): the outer sub-factor (32)
     is divisible by the mesh extent (4) but exceeds it, so the `Split`-bound mesh
-    axis must still keep local extent 1 ([shard §7.1.1](docs/spec/shard.md#711-layoutshape)) after the
-    further factorization — and a follow-on `Reshard(rmem)`, which assigns
-    stride 0 to every `Split`-bound layout dim, is what makes a lost local
-    extent observable: it would alias distinct per-device coordinates onto one
-    physical slot."""
-    reshaped = infer_call(_reshape((32, 128)), make_shard_tensor_type((4096,), mesh=_M, attrs=(Split(0),)))
+    axis must still keep local extent 1
+    ([shard §7.1.1](docs/spec/shard.md#711-layoutshape)) after further
+    factorization. A follow-on `Reshard(rmem)` assigns stride 0 to split-bound
+    layout dims, making a lost local extent observable as physical aliasing.
+    """
+    reshaped = infer_call(
+        _reshape((32, 128)), make_shard_tensor_type((4096,), mesh=_M, attrs=(Split(0),))
+    )
     assert _split_mesh_axes(reshaped) == {0}
     assert split_local_extents(reshaped) == [1]
     sl = reshaped.layout
@@ -145,22 +156,17 @@ def test_reshape_then_reshard_rmem_no_split_aliasing():
     local = shard_layout_local_shape(resharded.layout)
     strides = resharded.layout.layout.strides
     aliased = [
-        i for i, (extent, stride) in enumerate(zip(local, strides))
-        if stride == 0 and extent > 1
+        i for i, (extent, stride) in enumerate(zip(local, strides)) if stride == 0 and extent > 1
     ]
     assert not aliased, (
-        f"stride-0 axes with local extent > 1: {aliased} "
-        f"(local={local}, strides={strides})"
+        f"stride-0 axes with local extent > 1: {aliased} (local={local}, strides={strides})"
     )
 
 
-# A symbolic target axis (op metadata, not input data) inferred from the input.
 _S = DimVar(name="seq_len", lo=1, hi=4096)
 
 
 def test_reshape_evaluate_dynamic_axis_inferred():
     torch.manual_seed(0)
     x = torch.randn(1, 6, 8)
-    run_eval_case(
-        EvalCase("", Reshape(new_shape=(1, _S, 2, 4)), (x,), x.reshape(1, 6, 2, 4))
-    )
+    run_eval_case(EvalCase("", Reshape(new_shape=(1, _S, 2, 4)), (x,), x.reshape(1, 6, 2, 4)))

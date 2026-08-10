@@ -7,6 +7,7 @@ localises one such construction; the well-formed path is a runtime witness
 (``tests/e2e/test_dynamic_shape_dispatch.py``) and a lowering witness
 (``tests/ir/test_specialization_lowering.py``).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -51,9 +52,7 @@ def _build_module(
         subjects = (ShapeOf(type=_scalar_i32(), param=x_entry, axis=0),)
     if case_patterns is None:
         case_patterns = tuple(
-            # Non-overlapping closed ranges: [1,3], [4,6], [7,9], ...
-            (DimVarRangePat(dim_var="S", lo=1 + 3 * i, hi=3 + 3 * i),)
-            for i in range(callee_count)
+            (DimVarRangePat(dim_var="S", lo=1 + 3 * i, hi=3 + 3 * i),) for i in range(callee_count)
         )
     dc = DispatchCall(
         callee_name="main",
@@ -71,22 +70,25 @@ def _build_module(
 
 
 def test_subject_must_be_a_shape_of_an_enclosing_param_axis() -> None:
-    """The subject is the one value read at runtime to pick an arm. It must be a
+    """The subject is the one value read at runtime to pick an arm.
+
+    The subject is the one value read at runtime to pick an arm. It must be a
     ``ShapeOf``, of a param the enclosing PrimFunction actually declares (so the
     kernel is passed that extent), at an axis that param has. A stranger Var or an
-    out-of-rank axis would read memory the launch never bound."""
+    out-of-rank axis would read memory the launch never bound.
+    """
     x_entry = Var(type=_x_type(), name="x")
     with pytest.raises(VerifyError, match="ShapeOf"):
         verify_module(_build_module(subjects=(x_entry,)))
 
     stranger = Var(type=_x_type(), name="stranger")
     with pytest.raises(VerifyError, match="not one of the enclosing"):
-        verify_module(_build_module(
-            subjects=(ShapeOf(type=_scalar_i32(), param=stranger, axis=0),),
-        ))
+        verify_module(
+            _build_module(
+                subjects=(ShapeOf(type=_scalar_i32(), param=stranger, axis=0),),
+            )
+        )
 
-    # The axis check is contextual against the enclosing PrimFunction, so the
-    # same Var identity must be threaded through both params and the subject.
     callee = PrimFunction(
         name="main$S$variant_0",
         params=(Var(type=_x_type(), name="x"),),
@@ -105,58 +107,72 @@ def test_subject_must_be_a_shape_of_an_enclosing_param_axis() -> None:
 
 
 def test_case_patterns_must_be_one_range_per_arm() -> None:
-    """Every arm is selected by a ``DimVarRangePat``, and there are exactly as many
+    """Every arm is selected by a ``DimVarRangePat``.
+
+    Every arm is selected by a ``DimVarRangePat``, and there are exactly as many
     pattern tuples as calls: a shorter list silently drops an arm, and a
-    non-range pattern has no runtime comparison to lower to."""
+    non-range pattern has no runtime comparison to lower to.
+    """
     with pytest.raises(VerifyError, match="DimVarRangePat"):
-        verify_module(_build_module(case_patterns=(
-            (DimVarRangePat(dim_var="S", lo=1, hi=4),),
-            (ScalarPat(),),
-        )))
+        verify_module(
+            _build_module(
+                case_patterns=(
+                    (DimVarRangePat(dim_var="S", lo=1, hi=4),),
+                    (ScalarPat(),),
+                )
+            )
+        )
 
     with pytest.raises(VerifyError, match="len\\(case_patterns\\)"):
-        verify_module(_build_module(case_patterns=(
-            (DimVarRangePat(dim_var="S", lo=1, hi=4),),
-        )))
+        verify_module(_build_module(case_patterns=((DimVarRangePat(dim_var="S", lo=1, hi=4),),)))
 
 
 def test_dispatch_call_rejects_multi_axis() -> None:
-    """Dispatch selects on a single extent; a second subject would need a product
-    of ranges no lowering produces."""
+    """Dispatch selects on a single extent.
+
+    Dispatch selects on a single extent; a second subject would need a product
+    of ranges no lowering produces.
+    """
     x_entry = Var(type=_x_type(), name="x")
     with pytest.raises(VerifyError, match="len\\(subjects\\) == 1"):
-        verify_module(_build_module(
-            subjects=(
-                ShapeOf(type=_scalar_i32(), param=x_entry, axis=0),
-                ShapeOf(type=_scalar_i32(), param=x_entry, axis=1),
-            ),
-            case_patterns=(
-                (
-                    DimVarRangePat(dim_var="S", lo=1, hi=4),
-                    DimVarRangePat(dim_var="T", lo=1, hi=4),
+        verify_module(
+            _build_module(
+                subjects=(
+                    ShapeOf(type=_scalar_i32(), param=x_entry, axis=0),
+                    ShapeOf(type=_scalar_i32(), param=x_entry, axis=1),
                 ),
-                (
-                    DimVarRangePat(dim_var="S", lo=4, hi=7),
-                    DimVarRangePat(dim_var="T", lo=4, hi=7),
+                case_patterns=(
+                    (
+                        DimVarRangePat(dim_var="S", lo=1, hi=4),
+                        DimVarRangePat(dim_var="T", lo=1, hi=4),
+                    ),
+                    (
+                        DimVarRangePat(dim_var="S", lo=4, hi=7),
+                        DimVarRangePat(dim_var="T", lo=4, hi=7),
+                    ),
                 ),
-            ),
-        ))
+            )
+        )
 
 
 def test_dispatch_call_rejects_non_abort_fallback() -> None:
-    """An unmatched extent must abort. Returning instead would leave the output
-    buffer untouched and look like a numerical bug."""
+    """An unmatched extent must abort.
+
+    An unmatched extent must abort. Returning instead would leave the output
+    buffer untouched and look like a numerical bug.
+    """
     with pytest.raises(VerifyError, match="Sequential\\(\\(Abort"):
         verify_module(_build_module(fallback=Sequential(body=(Return(),))))
 
 
 def test_symbol_call_rejects_nonempty_nested() -> None:
-    """verify rejects an ``Evaluate(SymbolRef)`` whose ``nested`` is non-empty
-    (nested MUST be empty under the top-level-only module)."""
+    """Verify rejects an ``Evaluate`` whose ``nested`` is non-empty.
+
+    Verify rejects an ``Evaluate(SymbolRef)`` whose ``nested`` is non-empty
+    (nested MUST be empty under the top-level-only module).
+    """
     x_callee = Var(type=_x_type(), name="x")
-    callee = PrimFunction(
-        name="callee", params=(x_callee,), body=Sequential(body=(Return(),))
-    )
+    callee = PrimFunction(name="callee", params=(x_callee,), body=Sequential(body=(Return(),)))
     x_entry = Var(type=_x_type(), name="x")
     bad = Evaluate(
         callable=SymbolRef(
@@ -166,8 +182,6 @@ def test_symbol_call_rejects_nonempty_nested() -> None:
         ),
         args=(x_entry,),
     )
-    entry = PrimFunction(
-        name="main", params=(x_entry,), body=Sequential(body=(bad,))
-    )
+    entry = PrimFunction(name="main", params=(x_entry,), body=Sequential(body=(bad,)))
     with pytest.raises(VerifyError, match="nested"):
         verify_module([entry, callee])

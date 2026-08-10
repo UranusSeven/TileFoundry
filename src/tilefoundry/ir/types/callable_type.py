@@ -15,6 +15,7 @@ class CallableType:
     they live on ``tilefoundry.runtime.module.CallableType`` /
     ``ParamABI``, which is a separate layer.
     """
+
     return_type: Type
     parameters: tuple[Type, ...]
 
@@ -32,7 +33,9 @@ def callable_type_for(params, return_type: Type) -> CallableType:
 
 
 def callable_type_for_prim_function(fn) -> CallableType:
-    """``CallableType`` of a TIR ``PrimFunction`` callee: its parameter types
+    """``CallableType`` of a TIR ``PrimFunction`` callee.
+
+    ``CallableType`` of a TIR ``PrimFunction`` callee: its parameter types
     and a ``UnitType`` return — a prim_function returns no value, its outputs
     are trailing params.
     """

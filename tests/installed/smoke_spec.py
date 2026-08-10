@@ -20,7 +20,7 @@ def test_spec_outlines_a_document_rather_than_printing_it(tf, shipped) -> None:
     done = tf("spec", "dsl")
     assert done.returncode == 0, done.stderr
     outline = done.stdout
-    # `dsl` is an alias for hir.md, so this is the document being outlined.
+
     whole = (Path(shipped["spec"]) / "hir.md").read_text(encoding="utf-8")
 
     assert "Silu" in outline and "silu" in outline
@@ -50,9 +50,12 @@ def test_spec_lists_and_prints_cache_update(tf) -> None:
 
 
 def test_spec_separates_two_sections_that_would_share_a_key(tf) -> None:
-    """`tir.md` names a field `name` twice, under `SymbolRef` and under
+    """`tir.md` names a field `name` twice, under `SymbolRef` and under `MmaOpSpec`.
+
+    `tir.md` names a field `name` twice, under `SymbolRef` and under
     `MmaOpSpec`. Each is reachable by its enclosing section; the bare key is
-    not, because it would have to pick one."""
+    not, because it would have to pick one.
+    """
     symbol = tf("spec", "tir", "symbolref/name")
     assert symbol.returncode == 0, symbol.stderr
     assert "canonical name of a `PrimFunction`" in symbol.stdout
@@ -83,9 +86,7 @@ def test_spec_rejects_a_section_that_does_not_exist(tf) -> None:
         ("cli", "check", "A FAIL with `--inputs random`"),
     ),
 )
-def test_spec_answers_askable_rules(
-    tf, topic, section, expected
-) -> None:
+def test_spec_answers_askable_rules(tf, topic, section, expected) -> None:
     done = tf("spec", topic, section)
     assert done.returncode == 0, done.stderr
     assert expected in done.stdout

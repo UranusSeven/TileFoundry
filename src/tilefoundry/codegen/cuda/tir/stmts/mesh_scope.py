@@ -1,5 +1,8 @@
-"""Emitter for `tir.MeshScope` — emits a C++ block + comment marker +
-constexpr Mesh type alias ([runtime §2.3](docs/spec/runtime.md#23-tilefoundrymesh))."""
+"""Emit CUDA mesh scopes.
+
+Emitter for `tir.MeshScope` — emits a C++ block + comment marker +
+constexpr Mesh type alias ([runtime §2.3](docs/spec/runtime.md#23-tilefoundrymesh)).
+"""
 
 from __future__ import annotations
 
@@ -13,10 +16,13 @@ from tilefoundry.target import validate_cuda_topology_levels
 
 
 def _validate_topology(mesh, target) -> None:
-    """Each program topology level a mesh binds must be one this target
+    """Validate that the target supports every program topology level.
+
+    Each program topology level a mesh binds must be one this target
     supports; finer levels (e.g. warp) belong in the mesh layout, not as a
     program topology level. Defense-in-depth alongside the declared-topology
-    check at lowering entry."""
+    check at lowering entry.
+    """
     validate_cuda_topology_levels(target, (t.name for t in mesh.topologies))
 
 
@@ -34,8 +40,11 @@ def _mesh_type(mesh) -> str:
 
 
 def _is_dynamic_mesh(mesh) -> bool:
-    """A launch-provided (dynamic) CTA mesh: its topology size or a layout axis
-    extent is ``None`` and only known at launch time."""
+    """A launch-provided (dynamic) CTA mesh.
+
+    A launch-provided (dynamic) CTA mesh: its topology size or a layout axis
+    extent is ``None`` and only known at launch time.
+    """
     if mesh.topologies[0].size is None:
         return True
     return any(s is None for s in mesh.layout.shape)
@@ -48,10 +57,10 @@ def _emit(node: MeshScope, ctx: CodegenContext) -> None:
     _validate_topology(node.mesh, ctx.target)
     name = ctx.name_for(node.binding)
     ctx.emit(f"// mesh scope: {node.mesh.topologies[0].name}")
-    # A dynamic mesh has no compile-time type: its extent comes from the launch
-    # grid, so no constexpr ``using`` alias is emitted. Shard layouts on a
-    # dynamic mesh are built as runtime values at their use sites (reshard /
-    # make_shard_tensor) rather than referencing the alias.
+
+
+
+
     if not _is_dynamic_mesh(node.mesh):
         alias = f"{name}_mesh_t"
         mesh_type_str = _mesh_type(node.mesh)

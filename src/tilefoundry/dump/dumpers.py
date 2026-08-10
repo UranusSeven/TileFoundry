@@ -1,14 +1,8 @@
-"""Dumper backends.
+"""Provide filesystem, memory, and null dump backends.
 
-``IDumpper`` is the abstract write surface. ``FileDumper`` writes to a
-filesystem root; ``MemoryDumper`` keeps an in-memory mapping for tests;
-``NullDumper`` is a singleton no-op used when no scope is active or when
-the active scope's flags are zero.
-
-A subdir-form ``DumpScope`` nests by composing the parent dumper with a
-relative path prefix — ``FileDumper.subdir(name)`` returns a new
-``FileDumper`` rooted at ``parent_root/name``; ``MemoryDumper.subdir``
-prefixes keys; ``NullDumper.subdir`` returns itself.
+Subdirectory scopes compose the parent backend with a relative prefix. File
+backends change their root, memory backends prefix shared keys, and the null
+backend returns itself.
 """
 from __future__ import annotations
 
@@ -17,11 +11,14 @@ from typing import Protocol
 
 
 class IDumpper(Protocol):
-    """Write surface used by ``DumpScope.dump`` and the top-level
+    """Write surface used by ``DumpScope.dump`` and the top-level ``tilefoundry.dump.dump`` helper.
+
+    Write surface used by ``DumpScope.dump`` and the top-level
     ``tilefoundry.dump.dump`` helper. Implementations must be safe to call
     concurrently from multiple threads (a ``ContextVar`` per call site
     isolates the active scope, but two scopes pointing at the same
-    backend may interleave writes)."""
+    backend may interleave writes).
+    """
 
     def write(self, name: str, content: str | bytes) -> None: ...
 
@@ -29,8 +26,11 @@ class IDumpper(Protocol):
 
 
 class FileDumper:
-    """Filesystem-backed dumper. ``root`` is created lazily on first write
-    so empty scopes do not litter the disk."""
+    """Filesystem-backed dumper.
+
+    Filesystem-backed dumper. ``root`` is created lazily on first write
+    so empty scopes do not litter the disk.
+    """
 
     def __init__(self, root: str | os.PathLike[str]) -> None:
         self._root = os.fspath(root)
@@ -54,10 +54,13 @@ class FileDumper:
 
 
 class MemoryDumper:
-    """In-memory dumper. Stores the latest write per logical path in
+    """In-memory dumper.
+
+    In-memory dumper. Stores the latest write per logical path in
     ``self.entries``. Subdirs prefix keys with ``f"{name}/"`` so a nested
     write to ``codegen/module.cu`` from ``DumpScope("codegen")`` lands as
-    ``codegen/module.cu`` in the parent's view."""
+    ``codegen/module.cu`` in the parent's view.
+    """
 
     def __init__(self, prefix: str = "") -> None:
         self._prefix = prefix
@@ -71,8 +74,8 @@ class MemoryDumper:
         child = MemoryDumper(
             prefix=f"{self._prefix}{name}/" if self._prefix else f"{name}/"
         )
-        # Share the same backing dict so nested writes are observable from
-        # the root MemoryDumper that tests usually hold.
+
+
         child.entries = self.entries
         return child
 

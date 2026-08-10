@@ -1,4 +1,6 @@
-"""``RuntimeResource`` — checkpoint access surface: load a tensor (or group)
+"""``RuntimeResource`` — checkpoint access surface.
+
+``RuntimeResource`` — checkpoint access surface: load a tensor (or group)
 by name, scope to a child namespace. ``DictResource`` is an in-memory/test
 double; ``SafetensorsResource`` reads a safetensors checkpoint
 directory. See [runtime §1.5](docs/spec/runtime.md#15-runtimeresource).
@@ -37,7 +39,7 @@ class Preprocessed:
             )
 
 
-# One raw name, or (one-to-many, e.g. per-expert) a tuple in declared order.
+
 AliasValue = Union[str, "tuple[str, ...]", Absolute, Preprocessed]
 AliasMap = Mapping[str, AliasValue]
 
@@ -118,8 +120,11 @@ def _reject_group(where: str, name: str, resolved: "str | tuple[str, ...]") -> s
 
 
 class RuntimeResource(Protocol):
-    """Checkpoint access surface: load one tensor (or group) by name, scope
-    to a subtree."""
+    """Checkpoint access surface: load one tensor (or group) by name, scope to a subtree.
+
+    Checkpoint access surface: load one tensor (or group) by name, scope
+    to a subtree.
+    """
 
     def load(self, name: str) -> torch.Tensor: ...
 
@@ -229,7 +234,7 @@ class SafetensorsResource:
 
         from safetensors import safe_open  # noqa: PLC0415
 
-        shard = self._index()[raw_key]  # KeyError propagates the raw key
+        shard = self._index()[raw_key]
         handle = self._handles.get(shard)
         if handle is None:
             handle = safe_open(

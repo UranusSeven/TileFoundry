@@ -27,8 +27,11 @@ _CUDA_CPP: dict[str, str] = {
 
 
 def topology_scope_str(name: str) -> str:
-    """Map a topology level name to its C++ ``tilefoundry::TopologyScope``
-    enumerator. Loud on an unknown level rather than silently defaulting."""
+    """Map a topology level name to its C++ ``tilefoundry::TopologyScope`` enumerator.
+
+    Map a topology level name to its C++ ``tilefoundry::TopologyScope``
+    enumerator. Loud on an unknown level rather than silently defaulting.
+    """
     scopes = {
         "cta": "tilefoundry::TopologyScope::cta",
         "warp": "tilefoundry::TopologyScope::warp",
@@ -54,16 +57,16 @@ class CodegenContext:
         self._var_names: dict[int, str] = {}
         self._counter = 0
         self._kernel_param_ids: set[int] = set()
-        self._mesh_aliases: dict[int, str] = {}  # id(mesh) → alias + type_string
-        # DimVar name → C++ runtime expression (typically a
-        # ``<param>_shape_<axis>`` kernel scalar identifier). Populated
-        # by the PrimFunction emitter before the body is walked so
-        # downstream emitters (binary / unary / fill / copy) can size
-        # their iteration counts at runtime when a DimVar appears.
+        self._mesh_aliases: dict[int, str] = {}
+
+
+
+
+
         self._dim_var_runtime: dict[str, str] = {}
-        # Named-barrier ids for sub-CTA ``T.sync``. Allocated implicitly per
-        # kernel (reset at each PrimFunction body); id 0 is reserved for the
-        # implicit whole-CTA barrier, so sub-CTA syncs draw from 1..15.
+
+
+
         self._next_barrier_id = 1
 
     def reset_barrier_ids(self) -> None:
@@ -76,7 +79,8 @@ class CodegenContext:
         Hardware exposes ids 0..15; id 0 is reserved for the whole-CTA barrier,
         so 1..15 are available. Each emitted ``bar.sync`` draws a fresh id; a
         sync op node emits once, so a loop body reuses its id. Raises when a
-        single kernel needs more distinct named barriers than the hardware has."""
+        single kernel needs more distinct named barriers than the hardware has.
+        """
         bid = self._next_barrier_id
         if bid > 15:
             raise ValueError(
@@ -95,8 +99,11 @@ class CodegenContext:
         return t
 
     def register_kernel_param(self, var) -> None:
-        """Called by PrimFunction emitter before emitting the body — binds
-        the param's original name and marks it as a pointer (float*)."""
+        """Called by PrimFunction emitter before emitting the body.
+
+        Called by PrimFunction emitter before emitting the body — binds
+        the param's original name and marks it as a pointer (float*).
+        """
         key = id(var)
         self._var_names[key] = var.name
         self._kernel_param_ids.add(key)
@@ -129,11 +136,14 @@ class CodegenContext:
         return "\n".join(self._lines) + "\n"
 
     def capture(self, fn) -> str:
-        """Run ``fn(ctx)`` with ``ctx._lines`` temporarily swapped for a
+        """Capture.
+
+        Run ``fn(ctx)`` with ``ctx._lines`` temporarily swapped for a
         fresh buffer, returning the text emitted during the call. Indent
         and symbol tables are preserved across the swap; only the output
         buffer is isolated. Use this to render a stmt sub-sequence into a
-        string that a Jinja template can splice in."""
+        string that a Jinja template can splice in.
+        """
         saved_lines = self._lines
         self._lines = []
         try:
@@ -143,9 +153,9 @@ class CodegenContext:
             self._lines = saved_lines
 
     def emit_node(self, node) -> None:
-        # Effect-ful Op invocation in Stmt position: Evaluate(op, args).
-        # Dispatch on the Op class; the codegen handler ABI is Call-based, so
-        # feed it a Call built from the Op and its args.
+
+
+
         if isinstance(node, Evaluate):
             op = node.callable
             op_cls = type(op)

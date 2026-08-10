@@ -1,4 +1,6 @@
-"""``candidate_atoms(op, target) -> list[AtomFact]`` -- bridge one HIR
+"""``candidate_atoms(op, target) -> list[AtomFact]``.
+
+``candidate_atoms(op, target) -> list[AtomFact]`` -- bridge one HIR
 compute op to the TIR MMA atom catalogue it could run on. It only *lists*
 candidates (a hard filter over shape/dtype/layout); it never picks one,
 that ranking is the schedule layer's CP-SAT job. See each helper's
@@ -19,62 +21,58 @@ from tilefoundry.target import Target, default_target
 from tilefoundry.target.base import target_instance
 from tilefoundry.target.cuda.target import CudaTarget
 
-# The MMA atom catalogue this bridge searches. V1 has exactly the one op
-# registered in ir.tir.cuda.nn.mma._ATOM_TABLE; add its MmaOpSpec here too
-# whenever that table gains an entry -- this is the single extension
-# point (this module cannot, and does not try to, discover
-# _ATOM_TABLE's private keys on its own).
 _MMA_OP_CATALOG: tuple[MmaOpSpec, ...] = (SM80_16x8x16_F32BF16BF16F32_TN,)
 
 
 def _is_async_op(op: MmaOpSpec) -> bool:
-    """wgmma-family instructions (SM90+) issue asynchronously; the sole
+    """wgmma-family instructions issue asynchronously; the sole registered op today is synchronous.
+
+    wgmma-family instructions (SM90+) issue asynchronously; the sole
     registered op today (SM80 ``mma.sync``) is synchronous. No wgmma
     ``MmaOpSpec`` is registered yet in ``ir.tir.cuda.nn.mma._ATOM_TABLE``, so
     this substring check is forward-compatible naming, not a real dispatch
-    -- it always returns ``False`` today."""
+    -- it always returns ``False`` today.
+    """
     return "wgmma" in op.name.lower()
 
 
 def _dense_bytes(shape: tuple[int, ...], dtype: DType) -> int:
-    """Bytes for one dense (unsharded) ``shape``/``dtype`` tile -- reuses
+    """Bytes for one dense (unsharded) ``shape``/``dtype`` tile.
+
+    Bytes for one dense (unsharded) ``shape``/``dtype`` tile -- reuses
     ``target.cuda.cost.tensor_bytes`` (the exact helper the ``MatMul`` cost
     evaluator uses for its own HBM-traffic accounting), so op-level and
     atom-level byte counts share one formula. ``storage``/``layout`` are
-    irrelevant to a byte count, so a placeholder ``GMEM`` is used."""
+    irrelevant to a byte count, so a placeholder ``GMEM`` is used.
+    """
     type = TensorType(shape=shape, dtype=dtype, layout=None, storage=StorageKind.GMEM)
     return tensor_bytes(type)
 
 
 def _fragment_reg_bytes(fragment: ShardLayout, dtype: DType) -> int:
-    """Per-thread register bytes for one A/B/C fragment: divide the
+    """Per-thread register bytes for one A/B/C fragment.
+
+    Per-thread register bytes for one A/B/C fragment: divide the
     fragment's global layout shape down to its per-thread local shape
     (``shard_layout_local_shape`` -- quotients out the Split-bound lane
     axes; see ``mma.py``'s fragment derivation comments for the 8/4/4
     elements-per-thread this yields for A/B/C), then reuse ``tensor_bytes``
     for the numel*bitwidth->bytes conversion (the same formula as
-    ``_dense_bytes``, at per-thread instead of whole-tile granularity)."""
+    ``_dense_bytes``, at per-thread instead of whole-tile granularity).
+    """
     local_shape = shard_layout_local_shape(fragment)
     type = TensorType(shape=local_shape, dtype=dtype, layout=None, storage=StorageKind.RMEM)
     return tensor_bytes(type)
 
 
 def _roofline_duration_ns(op: MmaOpSpec, target: CudaTarget) -> tuple[float, float]:
-    """Nominal roofline estimate (ns) for *one* atom instance, as
-    ``(duration, compute_only)``.
+    """Estimate nominal compute and traffic time for one CUDA MMA atom.
 
-    Mirrors ``target.cuda.planner._Planner._target_facts`` (:774): compute
-    = flops*1e9*sm_count/(peak_for(dtype)*count), memory =
-    bytes*1e9/hbm_bandwidth, duration = max(compute, memory, 1) -- simplified
-    to a single atom instance (``count=1``, one compute dtype key, no CTA
-    mesh/wave bookkeeping -- that machinery belongs to the CTA planner's P2
-    problem, not to ranking one atom). ``flops`` uses the atom's own MNK
-    (2*m*n*k, mirroring ``target.cuda.cost``'s ``MatMul`` evaluator's
-    ``2*batch*m*k*n`` with batch=1); ``moved_bytes`` is the atom's dense
-    A+B+C tile traffic. The compute-only half is returned separately for a
-    consumer that accounts the surrounding traffic itself. This is a
-    *nominal* estimate -- ``AtomFact.duration`` is an explicit placeholder
-    for a real measured number, not a claim of accuracy.
+    Compute uses the atom's MNK flops, device peak throughput, and SM count;
+    memory uses dense A+B+C bytes and HBM bandwidth. Return the maximum with a
+    one-nanosecond floor and the compute-only time so callers that account for
+    traffic do not charge it twice. This ranks candidates rather than
+    predicting measured performance.
     """
     m, n, k = op.shape_mnk
     flops = 2 * m * n * k
@@ -90,13 +88,16 @@ def _roofline_duration_ns(op: MmaOpSpec, target: CudaTarget) -> tuple[float, flo
 
 
 def _operands_layout_ok(lhs: TensorType, rhs: TensorType) -> bool:
-    """V1 layout hard filter: the registered fragment layouts
+    """V1 layout hard filter.
+
+    V1 layout hard filter: the registered fragment layouts
     (``ir.tir.cuda.nn.mma``) are derived for dense, unsharded row-major
     operands -- the sole ``operand_layout="TN"`` convention today. A
     ShardLayout-carrying operand may need a pack/repack step to feed this
     atom; V1 defers that to an agent-filled hole (out of scope for this
     bridge) and simply excludes such operands from candidacy here, rather
-    than erroring."""
+    than erroring.
+    """
     return lhs.layout is None and rhs.layout is None
 
 

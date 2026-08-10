@@ -7,6 +7,7 @@ fail, it silently leaves an allocation out of the schedule it is supposed to
 place, and the arm most easily missed is the one a hand-rolled walk does not know
 about.
 """
+
 from __future__ import annotations
 
 from tests.fixtures.demo_ir import build_demo
@@ -35,15 +36,17 @@ def test_bufferize_returns_module_unchanged():
     pf_before, module = _lower()
     new_module = BufferizePass().run(module)
     [pf_after] = new_module.functions
-    # Trivial policy: each logical buffer keeps its own AllocTensor; IR
-    # identity is preserved (PrimFuncPass returns the same fn object).
+
     assert pf_after is pf_before
 
 
 def test_lifetime_collector_finds_buffer_inside_dispatch_call_fallback():
-    """A buffer allocated inside a ``DispatchCall``'s ``fallback`` arm must
+    """A buffer allocated inside a ``DispatchCall``'s ``fallback`` arm must be collected.
+
+    A buffer allocated inside a ``DispatchCall``'s ``fallback`` arm must
     be collected. A hand-rolled Stmt walk without ``DispatchCall`` coverage
-    silently skips it ([visitor-mutator §1](docs/spec/visitor-mutator.md#1-role))."""
+    silently skips it ([visitor-mutator §1](docs/spec/visitor-mutator.md#1-role)).
+    """
     buf_type = TensorType(shape=(4,), dtype=DType.f32, layout=None, storage=StorageKind.RMEM)
     buf_var = Var(type=buf_type, name="buf")
     alloc_call = Call(type=buf_type, target=AllocTensorOp(tensor_type=buf_type), args=())

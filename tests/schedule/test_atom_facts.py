@@ -1,4 +1,6 @@
-"""``candidate_atoms(op, target) -> list[AtomFact]`` -- the CUDA target's
+"""``candidate_atoms(op, target) -> list[AtomFact]`` -- the CUDA target's own candidate enumeration.
+
+``candidate_atoms(op, target) -> list[AtomFact]`` -- the CUDA target's
 own candidate enumeration: HIR ``MatMul`` op + target -> the MMA atom
 candidates it could run on (a hard filter over shape/dtype/layout; no
 CP-SAT ranking, which is the solver's own subject).
@@ -7,6 +9,7 @@ Builds a bf16 gemm HIR function -- bf16 being the sole dtype the one registered
 SM80 atom accepts -- and checks the listed ``AtomFact`` against that atom's
 real, known numbers, not just non-empty/non-zero placeholders.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -61,10 +64,13 @@ def gemm_rmsnorm(
 
 
 def test_bf16_gemm_lists_the_sm80_atom_with_real_numbers():
-    """The sole registered atom (SM80 16x8x16, bf16 x bf16 -> f32) is a
+    """Test bf16 gemm lists the sm80 atom with real numbers.
+
+    The sole registered atom (SM80 16x8x16, bf16 x bf16 -> f32) is a
     candidate for a bf16 gemm whose M/N/K (64, 64, 128) all divide its
     (16, 8, 16) shape; every ``AtomFact`` field is checked against the
-    atom's own known real numbers."""
+    atom's own known real numbers.
+    """
     facts = candidate_atoms(bf16_gemm.entry_function().body, bf16_gemm.resolve_target())
 
     print("\n=== candidate AtomFacts (bf16 gemm, M=64 N=64 K=128) ===")
@@ -80,12 +86,10 @@ def test_bf16_gemm_lists_the_sm80_atom_with_real_numbers():
     assert isinstance(fact.atom, MmaAtom)
     assert fact.atom.op is SM80_16x8x16_F32BF16BF16F32_TN
 
-    # storage: per-thread fragment register bytes -- 8/4/4 elements per
-    # thread for A/B/C, per mma.py's own fragment-derivation comments.
     assert fact.storage == {
-        "a_reg_bytes": 16,  # 8 bf16 elements * 2 bytes
-        "b_reg_bytes": 8,   # 4 bf16 elements * 2 bytes
-        "c_reg_bytes": 16,  # 4 f32 elements * 4 bytes
+        "a_reg_bytes": 16,
+        "b_reg_bytes": 8,
+        "c_reg_bytes": 16,
         "reg_bytes": 40,
     }
     assert fact.resource == {"lane": 32}
@@ -112,15 +116,21 @@ def test_a_gemm_the_atom_cannot_run_lists_no_candidate():
 
 
 def test_non_matmul_op_raises():
-    """V1 supports a MatMul Call only; any other op (here RMSNorm, from
+    """V1 supports a MatMul Call only.
+
+    V1 supports a MatMul Call only; any other op (here RMSNorm, from
     ``gemm_rmsnorm``'s body) raises a clear ``NotImplementedError`` rather
-    than silently returning ``[]``."""
+    than silently returning ``[]``.
+    """
     with pytest.raises(NotImplementedError):
         candidate_atoms(gemm_rmsnorm.body)
 
 
 def test_non_cuda_target_raises():
-    """V1 supports ``CudaTarget`` only -- no per-atom device facts
-    (sm_count / hbm_bandwidth / peak_for) exist for a CPU target."""
+    """V1 supports ``CudaTarget`` only -- no per-atom device facts exist for a CPU target.
+
+    V1 supports ``CudaTarget`` only -- no per-atom device facts
+    (sm_count / hbm_bandwidth / peak_for) exist for a CPU target.
+    """
     with pytest.raises(NotImplementedError):
         candidate_atoms(bf16_gemm.entry_function().body, target=CpuTarget())

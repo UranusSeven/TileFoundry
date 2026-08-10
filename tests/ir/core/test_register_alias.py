@@ -1,4 +1,6 @@
-"""The op registry as a table: what a name resolves to, and how many things it
+"""The op registry as a table: what a name resolves to.
+
+The op registry as a table: what a name resolves to, and how many things it
 may resolve to.
 
 Kinded sugar names (``add`` / ``sub`` / ...) resolve to a single alias schema;
@@ -41,14 +43,14 @@ def clean_schema_registry():
     _schemas_by_dialect_name.update(snapshot)
 
 
-# ── Registry shape ──────────────────────────────────────────────────────
-
-
 def test_kinded_alias_registers_one_schema_no_legacy_op() -> None:
-    """A kinded sugar name resolves to exactly one schema — the alias — with
+    """A kinded sugar name resolves to exactly one schema.
+
+    A kinded sugar name resolves to exactly one schema — the alias — with
     ``op_class=None``, a callable builder, and no legacy Op class. The builder
     constructs the kinded op and reuses the static ParamDef references for its
-    signature; a binary and a unary name stand for their whole families."""
+    signature; a binary and a unary name stand for their whole families.
+    """
     schemas = get_schemas("tf", "add")
     assert len(schemas) == 1
     assert schemas[0].op_class is None
@@ -72,6 +74,7 @@ def test_kinded_alias_registers_one_schema_no_legacy_op() -> None:
 
 def test_register_op_overload_and_iter_dedupe(clean_schema_registry) -> None:
     """Multi-schema overloads append in registration order; iter dedupes names."""
+
     class _DummyBase:
         pass
 
@@ -90,15 +93,12 @@ def test_register_op_overload_and_iter_dedupe(clean_schema_registry) -> None:
     assert names.count("testdup_relu") == 1
 
 
-# ── Parser end-to-end ──────────────────────────────────────────────────
-
-
 @func
 def _alias_call(
-    a: Tensor[(8,), DType.f32], b: Tensor[(8,), DType.f32],
+    a: Tensor[(8,), DType.f32],
+    b: Tensor[(8,), DType.f32],
 ) -> Tensor[(8,), DType.f32]:
-    # Bare ``add`` is bound by ``from tilefoundry.dsl.tf import add`` at
-    # the top of this test file (closure capture).
+
     return _tf_add(a, b)
 
 

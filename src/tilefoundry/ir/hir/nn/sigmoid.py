@@ -18,7 +18,6 @@ from tilefoundry.visitor_registry.access_relation import (
 )
 from tilefoundry.visitor_registry.isl_utility import to_domain
 
-# Monotone non-decreasing: commutes with max/min, not sum.
 _COMMUTES_WITH = frozenset({"max", "min"})
 
 
@@ -29,9 +28,12 @@ class Sigmoid(Op):
 
 @register_type_relation(Sigmoid)
 def _sigmoid_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Forward access relation for the elementwise Sigmoid: single input, no
+    """Forward access relation for the elementwise Sigmoid.
+
+    Forward access relation for the elementwise Sigmoid: single input, no
     broadcast, no reduction -- the iteration domain is the input shape and
-    both the input map and the output map are the identity."""
+    both the input map and the output map are the identity.
+    """
     (x,) = input_types
     domain, param_map = to_domain(x.shape)
     dims = [f"d{i}" for i in range(len(x.shape))]

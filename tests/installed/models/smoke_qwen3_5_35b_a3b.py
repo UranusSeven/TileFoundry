@@ -5,6 +5,7 @@ a later layer, and the MoE block. They are three corpus entries because a Module
 the execution domain of the functions it owns, and only the full-attention one leaves
 a context length open to be asked at a size.
 """
+
 from __future__ import annotations
 
 import contract
@@ -17,16 +18,13 @@ MODEL = "qwen3_5_35b_a3b"
 CASES = contract.model_cases(MODEL)
 
 ANALYSED = [
-    pytest.param(case, selected, id=selected.id)
-    for case in CASES
-    for selected in case.analyze
+    pytest.param(case, selected, id=selected.id) for case in CASES for selected in case.analyze
 ]
 PLANNED = [
-    pytest.param(case, planned, id=planned.id)
-    for case in CASES
-    for planned in case.schedule
+    pytest.param(case, planned, id=planned.id) for case in CASES for planned in case.schedule
 ]
 SIZED = [pytest.param(case, sized, id=sized.id) for case in CASES for sized in case.sized]
+
 
 @pytest.mark.parametrize(("case", "selected"), ANALYSED)
 def test_every_selected_function_analyses(tf, shipped_source, case, selected) -> None:
@@ -41,18 +39,11 @@ def test_every_selected_function_plans(tf, shipped_source, case, planned) -> Non
 
 
 @pytest.mark.parametrize(("case", "sized"), SIZED)
-def test_every_analysis_answers_at_the_largest_context(
-    tf, shipped_source, case, sized
-) -> None:
+def test_every_analysis_answers_at_the_largest_context(tf, shipped_source, case, sized) -> None:
     """At the ceiling the case states, not at a sample of it."""
-    contract.analysed_every_family(
-        tf, shipped_source(MODEL), case, sized.selector, sized.ceiling
-    )
+    contract.analysed_every_family(tf, shipped_source(MODEL), case, sized.selector, sized.ceiling)
 
 
-# ── against Hugging Face ─────────────────────────────────────────────────────
-#: Two lengths, so a mixer that only works at the length it was authored against
-#: cannot pass.
 CTX_LENGTHS = (25, 40)
 
 FULL = next(case for case in CASES if case.id.endswith("full_attention"))
@@ -61,7 +52,9 @@ LINEAR = next(case for case in CASES if case.id == "qwen3_5_35b_a3b")
 
 @pytest.mark.parametrize("ctx_len", CTX_LENGTHS)
 def test_full_attention_matches_hugging_face(tf, shipped_source, tmp_path, ctx_len) -> None:
-    """`full_attention` -- input_layernorm plus GQA with per-head q_norm/k_norm,
+    """Test full attention matches hugging face.
+
+    `full_attention` -- input_layernorm plus GQA with per-head q_norm/k_norm,
     partial RoPE and the output gate, over the cache and the new token -- against
     Hugging Face's own attention at the decoded position, at two lengths.
 
@@ -78,7 +71,11 @@ def test_full_attention_matches_hugging_face(tf, shipped_source, tmp_path, ctx_l
 
     assert want_key.shape[1] == ctx_len + 1
     contract.compared(
-        tf, tmp_path, shipped_source(MODEL), FULL, "full_attention",
+        tf,
+        tmp_path,
+        shipped_source(MODEL),
+        FULL,
+        "full_attention",
         activations=(step.hidden_new, *step.mixer_acts),
         weights=loaded.constants,
         expected=(want, entry_key, entry_value),
@@ -93,26 +90,26 @@ def test_full_attention_matches_hugging_face(tf, shipped_source, tmp_path, ctx_l
 
 @pytest.mark.parametrize("ctx_len", CTX_LENGTHS)
 def test_linear_attention_matches_hugging_face(tf, shipped_source, tmp_path, ctx_len) -> None:
-    """`linear_attention` -- input_layernorm plus the causal convolution,
-    L2-normalised query and key, the gated delta rule and the gated output norm --
-    against Hugging Face's own mixer at the decoded position, at two lengths.
+    """Test linear attention matches hugging face.
 
-    The returned convolution column and recurrent matrix are the state a caller
-    holds afterwards, compared against a state rebuilt one token longer. For the
-    recurrent matrix that is the failure worth guarding, since its shape gives
-    nothing away. No `--dim`: this mixer's state is a fixed-size recurrent matrix
-    rather than a growing cache, so it leaves no dimension open to bind -- the two
-    lengths differ in the context the oracle was drawn over, not in the kernel.
+    Compare normalization, convolution, gated delta rule, and output normalization
+    with Hugging Face at two lengths. Returned convolution and recurrent state are
+    checked against an oracle advanced one token. The fixed-size state exposes no
+    ``--dim``; lengths vary oracle context, not kernel shape.
     """
     step = reference.linear_step(ctx_len=ctx_len, device="cpu")
     loaded = reference.load_mixer("linear_attention", step.layer)
     want = reference.linear_mixer_oracle(step)
     want_conv, want_state = reference.advanced_state_oracle(step)
-    # The window slides on its last axis, so this token's column is the newest one.
+
     entry = want_conv[..., -1:]
 
     contract.compared(
-        tf, tmp_path, shipped_source(MODEL), LINEAR, "linear_attention",
+        tf,
+        tmp_path,
+        shipped_source(MODEL),
+        LINEAR,
+        "linear_attention",
         activations=(step.hidden_new, *step.mixer_acts),
         weights=loaded.constants,
         expected=(want, entry, want_state),
@@ -128,7 +125,9 @@ MOE = next(case for case in CASES if case.id.endswith("_moe"))
 
 
 def test_the_moe_block_matches_hugging_face(tf, shipped_source, tmp_path) -> None:
-    """The whole block -- post_attention_layernorm plus `Qwen3_5MoeSparseMoeBlock`,
+    """Test the moe block matches hugging face.
+
+    The whole block -- post_attention_layernorm plus `Qwen3_5MoeSparseMoeBlock`,
     routed experts and the shared expert together -- against Hugging Face's own.
 
     Named as a Module so `check` compares the block's own orchestration rather than
@@ -139,7 +138,11 @@ def test_the_moe_block_matches_hugging_face(tf, shipped_source, tmp_path) -> Non
     want = reference.moe_oracle(step.layer, step.hidden_new)
 
     contract.compared(
-        tf, tmp_path, shipped_source(MODEL), MOE, "",
+        tf,
+        tmp_path,
+        shipped_source(MODEL),
+        MOE,
+        "",
         activations=(step.hidden_new,),
         weights=contract.nested_constants(loaded),
         expected=(want,),
@@ -154,7 +157,11 @@ def _linear_disagrees(tf, work, source, step, loaded, activations) -> None:
     entry = want_conv[..., -1:]
 
     contract.disagreed(
-        tf, work, source, LINEAR, "linear_attention",
+        tf,
+        work,
+        source,
+        LINEAR,
+        "linear_attention",
         activations=activations,
         weights=contract.nested_constants(loaded),
         expected=(want, entry, want_state),
@@ -166,34 +173,30 @@ def _linear_disagrees(tf, work, source, step, loaded, activations) -> None:
     )
 
 
-#: Each half of the state a linear-attention step is handed, zeroed. The step has no
-#: `ctx_len` in its signature, so nothing about its shape says it consulted the
-#: context at all -- an implementation that dropped either half would produce a
-#: plausible tensor of the right size. Zeroing has to move the answer away from the
-#: oracle the unperturbed step meets: for the recurrent matrix, otherwise every
-#: agreement above is an agreement about one token in isolation; for the convolution's
-#: left context, a kernel that convolved only the current column would be a kernel of
-#: kernel size one, and its output shape would not say so either.
 ZEROED = ["recurrent_state", "conv_state"]
 
 
 @pytest.mark.parametrize("zeroed", ZEROED)
-def test_each_half_of_the_state_reaches_the_answer(
-    tf, shipped_source, tmp_path, zeroed
-) -> None:
+def test_each_half_of_the_state_reaches_the_answer(tf, shipped_source, tmp_path, zeroed) -> None:
     step = reference.linear_step(device="cpu")
     loaded = reference.load_mixer("linear_attention", step.layer)
     held = {"conv_state": step.conv_state, "recurrent_state": step.recurrent_state}
     held[zeroed] = torch.zeros_like(held[zeroed])
 
     _linear_disagrees(
-        tf, tmp_path, shipped_source(MODEL), step, loaded,
+        tf,
+        tmp_path,
+        shipped_source(MODEL),
+        step,
+        loaded,
         (step.hidden_new, held["conv_state"], held["recurrent_state"]),
     )
 
 
 def test_the_output_gate_is_applied(tf, shipped_source, tmp_path) -> None:
-    """Half of `q_proj`'s fan-out never reaches a score, and this measures that it
+    """Half of `q_proj`'s fan-out never reaches a score.
+
+    Half of `q_proj`'s fan-out never reaches a score, and this measures that it
     reaches the output instead.
 
     The gate is a sigmoid, so it lies strictly between 0 and 1: an implementation
@@ -208,23 +211,28 @@ def test_the_output_gate_is_applied(tf, shipped_source, tmp_path) -> None:
     want = reference.full_mixer_oracle(step)
     want_key, want_value = reference.appended_cache_oracle(step)
 
-    # w_qg is [1, hidden, 2 * heads * head_dim] with the gate interleaved per head.
     neutral = dict(loaded.constants)
-    gated = neutral["w_qg"].clone().reshape(
-        1, shape.hidden_size, shape.num_attention_heads, 2 * shape.head_dim
+    gated = (
+        neutral["w_qg"]
+        .clone()
+        .reshape(1, shape.hidden_size, shape.num_attention_heads, 2 * shape.head_dim)
     )
-    gated[..., shape.head_dim:] = 0.0
+    gated[..., shape.head_dim :] = 0.0
     neutral["w_qg"] = gated.reshape(loaded.constants["w_qg"].shape)
 
     contract.disagreed(
-        tf, tmp_path, shipped_source(MODEL), FULL, "full_attention",
+        tf,
+        tmp_path,
+        shipped_source(MODEL),
+        FULL,
+        "full_attention",
         activations=(step.hidden_new, *step.mixer_acts),
         weights=neutral,
-        expected=(want, want_key[:, step.ctx_len:], want_value[:, step.ctx_len:]),
+        expected=(want, want_key[:, step.ctx_len :], want_value[:, step.ctx_len :]),
         held=(
             contract.three_roundings(want),
-            contract.three_roundings(want_key[:, step.ctx_len:]),
-            contract.three_roundings(want_value[:, step.ctx_len:]),
+            contract.three_roundings(want_key[:, step.ctx_len :]),
+            contract.three_roundings(want_value[:, step.ctx_len :]),
         ),
         dims={"ctx_len": step.ctx_len},
     )

@@ -20,7 +20,8 @@ from tilefoundry.visitor_registry import register_typeinfer
 
 @register_op(dialect="tf", category="custom", name="custom_parse_addsq")
 class CustomParseAddSq(Op):
-    """Custom op: lhs + rhs, then squared. (Test-only fixture.)"""
+    """Test-only custom op that squares the sum of its inputs."""
+
     lhs = ParamDef(kind="input", pattern=TensorPattern)
     rhs = ParamDef(kind="input", pattern=TensorPattern)
 
@@ -30,22 +31,23 @@ def _(call, ctx):
     return ctx.type_of(call.args[0])
 
 
-# Bind the registered Op class under its bare name so the ``@func`` body
-# below can call it; the parser resolves bare callees through the
-# function's closure (mirrors ``from tilefoundry.dsl.tf import *``).
 custom_parse_addsq = CustomParseAddSq
 
 
 @func
 def _use_custom_op(
-    a: Tensor[(8,), "f32"], b: Tensor[(8,), "f32"],
+    a: Tensor[(8,), "f32"],
+    b: Tensor[(8,), "f32"],
 ) -> Tensor[(8,), "f32"]:
     return custom_parse_addsq(a, b)
 
 
 def test_parse_custom_op_resolves_to_custom_op_call_target() -> None:
-    """A ``@func`` calling the registered custom op parses to a
-    ``Call`` whose target is the custom ``Op`` instance."""
+    """Test parse custom op resolves to custom op call target.
+
+    A ``@func`` calling the registered custom op parses to a
+    ``Call`` whose target is the custom ``Op`` instance.
+    """
     body = _use_custom_op.body
     assert isinstance(body, Call)
     assert isinstance(body.target, CustomParseAddSq)

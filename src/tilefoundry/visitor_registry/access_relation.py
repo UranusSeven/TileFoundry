@@ -1,22 +1,8 @@
-"""Access relation analysis registry.
+"""Register per-operation affine access relations.
 
-``AccessRelation = isl.multi_aff``. This module adds a per-op handler
-registry so each HIR op can report the
-input/output access relations at its current memory level (currently only
-the GMEM (global) black-box level is implemented).
-
-
-Usage::
-
-    from tilefoundry.visitor_registry.access_relation import (
-        register_access_relation,
-        AccessRelations,
-        OPAQUE,
-    )
-
-    @register_access_relation(MyOp)
-    def _(call, ctx):
-        return AccessRelations(inputs=(...,), outputs=(...,))
+Handlers return input and output isl relations from call types and attributes.
+``OPAQUE`` marks boundaries that cannot be expressed at the queried memory
+level. The GMEM black-box level is currently supported.
 """
 from __future__ import annotations
 
@@ -27,13 +13,11 @@ import isl
 
 from .registries import AnalysisRegistry
 
-# ─────────────────────────────────────────────────────────────────────
-# OpaqueRelation — marker for "not affine-expressible at this level"
-# ─────────────────────────────────────────────────────────────────────
-
 
 class OpaqueRelation:
-    """Marker object for an access relation that cannot be expressed in the
+    """Represent OpaqueRelation.
+
+    Marker object for an access relation that cannot be expressed in the
     affine framework at the queried memory level.
 
     Data-dependent or otherwise non-affine operations return ``OPAQUE`` for
@@ -62,14 +46,14 @@ class OpaqueRelation:
 OPAQUE = OpaqueRelation()
 
 
-# The canonical carrier is ``isl.multi_aff``; ``isl.map`` is allowed when the
-# relation is reduction-like or otherwise many-to-one.
+
+
 AccessRelation = Union["isl.multi_aff", "isl.map", OpaqueRelation]
 
 
-# ─────────────────────────────────────────────────────────────────────
-# AccessRelations — per-call result
-# ─────────────────────────────────────────────────────────────────────
+
+
+
 
 
 @dataclass(frozen=True)
@@ -87,9 +71,9 @@ class AccessRelations:
     outputs: tuple[AccessRelation, ...]
 
 
-# ─────────────────────────────────────────────────────────────────────
-# AccessRelationResult — forward relation carrier (input-type driven)
-# ─────────────────────────────────────────────────────────────────────
+
+
+
 
 
 @dataclass(frozen=True)
@@ -110,16 +94,16 @@ class AccessRelationResult:
     param_map: dict = field(default_factory=dict)
 
 
-# ─────────────────────────────────────────────────────────────────────
-# Registry
-# ─────────────────────────────────────────────────────────────────────
+
+
+
 
 
 access_relation_registry: AnalysisRegistry = AnalysisRegistry("access_relation")
 
-# Forward relation registry: handlers build the relation from input types +
-# op attributes only, so typeinfer can consume the relation without depending
-# on the (not-yet-computed) output type.
+
+
+
 type_relation_registry: AnalysisRegistry = AnalysisRegistry("type_relation")
 
 
@@ -141,7 +125,9 @@ def _identity(rank: int) -> "isl.multi_aff":
 
 
 def identity_relations(n_inputs: int) -> Callable[..., AccessRelations]:
-    """Factory for a GLOBAL-level access-relation handler whose ``n_inputs``
+    """Identity relations.
+
+    Factory for a GLOBAL-level access-relation handler whose ``n_inputs``
     inputs and single output are all elementwise identity.
 
     Each input contributes its own-rank identity; the output uses its own
@@ -173,8 +159,11 @@ def register_type_relation(op_cls: type) -> Callable[[Callable], Callable]:
 
 
 def build_relation(call, input_types, ctx) -> "AccessRelationResult | None":
-    """Build the forward access relation for *call*, or ``None`` if its op has
-    no registered builder."""
+    """Build relation.
+
+    Build the forward access relation for *call*, or ``None`` if its op has
+    no registered builder.
+    """
     fn = type_relation_registry.lookup(type(call.target))
     if fn is None:
         return None

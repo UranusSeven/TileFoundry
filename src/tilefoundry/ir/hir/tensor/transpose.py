@@ -30,17 +30,18 @@ class Transpose(Op):
     perm = ParamDef(kind="attribute", annotation=tuple)
 
 
-# GLOBAL-level: identity (the exact permutation is encoded in `perm`, not
-# duplicated in the relation at this level).
 register_access_relation(Transpose)(identity_relations(1))
 
 
 @register_type_relation(Transpose)
 def _transpose_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Forward relation for Transpose: an identity input map and an output map
+    """Forward relation for Transpose.
+
+    Forward relation for Transpose: an identity input map and an output map
     that permutes the iteration dims (output axis ``o`` reads domain dim
     ``perm[o]``). The shard engine reorders the input's layout positions by their
-    owning tensor axis, preserving any factorization."""
+    owning tensor axis, preserving any factorization.
+    """
     (x,) = input_types
     perm = call.target.perm
     rank = len(x.shape)
@@ -62,9 +63,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     new_layout = x_ty.layout
     if isinstance(x_ty.layout, ShardLayout):
         relation = build_relation(call, (x_ty,), ctx)
-        derived = derive_output_shard_layout(
-            (x_ty,), relation, new_shape, fresh_strides=False
-        )
+        derived = derive_output_shard_layout((x_ty,), relation, new_shape, fresh_strides=False)
         if derived is not None:
             new_layout = derived
     else:
@@ -73,15 +72,10 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
             new_layout = Layout(
                 shape=tuple(source.shape[p] for p in perm),
                 strides=(
-                    None
-                    if source.strides is None
-                    else tuple(source.strides[p] for p in perm)
+                    None if source.strides is None else tuple(source.strides[p] for p in perm)
                 ),
             )
-        elif (
-            isinstance(source, ComposedLayout)
-            and isinstance(source.outer, Layout)
-        ):
+        elif isinstance(source, ComposedLayout) and isinstance(source.outer, Layout):
             new_layout = ComposedLayout(
                 inner=source.inner,
                 offset=source.offset,
@@ -94,9 +88,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
                     ),
                 ),
             )
-    return TensorType(
-        shape=new_shape, dtype=x_ty.dtype, layout=new_layout, storage=x_ty.storage
-    )
+    return TensorType(shape=new_shape, dtype=x_ty.dtype, layout=new_layout, storage=x_ty.storage)
 
 
 @register_eval(Transpose)

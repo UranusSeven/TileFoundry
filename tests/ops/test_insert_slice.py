@@ -1,19 +1,12 @@
-"""HIR insert_slice (dynamic-update-slice): its bounds, and the in-place
-loop-carry lowering exercised through a single decode step.
+"""Cover InsertSlice bounds and its in-place loop-carry lowering.
 
-``insert_slice(dst, update, offsets)`` returns ``dst`` with ``update`` written
-into the per-axis window at ``offsets``. A rank-1 dst takes a single scalar
-start (a rank-0 integer tensor or an integer literal); a rank-N dst takes a
-tuple of per-axis rank-0 offsets (literals or runtime scalars).
+Rank-one destinations accept one scalar offset; higher ranks use tuples.
+Type inference checks literals while evaluation guards runtime offsets. Decode
+steps exercise the combined lowering on GPU.
 
-No corpus model calls ``insert_slice``, so this file is its whole witness. The
-bounds live in two places by necessity: a literal offset is checked at typeinfer
-and names the offending axis, while a runtime offset is invisible there and must
-be caught by the eval guard. The decode-step tests are the GPU witness for the
-in-place loop-carry lowerings (grid-region carry, ``full_like``,
-``tuple_get_item``, ``cache_update``, in-place ``insert_slice`` at a runtime
-scalar offset) and for the cross-CTA reshard-owned sync.
+See [hir §1.3](docs/spec/hir.md#13-op).
 """
+
 from __future__ import annotations
 
 import pytest
@@ -77,9 +70,11 @@ _DSL_PRELUDE = (
 
 def _eval_rankn(dst: torch.Tensor, upd: torch.Tensor, lit_offsets, runtime_axis=None):
     """Evaluate a rank-N insert_slice through the parsed DSL surface.
+
     ``lit_offsets`` are per-axis literals; if ``runtime_axis`` is given, that
     axis's offset is a runtime rank-0 i32 param carrying
-    ``lit_offsets[runtime_axis]`` instead."""
+    ``lit_offsets[runtime_axis]`` instead.
+    """
     d = ", ".join(str(int(x)) for x in dst.shape)
     u = ", ".join(str(int(x)) for x in upd.shape)
     extra_params, inputs, elems = [], [dst, upd], []
@@ -107,31 +102,26 @@ def _ref_scatter(dst, upd, offsets):
     ref[sl] = upd
     return ref
 
+
 CASES = [
-    # update rank must equal dst rank.
     TypeInferCase(
         "rank_mismatch_rejected",
         _OP,
         (make_tensor_type((8,), _F), make_tensor_type((2, 4), _F), make_tensor_type((), _I)),
         ExpectedError("update rank .* must equal dst rank"),
     ),
-    # A bare scalar offset applies only to a rank-1 dst; a multi-D dst needs a
-    # per-axis offset tuple.
     TypeInferCase(
         "nd_scalar_offset_rejected",
         _OP,
         (make_tensor_type((4, 8), _F), make_tensor_type((1, 8), _F), make_tensor_type((), _I)),
         ExpectedError("per-axis offset tuple"),
     ),
-    # offsets must be an integer scalar.
     TypeInferCase(
         "offsets_dtype_rejected",
         _OP,
         (make_tensor_type((8,), _F), make_tensor_type((3,), _F), make_tensor_type((), _F)),
         ExpectedError("offsets must be an integer scalar"),
     ),
-    # A Partial dst may only be written by an equally-Partial update; the
-    # update side is symmetric and reported by name the same way.
     TypeInferCase(
         "partial_dst_plain_update_rejected",
         _OP,
@@ -150,54 +140,59 @@ def test_insert_slice_typeinfer(case):
     run_typeinfer_case(case)
 
 
-# ── rank-N per-axis offset tuple (typeinfer) ──────────────────────────────
-
 def test_insert_slice_rankn_static_oob_names_axis():
-    """An all-literal offset that puts the window past dst on one axis is
+    """An all-literal offset that puts the window past dst on one axis is rejected at typeinfer.
+
+    An all-literal offset that puts the window past dst on one axis is
     rejected at typeinfer, and the error names the offending axis. A negative
     literal is the same check from the other side, so it is not asserted
-    separately."""
+    separately.
+    """
     with pytest.raises(VerifyError, match="axis 1"):
         _infer_insert(
             make_tensor_type((1, 16512, 512), _F),
             make_tensor_type((1, 1, 512), _F),
-            _offsets(_lit(0), _lit(16512), _lit(0)),  # 16512 + 1 > 16512 on axis 1
+            _offsets(_lit(0), _lit(16512), _lit(0)),
         )
 
 
 def test_insert_slice_tuple_len_must_equal_rank():
     with pytest.raises(VerifyError, match="tuple length"):
         _infer_insert(
-            make_tensor_type((1, 16512, 512), _F), make_tensor_type((1, 1, 512), _F), _offsets(_lit(0), _lit(0))
+            make_tensor_type((1, 16512, 512), _F),
+            make_tensor_type((1, 1, 512), _F),
+            _offsets(_lit(0), _lit(0)),
         )
 
 
-# ── rank-N per-axis offset tuple (evaluation) ─────────────────────────────
-
 def test_insert_slice_rankn_eval_matches_reference_scatter():
-    """A rank-3 window at ``(0, P%128, 0)`` (the middle offset a runtime member)
+    """A rank-3 window at ```` evaluates to the same tensor as a reference scatter.
+
+    A rank-3 window at ``(0, P%128, 0)`` (the middle offset a runtime member)
     evaluates to the same tensor as a reference scatter. This is also where
     typeinfer accepting a runtime offset member is shown to be sound: the
     literal members are still bounds-checked, the runtime one is deferred to
-    here."""
+    here.
+    """
     torch.manual_seed(0)
     dst = torch.randn(1, 16512, 512)
     upd = torch.randn(1, 1, 512)
-    p = 640 % 128  # a runtime middle-axis offset
+    p = 640 % 128
     out = _eval_rankn(dst, upd, (0, p, 0), runtime_axis=1)
     torch.testing.assert_close(out, _ref_scatter(dst, upd, (0, p, 0)))
 
 
 def test_insert_slice_rankn_eval_runtime_oob_raises():
-    """A runtime offset member that puts the window out of bounds is caught by
-    the eval guard (typeinfer cannot see the runtime value)."""
+    """A runtime offset member that puts the window out of bounds is caught by the eval guard.
+
+    A runtime offset member that puts the window out of bounds is caught by
+    the eval guard (typeinfer cannot see the runtime value).
+    """
     dst = torch.zeros(1, 8, 4)
     upd = torch.zeros(1, 3, 4)
     with pytest.raises(ValueError, match="out of bounds"):
-        _eval_rankn(dst, upd, (0, 6, 0), runtime_axis=1)  # 6 + 3 > 8 on axis 1
+        _eval_rankn(dst, upd, (0, 6, 0), runtime_axis=1)
 
-
-# ── single decode step: in-place carry lowering + reshard-owned sync ──────
 
 from tilefoundry import func, module  # noqa: E402
 from tilefoundry.dsl import Mesh, Tensor, Topology  # noqa: E402
@@ -222,11 +217,13 @@ _HEAD_DIM = 4
 
 @module(entry="decode_step", topologies=(Topology("thread", 1),))
 class _DecodeStep:
-    """A single decode step exercising the in-place loop-carry lowerings: a
+    """A single decode step exercising the in-place loop-carry lowerings.
+
+    A single decode step exercising the in-place loop-carry lowerings: a
     two-carry grid region (output accumulator + running total → a tuple, so
     ``tuple_get_item``), ``full_like`` inits, an in-place ``insert_slice`` write
-    at a dynamic scalar offset, and a rank-4 ``cache_update`` KV write."""
-
+    at a dynamic scalar offset, and a rank-4 ``cache_update`` KV write.
+    """
 
     @func
     def decode_step(
@@ -253,8 +250,11 @@ class _DecodeStep:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_decode_step_matches_torch() -> None:
-    """The decode step compiles and runs on GPU; the accumulator write at a
-    dynamic offset and the KV cache update match a torch reference."""
+    """The decode step compiles and runs on GPU.
+
+    The decode step compiles and runs on GPU; the accumulator write at a
+    dynamic offset and the KV cache update match a torch reference.
+    """
     import tilefoundry  # noqa: PLC0415
 
     rm = tilefoundry.compile(_DecodeStep, target=CudaTarget("nvidia.h200_sxm"))
@@ -301,9 +301,6 @@ def _op_of(value):
     return getattr(value, "target", None) or getattr(value, "callable", None)
 
 
-# A cross-CTA ownership-change reshard (split axis 0 to split axis 1) at the
-# output position (the returned value). The reshard-owned grid fence must not
-# be bypassed by the output-sink lowering.
 @func(topologies=(Topology("cta", 2),))
 def _cross_cta_reshard_output(a: Tensor[(2, _DEC_D), "f32"]) -> Tensor[(2, _DEC_D), "f32"]:
     with Mesh(("cta",), layout=ShardMeshLayout(shape=(2,), strides=(1,))) as cta:
@@ -312,43 +309,38 @@ def _cross_cta_reshard_output(a: Tensor[(2, _DEC_D), "f32"]) -> Tensor[(2, _DEC_
 
 
 def test_cross_cta_reshard_owned_sync() -> None:
-    """An output-position cross-CTA reshard (ownership change) still lowers to
+    """An output-position cross-CTA reshard (ownership change) still lowers to sync-then-reshard.
+
+    An output-position cross-CTA reshard (ownership change) still lowers to
     sync-then-reshard: the grid sync is emitted before the output copy, proving
     the output-sink path routes through the same reshard-owned fence as an
-    intermediate reshard."""
+    intermediate reshard.
+    """
     pf = _lower(_cross_cta_reshard_output)
     nodes = []
     _walk(pf.body, False, nodes)
 
     kinds = [
-        type(_op_of(val)).__name__
-        for in_loop, kind, var, val in nodes
-        if _op_of(val) is not None
+        type(_op_of(val)).__name__ for in_loop, kind, var, val in nodes if _op_of(val) is not None
     ]
     assert "Sync" in kinds, f"no reshard-owned grid sync emitted: {kinds}"
-    # The sync fences before the output reshard's copy.
+
     assert kinds.index("Sync") < len(kinds) - 1 - kinds[::-1].index("Copy")
 
 
-# ── rank-N insert_slice end-to-end on GPU: per-axis window + coords ────────
-#
-# A non-contiguous per-axis window (partial inner axis) written at a dynamic,
-# non-zero middle-axis coordinate. This is the numerical gate for the rank-N
-# codegen: it fails if the emitter drops trailing coordinates (writes at the
-# wrong axis) or flat-collapses the window shape (a partial inner axis is not
-# contiguous in the flattened buffer). The offset is the loop induction
-# variable, so a per-iteration dynamic offset is covered here too.
 _NW_A, _NW_B, _NW_C = 1, 4, 6
-_NW_UB, _NW_UC = 2, 3  # window extent on axis 1 / axis 2 (partial: 3 of 6)
+_NW_UB, _NW_UC = 2, 3
 _NW_STEPS = 2
 
 
 @module(entry="nd_window", topologies=(Topology("thread", 1),))
 class _NdWindow:
-    """A loop-carried rank-3 in-place ``insert_slice`` writing a non-trivial,
-    non-contiguous window (full axis 0, window 2 on axis 1, partial 3-of-6 on
-    axis 2) at the induction variable as the middle-axis tile coordinate."""
+    """Represent NdWindow.
 
+    A loop-carried rank-3 in-place ``insert_slice`` writing a non-trivial,
+    non-contiguous window (full axis 0, window 2 on axis 1, partial 3-of-6 on
+    axis 2) at the induction variable as the middle-axis tile coordinate.
+    """
 
     @func
     def nd_window(
@@ -364,13 +356,14 @@ class _NdWindow:
             return reshard(acc, (_NW_A, _NW_B, _NW_C @ m.t), "gmem")
 
 
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_insert_slice_rankn_gpu_oracle() -> None:
-    """The rank-N in-place ``insert_slice`` runs on GPU and matches a torch
+    """The rank-N in-place ``insert_slice`` runs on GPU and matches a torch scatter reference.
+
+    The rank-N in-place ``insert_slice`` runs on GPU and matches a torch
     scatter reference: a non-contiguous window at a dynamic, non-zero
-    middle-axis coordinate."""
+    middle-axis coordinate.
+    """
     import tilefoundry  # noqa: PLC0415
 
     rm = tilefoundry.compile(_NdWindow, target=CudaTarget("nvidia.h200_sxm"))

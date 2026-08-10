@@ -1,19 +1,8 @@
-"""``build_schedule_tree(tg) -> TileGraph`` -- construct an isl schedule
-tree over a ``TileGraph`` directly from its topological statement order,
-plus the band operations the resource solve needs: enumerate the bands to
-decide over (:func:`schedule_bands`, :func:`band_statement`) and split one
-into a tile/point band pair (:func:`tile_band`).
+"""Build and transform an isl schedule tree for a ``TileGraph``.
 
-Nothing here solves. ``tg.units`` is already a dependence-respecting order
-(``extract`` walks the SSA DAG in postorder), so sequencing the statements
-in that order is legal by construction -- no affine solve to converge, and
-no objective smuggled in from ``isl.schedule_constraints``, whose
-dependence-distance goal is not the one this layer optimises for.
-isl is left doing what it is unrivalled at: representing the tree,
-transforming bands and generating code from them.
-
-``coincident`` is written onto each band from ``tg.parallel_dims``, the
-fact ``analysis.poly`` measures off ``domain`` + ``deps``.
+The dependence-respecting unit order becomes a sequence of identity bands;
+nothing here solves an objective. Band helpers enumerate, identify, and tile
+those bands. Parallel dimensions set each member's ``coincident`` flag.
 """
 from __future__ import annotations
 
@@ -23,8 +12,11 @@ from tilefoundry.analysis.poly import TileGraph
 
 
 class KernelScheduleError(RuntimeError):
-    """A schedule tree the band operations cannot work on -- always raised
-    with a message naming what was found instead."""
+    """A schedule tree the band operations cannot work on.
+
+    A schedule tree the band operations cannot work on -- always raised
+    with a message naming what was found instead.
+    """
 
 
 def _domain_sets(domain: "isl.union_set") -> dict[str, "isl.set"]:
@@ -34,8 +26,11 @@ def _domain_sets(domain: "isl.union_set") -> dict[str, "isl.set"]:
 
 
 def _statement_schedule(s: "isl.set") -> "isl.schedule":
-    """One statement's own domain under one identity band, so the band's
-    members are that statement's own dimensions, in order."""
+    """One statement's own domain under one identity band.
+
+    One statement's own domain under one identity band, so the band's
+    members are that statement's own dimensions, in order.
+    """
     sched = isl.schedule.from_domain(s.to_union_set())
     if not s.dim(isl.dim_type.SET):
         return sched
@@ -80,8 +75,11 @@ def build_schedule_tree(tg: TileGraph) -> "isl.schedule":
 
 
 def schedule_bands(tree: "isl.schedule") -> tuple["isl.schedule_node_band", ...]:
-    """Every band in ``tree``, in top-down order -- which for a
-    :func:`build_schedule_tree` tree is ``tg.units`` order."""
+    """Every band in ``tree``, in top-down order.
+
+    Every band in ``tree``, in top-down order -- which for a
+    :func:`build_schedule_tree` tree is ``tg.units`` order.
+    """
     found: list["isl.schedule_node_band"] = []
 
     def visit(node) -> bool:
@@ -109,8 +107,11 @@ def band_statement(band: "isl.schedule_node_band") -> str:
 
 
 def tile_band(band: "isl.schedule_node_band", sizes: tuple[int, ...]) -> "isl.schedule":
-    """``band`` split into a tile band over ``sizes`` plus a point band
-    holding the remainder, returned as the whole schedule."""
+    """Tile band.
+
+    ``band`` split into a tile band over ``sizes`` plus a point band
+    holding the remainder, returned as the whole schedule.
+    """
     if band.n_member() != len(sizes):
         raise KernelScheduleError(
             f"tile_band: band has {band.n_member()} member(s) but got "

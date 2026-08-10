@@ -28,7 +28,9 @@ from .registries import (
 
 
 class TypeInferVisitor(ExprVisitor[Type]):
-    """The one typeinfer derivation rule per ``Expr`` kind. [hir §1.1](docs/spec/hir.md#11-function),
+    """The one typeinfer derivation rule per ``Expr`` kind.
+
+    The one typeinfer derivation rule per ``Expr`` kind. [hir §1.1](docs/spec/hir.md#11-function),
     [visitor-registry §4](docs/spec/visitor-registry.md#4-instance-1--typeinfer).
 
     ``TypeInferContext.type_of`` is the caller-facing cache + dispatch
@@ -58,14 +60,20 @@ class TypeInferVisitor(ExprVisitor[Type]):
         return fn(call, self.ctx)
 
     def visit_Tuple(self, tup: Tuple) -> Type:
-        """Structural: the field types of the (possibly just-elaborated)
-        elements, never the node's own stamped ``.type`` ([hir §1.1](docs/spec/hir.md#11-function))."""
+        """Visit Tuple.
+
+        Structural: the field types of the (possibly just-elaborated)
+        elements, never the node's own stamped ``.type`` ([hir §1.1](docs/spec/hir.md#11-function)).
+        """
         return TupleType(fields=tuple(self.ctx.type_of(e) for e in tup.elements))
 
     def visit_GridRegionExpr(self, grid: GridRegionExpr) -> Type:
-        """Carry/body: a no-carry loop's value is its body; a carrying loop's
-        value is its ``carried_args`` phi Vars' own declared type(s) — the
-        same rule the parser applies when constructing the node ([hir §1.2](docs/spec/hir.md#12-gridregionexpr))."""
+        """Carry/body: a no-carry loop's value is its body.
+
+        A carrying loop's value is its ``carried_args`` phi variables' declared
+        types, matching the parser's node-construction rule.
+        See [hir §1.2](docs/spec/hir.md#12-gridregionexpr).
+        """
         self.ctx.type_of(grid.body)
         for y in grid.yield_values:
             self.ctx.type_of(y)
@@ -76,8 +84,11 @@ class TypeInferVisitor(ExprVisitor[Type]):
         return TupleType(fields=tuple(p.type for p in grid.carried_args))
 
     def visit_ShapeOf(self, shape_of: ShapeOf) -> Type:
-        """A ``tir.ShapeOf`` always carries its own concrete (rank-0 i32)
-        type at construction; it has no children to derive from."""
+        """A ``tir.ShapeOf`` always carries its own concrete (rank-0 i32) type at construction.
+
+        A ``tir.ShapeOf`` always carries its own concrete (rank-0 i32)
+        type at construction; it has no children to derive from.
+        """
         return shape_of.type
 
     def generic_visit(self, expr: Expr) -> Type:
@@ -99,18 +110,18 @@ class VerifyVisitor(StmtVisitor[None]):
         ctx: VerifyContext,
         registry: AnalysisRegistry = verify_stmt_registry,
     ) -> None:
-        # Default path: no registry argument, use the module-level
-        # verify_stmt_registry. Passing an explicit registry is an advanced
-        # extension point (e.g. sandbox tests, grouped dispatch); the everyday
-        # verify pass never needs it.
+
+
+
+
         self.ctx = ctx
         self.registry = registry
 
     def generic_visit(self, stmt: Stmt) -> None:
         if isinstance(stmt, Evaluate):
-            # Effect-ful Op invocation in Stmt position: dispatch verify on the
-            # Op class. The handler ABI is Call-based, so feed it a Call built
-            # from the Op and its args.
+
+
+
             op = stmt.callable
             fn = self.registry.lookup(type(op))
             if fn is not None:
@@ -126,8 +137,8 @@ class VerifyVisitor(StmtVisitor[None]):
     def visit_MeshScope(self, stmt: MeshScope) -> None:
         self.ctx.mesh_stack.append(stmt.mesh)
         try:
-            # Fire any custom verify handler for MeshScope (none by default),
-            # then recurse into body with the scope active.
+
+
             fn = self.registry.lookup(MeshScope)
             if fn is not None:
                 fn(stmt, self.ctx)
@@ -148,7 +159,7 @@ class CodegenVisitor:
 
     def __init__(
         self,
-        ctx,  # CodegenContext; concrete per-target type lives with the target
+        ctx,
         registry: AnalysisRegistry,
         *,
         backend: str,
@@ -175,9 +186,9 @@ class CodegenVisitor:
                     f"{type(expr.target).__name__}"
                 )
             return fn(expr, self.ctx)
-        # Leaf Expr nodes (Var / Constant) are emitted by the target's
-        # CodegenContext helpers (e.g. ctx.name_for / ctx.literal). Callers
-        # that want a generic fallback should override emit_expr.
+
+
+
         raise RuntimeError(
             f"CodegenVisitor.emit_expr: leaf Expr {type(expr).__name__} "
             "has no default emission; handle via target ctx helpers."

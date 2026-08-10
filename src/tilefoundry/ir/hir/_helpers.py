@@ -1,4 +1,5 @@
 """Shared HIR-wide helpers (cross-category), not tied to any one op family."""
+
 from __future__ import annotations
 
 from tilefoundry.ir.core import Constant
@@ -50,7 +51,9 @@ def broadcast_shapes(a: tuple, b: tuple, *, raising: bool = True):
 
 
 def resolve_anchor_storage(ctx, call, *storages):
-    """Resolve a multi-input op's output storage by anchoring on the concrete
+    """Resolve anchor storage.
+
+    Resolve a multi-input op's output storage by anchoring on the concrete
     residency present among its operands.
 
     An unmaterialized operand (``StorageKind.UMAT``) abstains. A single concrete

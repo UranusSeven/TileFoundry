@@ -27,21 +27,19 @@ from tilefoundry.ir.types.shard import Topology
 from tilefoundry.schedule import ScheduleError, ScheduleOptions, schedule
 from tilefoundry.target import CudaTarget
 
-#: Small enough to solve and to analyse on a CPU gate.
 CONTEXT = 32
 DIMS = {"ctx_len": CONTEXT}
 FAMILIES = ("compute-cost", "memory", "roofline", "timeline")
-#: What is asked here is that a plan exists for the stated size and verifies against
-#: the program of that size. The solver cannot prove this makespan optimal, so left
-#: to run it spends the whole budget improving a plan whose verdict does not change.
-SOLVER = ScheduleOptions(
-    timeout_seconds=60, workers=4, random_seed=0, stop_at_first_solution=True
-)
+
+
+SOLVER = ScheduleOptions(timeout_seconds=60, workers=4, random_seed=0, stop_at_first_solution=True)
 
 
 def _aimed():
     """The decode example, aimed at one machine."""
-    return replace(GqaOnline, target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 8),))
+    return replace(
+        GqaOnline, target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 8),)
+    )
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -56,9 +54,12 @@ def test_every_analysis_runs_at_a_stated_size(family: str) -> None:
 
 @pytest.mark.parametrize("family", FAMILIES)
 def test_the_result_names_the_function_that_carries_the_records(family: str) -> None:
-    """The records are written onto the program that was measured, and that is
+    """The records are written onto the program that was measured, and that is the derived one.
+
+    The records are written onto the program that was measured, and that is
     the derived one. Handing back the symbolic input would send a reader looking
-    for records on a function that has none."""
+    for records on a function that has none.
+    """
     module = _aimed()
     authored = module.entry_function()
 
@@ -83,12 +84,10 @@ def test_a_report_at_a_size_carries_every_family_it_ran() -> None:
     module = _aimed()
     authored = module.entry_function()
 
-    data = report([
-        analyze(module, authored, analysis=family, dims=DIMS) for family in FAMILIES
-    ])
+    data = report([analyze(module, authored, analysis=family, dims=DIMS) for family in FAMILIES])
 
     assert data["executed"] == list(FAMILIES)
-    # compute-cost keeps no whole-function record; the other three each keep one.
+
     assert set(data["function_records"]) == {"memory", "roofline", "timeline"}
     assert data["totals"]["flops"], "the work totals summed to nothing"
     text = render_text(data)
@@ -97,7 +96,9 @@ def test_a_report_at_a_size_carries_every_family_it_ran() -> None:
 
 
 def test_a_report_at_a_size_carries_the_per_call_records_of_every_family() -> None:
-    """The same for the per-Call rows, which are keyed by position rather than by
+    """The same for the per-Call rows, which are keyed by position rather than by identity.
+
+    The same for the per-Call rows, which are keyed by position rather than by
     identity: two rebuilds share no Call object, so a report that matched them by
     identity would find none of the second family's.
 
@@ -108,10 +109,12 @@ def test_a_report_at_a_size_carries_the_per_call_records_of_every_family() -> No
     module = _aimed()
     authored = module.entry_function()
 
-    data = report([
-        analyze(module, authored, analysis=family, dims=DIMS)
-        for family in ("compute-cost", "timeline")
-    ])
+    data = report(
+        [
+            analyze(module, authored, analysis=family, dims=DIMS)
+            for family in ("compute-cost", "timeline")
+        ]
+    )
 
     families = {name for row in data["calls"] for name in row if name != "value"}
     assert families == {"compute-cost", "timeline"}, families
@@ -137,9 +140,7 @@ def test_qwen_decoder_unplaced_calls_have_one_position_at_each_sequence_length(
     module = QWEN3_1_7B.build()
     function = module.lookup("decoder_layer")
 
-    result = analyze(
-        module, function, analysis="timeline", dims={"ctx_len": ctx_len}
-    )
+    result = analyze(module, function, analysis="timeline", dims={"ctx_len": ctx_len})
 
     record = get_metadata(result.function, TimelineMetadata)
     assert record is not None
@@ -152,9 +153,7 @@ def test_qwen_decoder_keeps_rotary_and_kv_cache_parameters_resident() -> None:
     module = QWEN3_1_7B.build()
     function = module.lookup("decoder_layer")
 
-    result = analyze(
-        module, function, analysis="memory", dims={"ctx_len": 1024}
-    )
+    result = analyze(module, function, analysis="memory", dims={"ctx_len": 1024})
 
     record = get_metadata(result.function, MemoryMetadata)
     assert record is not None
@@ -188,14 +187,19 @@ def test_a_dimension_the_function_does_not_have_is_refused() -> None:
 
 
 def test_a_dimension_left_unbound_is_refused() -> None:
-    """Stating some other dimension is useful while the choices are being made
+    """Test a dimension left unbound is refused.
+
+    Stating some other dimension is useful while the choices are being made
     and useless to an analysis, which would meet the unbound one as an extent
-    that is not a number."""
+    that is not a number.
+    """
     module = _aimed()
 
     with pytest.raises(AnalysisError, match="was not given a size"):
         analyze(
-            module, module.entry_function(), analysis="compute-cost",
+            module,
+            module.entry_function(),
+            analysis="compute-cost",
             dims={"batch": 4},
         )
 
@@ -212,8 +216,11 @@ def test_an_empty_or_malformed_size_is_refused_rather_than_ignored() -> None:
 
 
 def test_a_size_states_nothing_about_a_function_from_elsewhere() -> None:
-    """Ownership is settled before a size is looked at, so a foreign function
-    is refused for being foreign rather than for its dimensions."""
+    """Ownership is settled before a size is looked at.
+
+    Ownership is settled before a size is looked at, so a foreign function
+    is refused for being foreign rather than for its dimensions.
+    """
     module = _aimed()
     foreign = QWEN3_1_7B.build().lookup("mlp")
 
@@ -222,14 +229,15 @@ def test_a_size_states_nothing_about_a_function_from_elsewhere() -> None:
 
 
 def test_scheduling_at_a_stated_size_plans_and_verifies() -> None:
-    """The plan is a plan for one size, and it is checked against the program of
-    that size -- which is the one the result names."""
+    """The plan is a plan for one size, and it is checked against the program of that size.
+
+    The plan is a plan for one size, and it is checked against the program of
+    that size -- which is the one the result names.
+    """
     module = _aimed()
     authored = module.entry_function()
 
-    result = schedule(
-        module, authored, topology="cta", options=SOLVER, dims=DIMS
-    )
+    result = schedule(module, authored, topology="cta", options=SOLVER, dims=DIMS)
 
     assert result.module is module
     assert result.function is not authored
@@ -252,9 +260,12 @@ def test_scheduling_refuses_a_size_no_variant_covers() -> None:
 
 
 def test_the_entry_at_a_chosen_size_is_still_the_entry() -> None:
-    """The device-wide solver admits only the entry, and it decides that by
+    """The device-wide solver admits only the entry, and it decides that by name.
+
+    The device-wide solver admits only the entry, and it decides that by
     name: a function specialised from the entry is a different object and the
-    same program."""
+    same program.
+    """
     module = _aimed()
     variant = variant_for(module.entry_function(), DIMS)
 

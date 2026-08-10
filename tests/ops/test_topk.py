@@ -1,18 +1,12 @@
-"""TopK's dynamic ``k``, its output layout, its surface, and its consumer.
+"""Cover TopK's dynamic ``k``, output layout, surface, and gather consumer.
 
-- dynamic ``k`` (``ShapeDim = int | DimVar | Expr``): a ``k`` derived from a
-  context-length ``DimVar`` (e.g. ``dim_min(512, POS // 4)``) is a first-class
-  value -- typeinfer propagates it as a symbolic output axis, and the same
-  *built* ``Function`` evaluates at any concrete context length without a
-  rebuild -- and a ``k`` whose statically-derivable upper bound cannot fit the
-  axis is rejected before it ever runs;
-- the output ``ShardLayout``: the selected axis shrinks to ``k`` while a Split on
-  a non-selected axis survives, including when a non-selected axis is dynamic;
-- ``largest`` / ``sorted`` surviving the parse surface, and ``sorted=False``
-  keeping each value paired with its own index;
-- the downstream consumer: those indices feed ``gather``, whose output shape
-  must stay consistent at every binding of the same symbolic ``k``.
+Symbolic bounds propagate to the selected axis and reject provably oversized
+values. Other Split axes survive, options round-trip through parsing, and values
+remain paired with indices.
+
+See [hir §1.3](docs/spec/hir.md#13-op).
 """
+
 from __future__ import annotations
 
 import math
@@ -51,8 +45,6 @@ _F32 = DType.f32
 _I64 = DType.i64
 
 
-# ─── typeinfer rejections ───────────────────────────────────────────────────
-
 CASES = [
     TypeInferCase(
         "oversized_k_rejected",
@@ -80,8 +72,6 @@ def test_topk_typeinfer(case):
     run_typeinfer_case(case)
 
 
-# ─── evaluation of a mode no model selects ──────────────────────────────────
-
 def _run_topk(x: torch.Tensor, **attrs):
     param = Var(type=make_tensor_type(tuple(x.shape), DType.f32), name="x")
     call = Call(type=param.type, target=TopK(**attrs), args=(param,))
@@ -92,29 +82,33 @@ def _run_topk(x: torch.Tensor, **attrs):
 
 
 def test_topk_unsorted_selects_same_set():
-    """sorted=False: the selected (value,index) pairs match torch.topk as a
+    """Test topk unsorted selects same set.
+
+    sorted=False: the selected (value,index) pairs match torch.topk as a
     SET, without requiring a particular internal order. Pairing is what an
     unsorted implementation can silently lose, and no corpus router asks for
-    unsorted output, so it is checked here."""
+    unsorted output, so it is checked here.
+    """
     torch.manual_seed(0)
     x = torch.randn(4, 256)
     vals, idx = _run_topk(x, k=6, axis=-1, largest=True, sorted=False)
     ref_v, _ = torch.topk(x, 6, dim=-1, largest=True, sorted=True)
-    # Values stay paired with their indices (gather along the axis).
+
     torch.testing.assert_close(vals, x.gather(-1, idx.long()))
-    # Same selected values once both are sorted, and same index set per row.
+
     got_sorted, _ = torch.sort(vals, dim=-1, descending=True)
     torch.testing.assert_close(got_sorted, ref_v)
     for r in range(x.shape[0]):
         assert set(idx[r].long().tolist()) == set(torch.topk(x[r], 6).indices.tolist())
 
 
-# ─── output shard layout ────────────────────────────────────────────────────
-
 def test_topk_output_layout_shrinks_selected_axis_preserving_split():
-    """A Split on a non-selected axis must be preserved, and the output shard
-    layout's selected axis must shrink to k so size(layout)==size(shape)."""
-    x_ty = make_shard_tensor_type((4, 256), mesh=make_mesh((4,)), attrs=(Split(0),))  # split axis 0; TopK on axis 1
+    """A Split on a non-selected axis must be preserved.
+
+    A Split on a non-selected axis must be preserved, and the output shard
+    layout's selected axis must shrink to k so size(layout)==size(shape).
+    """
+    x_ty = make_shard_tensor_type((4, 256), mesh=make_mesh((4,)), attrs=(Split(0),))
     out = infer_call(TopK(k=6, axis=-1), x_ty)
     values_ty, indices_ty = out.fields
     assert values_ty.shape == (4, 6) and indices_ty.shape == (4, 6)
@@ -129,9 +123,7 @@ def test_topk_output_layout_shrinks_selected_axis_preserving_split():
 
 
 def test_plain_topk_layout_describes_the_selected_result():
-    source = make_tensor_type(
-        (4, 256), _F32, layout=Layout(shape=(4, 256), strides=(256, 1))
-    )
+    source = make_tensor_type((4, 256), _F32, layout=Layout(shape=(4, 256), strides=(256, 1)))
 
     values, indices = infer_call(TopK(k=6, axis=-1), source).fields
 
@@ -140,17 +132,25 @@ def test_plain_topk_layout_describes_the_selected_result():
 
 
 def test_topk_all_broadcast_layout_with_dynamic_dim():
-    """The canonical replicated fallback (an all-Broadcast layout has no
+    """Test topk all broadcast layout with dynamic dim.
+
+    The canonical replicated fallback (an all-Broadcast layout has no
     Split/Partial to propagate, but must still shrink the selected axis to k
     rather than retain the stale input extent) must handle a dynamic (DimVar)
     dim on a non-selected axis: no int() on a ShapeDim, and — per the HIR
     invariant that every post-typeinfer ShardLayout has concrete strides — it
-    materializes explicit all-ones strides rather than leaving them None."""
+    materializes explicit all-ones strides rather than leaving them None.
+    """
     s = DimVar("S", 1, 64)
     x_ty = raw_shard_tensor_type(
-        (256, s), (256, s), None, (Broadcast(),), make_mesh((4,)), dtype=_F32,
+        (256, s),
+        (256, s),
+        None,
+        (Broadcast(),),
+        make_mesh((4,)),
+        dtype=_F32,
     )
-    values_ty, indices_ty = infer_call(TopK(k=6, axis=0), x_ty).fields  # select the static axis
+    values_ty, indices_ty = infer_call(TopK(k=6, axis=0), x_ty).fields
     assert values_ty.shape == (6, s) and indices_ty.shape == (6, s)
     for t in (values_ty, indices_ty):
         assert isinstance(t.layout, ShardLayout)
@@ -175,21 +175,20 @@ def test_topk_parser_preserves_largest_sorted():
     assert topk.largest is False and topk.sorted is True
 
 
-# ─── dynamic k: ShapeDim = int | DimVar | Expr ──────────────────────────────
-
-# Context-length-shaped axis; envelope comfortably covers both eval bindings
-# exercised below (100 and 4096).
 POS = DimVar("POS", 1, 8193)
-# The task's motivating example: a decode-time top-k capped at 512 but never
-# exceeding a quarter of the current context length.
-K = dim_min(512, POS // 4)          # pos=100 -> 25; pos=4096 -> 512
+
+
+K = dim_min(512, POS // 4)
 
 
 def _build_topk_fn(x_shape, k, *, axis: int = -1) -> tuple[Function, "TupleType"]:
-    """A one-``Call`` Function ``x -> (values, indices)`` with ``TopK(k=k,
+    """A one-``Call`` Function ``x ->`` with ``TopK``, typeinfer'd.
+
+    A one-``Call`` Function ``x -> (values, indices)`` with ``TopK(k=k,
     axis=axis)``, typeinfer'd. Mirrors this file's ``_run_topk`` but returns
     the built ``Function`` (not the evaluated result) so a caller can
-    ``evaluate`` it at more than one concrete binding."""
+    ``evaluate`` it at more than one concrete binding.
+    """
     x = Var(type=make_tensor_type(x_shape, _F32), name="x")
     call = Call(type=x.type, target=TopK(k=k, axis=axis), args=(x,))
     result_type = TypeInferVisitor(TypeInferContext()).visit(call)
@@ -198,8 +197,6 @@ def _build_topk_fn(x_shape, k, *, axis: int = -1) -> tuple[Function, "TupleType"
     return fn, result_type
 
 
-# A bare DimVar whose envelope alone (hi=2000 -> max reachable 1999) exceeds a
-# static axis length of 100.
 _BIG_K = DimVar("topk_dyn_big_k", 1, 2000)
 
 DYNAMIC_K_TYPEINFER_CASES = [
@@ -230,10 +227,13 @@ def test_topk_dynamic_k_typeinfer(case):
 
 
 def test_topk_dynamic_k_evaluates_at_two_ctx_bindings():
-    """Same built Function; k = min(512, pos // 4) resolves to a different
+    """Same built Function.
+
+    Same built Function; k = min(512, pos // 4) resolves to a different
     concrete int per invocation, driven purely by x's runtime shape -- no
     rebuild (mirrors the dynamic-ctx pattern the corpus decoders use for their
-    DimVar-shaped kv cache)."""
+    DimVar-shaped kv cache).
+    """
     fn, _ = _build_topk_fn((4, POS), K)
 
     torch.manual_seed(0)
@@ -247,15 +247,16 @@ def test_topk_dynamic_k_evaluates_at_two_ctx_bindings():
         torch.testing.assert_close(idx.long(), ref_i)
 
 
-# ─── downstream consumer: topk indices -> gather, shape (1, K, D) ──────────
-
 _D = 8
 
 
 def test_topk_dynamic_k_downstream_gather_shape_consistent():
-    """indices from a dynamic-k TopK feed ``gather``; shape (1, K, D) holds,
+    """Indices from a dynamic-k TopK feed ``gather``.
+
+    Indices from a dynamic-k TopK feed ``gather``; shape (1, K, D) holds,
     at the type level and at both concrete ctx-length bindings, and the
-    gathered rows match a plain-torch reference."""
+    gathered rows match a plain-torch reference.
+    """
     scores = Var(type=make_tensor_type((1, POS), _F32), name="scores")
     table = Var(type=make_tensor_type((POS, _D), _F32), name="table")
 

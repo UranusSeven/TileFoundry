@@ -1,14 +1,11 @@
-"""``extract`` dynamic-shape (``DimVar``) coverage: a parametrised domain
-used to make ``extract`` raise outright; now a ``DimVar`` axis flows straight
-through as an isl parameter (``to_domain`` already produces one), and
-resolves back to its ``ShapeDim`` in ``TileGraph.params``.
+"""Pin ``extract`` behavior for dynamic ``DimVar`` shapes.
 
-Two things have to hold for a decode kernel, and they are the two below: the
-parameter stays *bounded* (a domain nothing bounds cannot be scheduled), and the
-loop that comes out of it names the parameter instead of a trip count somebody
-guessed. The static counterpart of this graph is pinned in
-``test_analysis_invariants.py``.
+A ``DimVar`` flows through as a bounded isl parameter and resolves to its
+``ShapeDim`` in ``TileGraph.params``. Emitted loops name that parameter rather
+than inventing a fixed trip count. ``test_analysis_invariants.py`` pins the
+static counterpart.
 """
+
 from __future__ import annotations
 
 import re
@@ -22,9 +19,6 @@ from tilefoundry.dsl.tf import *  # noqa: F401,F403 -- matmul resolved dynamical
 from tilefoundry.schedule.kernel_schedule import build_schedule_tree
 from tilefoundry.schedule.render import emit_scaffold
 
-# Dynamic M axis: x:[seq,4] @ w:[4,2], seq a DimVar (real variable
-# sequence length). N/K stay small so the expected extents below remain
-# hand-checkable literals.
 SEQ = DimVar("seq", 1, 128)
 
 
@@ -38,13 +32,16 @@ def dyn_matmul(
 
 
 def test_dynamic_matmul_extract_params_and_domain():
-    """A DimVar M axis extracts a parametrised ``[seq]->{...}`` domain
+    """Test dynamic matmul extract params and domain.
+
+    A DimVar M axis extracts a parametrised ``[seq]->{...}`` domain
     (``0 <= i < seq``, straight from ``to_domain`` -- no tiling), resolves
     ``TileGraph.params['seq']`` back to the exact ``DimVar``, and the M
     axis is still bounded (``dim_max_val`` a finite 126, not ``infty``,
     since ``seq``'s own half-open range ``[1, 128)`` tops out at 127 --
     an unbounded ``DimVar`` is not constructible in the first place).
-    ``build_schedule_tree()`` stays parametrised too."""
+    ``build_schedule_tree()`` stays parametrised too.
+    """
     tg = extract(dyn_matmul)
     assert isinstance(tg, TileGraph)
 
@@ -60,11 +57,9 @@ def test_dynamic_matmul_extract_params_and_domain():
     (mm_set,) = sets
     assert mm_set.get_tuple_name() == "MM"
 
-    # M axis: 0 <= i < seq directly, so i's max possible value (maximizing
-    # over every valid seq up to its own range's 127) is 126.
     assert int(mm_set.dim_min_val(0).num_si()) == 0
     assert int(mm_set.dim_max_val(0).num_si()) == 126
-    # N=2, K=4: static axes, unaffected by M.
+
     assert int(mm_set.dim_max_val(1).num_si()) == 1
     assert int(mm_set.dim_max_val(2).num_si()) == 3
 
@@ -73,8 +68,11 @@ def test_dynamic_matmul_extract_params_and_domain():
 
 
 def test_dynamic_matmul_end_to_end_emits_symbolic_loop():
-    """extract -> build_schedule_tree -> emit_scaffold: the M loop's upper bound
-    names the isl parameter directly, never a fixed integer trip count."""
+    """Extract -> build_schedule_tree -> emit_scaffold.
+
+    Extract -> build_schedule_tree -> emit_scaffold: the M loop's upper bound
+    names the isl parameter directly, never a fixed integer trip count.
+    """
     tg = extract(dyn_matmul)
     tree = build_schedule_tree(tg)
     skeleton, _swimlane, contracts = emit_scaffold(tg, tree, {})

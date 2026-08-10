@@ -35,8 +35,8 @@ def _unique_values(namespace: dict[str, object], kind: type) -> tuple[object, ..
 
 def select_ir(namespace: dict[str, object], selector: str | None) -> Module:
     if selector is not None:
-        # Validated before the join, which would turn `Root.` into the empty
-        # path -- and that deliberately means the root itself.
+
+
         segments = selector.split(".")
         if any(not segment for segment in segments):
             raise ValueError(
@@ -62,8 +62,8 @@ def select_ir(namespace: dict[str, object], selector: str | None) -> Module:
             raise TypeError(
                 f"selector root {root_name!r} is {type(selected).__name__}, expected Module"
             )
-        # The path below the root is resolved by the IR's own selector, so the
-        # CLI and the corpus reach a nested kernel the same way.
+
+
         return select(selected, ".".join(path))
 
     modules = _unique_values(namespace, Module)
@@ -111,12 +111,12 @@ def load_namespace(source: str) -> tuple[dict[str, object], str | None]:
         if spec is None or spec.loader is None:
             raise ImportError(f"could not load source module {path}")
         module = importlib.util.module_from_spec(spec)
-        # Registered before it runs, because a class defined in it records this
-        # module's name and `dataclasses` resolves a string annotation by looking
-        # that name up in `sys.modules`. A file pairing `from __future__ import
-        # annotations` with a `@dataclass` is otherwise unloadable: the lookup
-        # returns None and the decorator raises. The `finally` below removes it
-        # again, `path.stem` being one of the sibling names.
+
+
+
+
+
+
         sys.modules[spec.name] = module
         captured_stdout = io.StringIO()
         with contextlib.redirect_stdout(captured_stdout):
@@ -149,8 +149,11 @@ def load_authored_ir(source: str) -> Module:
 
 
 def entry_function(ir: Module | Function) -> Function:
-    """Resolve the HIR Function a command runs its pipeline over -- the
-    same Module -> entry_function() convention as `selected_target`."""
+    """Resolve the HIR Function a command runs its pipeline over.
+
+    Resolve the HIR Function a command runs its pipeline over -- the
+    same Module -> entry_function() convention as `selected_target`.
+    """
     function = ir.entry_function() if isinstance(ir, Module) else ir
     if not isinstance(function, Function):
         raise TypeError(f"schedule requires a HIR Function entry, got {type(function).__name__}")
@@ -158,9 +161,12 @@ def entry_function(ir: Module | Function) -> Function:
 
 
 def selected_target(ir: Module):
-    """The Target the selection declares. Schedule and Analyze read hardware
+    """The Target the selection declares.
+
+    The Target the selection declares. Schedule and Analyze read hardware
     facts off it, so an undeclared Target is an authoring error rather than a
-    cue to pick one: the selection must name the device it was written for."""
+    cue to pick one: the selection must name the device it was written for.
+    """
     if not isinstance(ir, Module):
         raise TypeError(
             f"expected a Module selection, got {type(ir).__name__}. A Function "

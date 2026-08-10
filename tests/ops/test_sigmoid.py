@@ -1,4 +1,5 @@
 """Sigmoid's Partial(R) commutation."""
+
 from __future__ import annotations
 
 from tests.ops.typeinfer_utils import (
@@ -15,7 +16,7 @@ _M = make_mesh((4,))
 
 
 def test_sigmoid_rejects_partial_sum_input():
-    """sigmoid is monotone increasing: it commutes with max/min, not sum."""
+    """Sigmoid is monotone increasing: it commutes with max/min, not sum."""
     run_typeinfer_case(
         TypeInferCase(
             "partial_sum_errors",

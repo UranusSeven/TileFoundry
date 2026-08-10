@@ -14,9 +14,12 @@ class DType:
 
     @classmethod
     def _members(cls) -> dict[str, "DType"]:
-        """Descriptor singletons keyed by surface name (internal — the
+        """Descriptor singletons keyed by surface name.
+
+        Descriptor singletons keyed by surface name (internal — the
         spec closes the Enum-style iteration surface; ``from_name`` is
-        the one public resolution entry)."""
+        the one public resolution entry).
+        """
         return {v.name: v for v in vars(cls).values() if isinstance(v, DType)}
 
     @classmethod
@@ -29,9 +32,7 @@ class DType:
         members = cls._members()
         member = members.get(name)
         if member is None:
-            raise ValueError(
-                f"DType: unknown value {name!r}; valid: {sorted(members)}"
-            )
+            raise ValueError(f"DType: unknown value {name!r}; valid: {sorted(members)}")
         return member
 
     def to_python(self) -> PythonExpr:

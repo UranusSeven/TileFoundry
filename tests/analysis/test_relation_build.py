@@ -1,4 +1,5 @@
 """relation_build — thin isl_utility consumer: build_domain, shape_from_relation, arity."""
+
 from __future__ import annotations
 
 import isl
@@ -16,21 +17,18 @@ from tilefoundry.visitor_registry.relation_build import (
 
 def test_build_domain_static_constant_constraints():
     dom = build_domain((8, 4))
-    # Static extents become constant upper bounds; no isl parameters.
+
     assert dom.dim(isl.dim_type.PARAM) == 0
     assert dom.dim(isl.dim_type.SET) == 2
-    # The whole [0,8)x[0,4) box is 32 points.
+
     assert int(dom.count_val().num_si()) == 32
 
 
 def test_validate_output_map_arity():
     om = isl.map("{ [m, k, n] -> [m, n] }")
-    validate_output_map_arity(om, (1, 1))  # ok
+    validate_output_map_arity(om, (1, 1))
     with pytest.raises(ValueError, match="range rank"):
         validate_output_map_arity(om, (1, 1, 1))
-
-
-# ─── shape_from_relation ──────────────────────────────────────────────────────
 
 
 def _relation(extents, out_dst):
@@ -42,10 +40,13 @@ def _relation(extents, out_dst):
 
 
 def test_shape_from_relation_reads_static_dynamic_and_broadcast_axes():
-    """One projection, three kinds of axis: a static extent comes back as itself,
+    """One projection, three kinds of axis.
+
+    One projection, three kinds of axis: a static extent comes back as itself,
     a dynamic axis resolves back to the same ``DimVar`` by parameter name (the
     decode shape), and an output position that is a constant is a size-1 axis
-    rather than an axis of that constant's value."""
+    rather than an axis of that constant's value.
+    """
     assert shape_from_relation(_relation((16, 8), "d0, d1")) == (16, 8)
 
     n = DimVar("N", 1, 64)
@@ -58,8 +59,7 @@ def test_shape_from_relation_composite_param():
     n = DimVar("N", 2048, 1_048_577)
     quarter = simplify_dim(DimFloorDiv, (n, 4))
     rel = _relation((quarter,), "d0")
-    # The opaque parameter minted for the composite expr resolves back to
-    # the original DimExpr via relation.param_map.
+
     assert shape_from_relation(rel) == (quarter,)
 
 

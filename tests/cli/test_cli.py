@@ -86,7 +86,9 @@ def test_parse_dims_rejects_an_argument_that_states_no_extent(stated) -> None:
 
 
 def test_parse_dims_rejects_one_dimension_stated_twice() -> None:
-    """Repeating the flag states another dimension, not another value for one
+    """Repeating the flag states another dimension, not another value for one already stated.
+
+    Repeating the flag states another dimension, not another value for one
     already stated.
 
     Taking the last would answer an ambiguous request by picking silently, and
@@ -95,7 +97,7 @@ def test_parse_dims_rejects_one_dimension_stated_twice() -> None:
     """
     with pytest.raises(ValueError, match="ctx_len was given twice"):
         cli.parse_dims(["ctx_len=8", "ctx_len=512"])
-    # Repeating the same extent is still two statements of one dimension.
+
     with pytest.raises(ValueError, match="ctx_len was given twice"):
         cli.parse_dims(["ctx_len=8", "ctx_len=8"])
 
@@ -108,9 +110,7 @@ def test_schedule_rejects_several_extents_per_dimension(capsys) -> None:
     assert "asking several EXTENTs together is for check" in refused
 
 
-def test_analyze_reads_a_launch_provided_topology_from_its_mesh_layout(
-    tmp_path, capsys
-) -> None:
+def test_analyze_reads_a_launch_provided_topology_from_its_mesh_layout(tmp_path, capsys) -> None:
     source = tmp_path / "dynamic_tiles.py"
     source.write_text(
         "from tilefoundry import func\n"

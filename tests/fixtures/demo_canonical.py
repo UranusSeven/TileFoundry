@@ -29,9 +29,7 @@ from tilefoundry.ir.types.shard import (
 def demo_canonical(
     a: Tensor[(1, 1536), "f32"],
 ) -> Tensor[(1, 1536), "f32"]:
-    with Mesh(
-        ("cta",), layout=Layout(shape=(128,), strides=(1,))
-    ) as cta_mesh:
+    with Mesh(("cta",), layout=Layout(shape=(128,), strides=(1,))) as cta_mesh:
         b = reshard(
             a,
             layout=ShardLayout(
@@ -72,7 +70,8 @@ def build_demo_canonical() -> Module:
     """Return the canonical Module of the topology-aware fixture.
 
     The fixture declares its execution context on the function, so the
-    decorated name is the single-function Module that owns it."""
+    decorated name is the single-function Module that owns it.
+    """
     ir = demo_canonical
     if not isinstance(ir, Module):
         raise TypeError(f"expected Module, got {type(ir)}")

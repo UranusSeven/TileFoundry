@@ -72,13 +72,13 @@ def _eval_call(op: Op, *args: Expr) -> Evaluate:
     return Evaluate(callable=op, args=args)
 
 
-# ── ExprVisitor / ExprMutator ─────────────────────────────────────────────
-
-
 def test_expr_visitor_dispatches_by_class_name_and_shares_unchanged_branches() -> None:
-    """``visit_<ClassName>`` dispatch, in child order; a plain ExprMutator is the
+    """``visit_<ClassName>`` dispatch, in child order.
+
+    ``visit_<ClassName>`` dispatch, in child order; a plain ExprMutator is the
     identity; and replacing one Var rebuilds its containing Call while sharing the
-    siblings that were not touched."""
+    siblings that were not touched.
+    """
     visits = []
 
     class V(ExprVisitor[None]):
@@ -109,14 +109,16 @@ def test_expr_visitor_dispatches_by_class_name_and_shares_unchanged_branches() -
     out = OnlyReplaceY().visit(top)
     assert out is not top
     assert out.args[0] is not sub
-    assert out.args[0].args[0] is x  # x unchanged → shared
+    assert out.args[0].args[0] is x
     assert out.args[1] is top.args[1]
 
 
 def test_expr_mutator_skips_grid_region_binding_vars() -> None:
-    """Binding-site Vars (``induction_var`` / ``carried_args``) are not
-    exposed to a generic ExprMutator (would otherwise be type-illegal)."""
+    """Binding-site Vars are not exposed to a generic ExprMutator.
 
+    Binding-site Vars (``induction_var`` / ``carried_args``) are not
+    exposed to a generic ExprMutator (would otherwise be type-illegal).
+    """
     ind = _var("i", _i32())
     carried = (_var("a"), _var("b"))
     init = (_var("a0"), _var("b0"))
@@ -141,21 +143,20 @@ def test_expr_mutator_skips_grid_region_binding_vars() -> None:
     out = ToConst().visit(region)
     assert out.induction_var is ind and out.carried_args is carried
     assert isinstance(out.body, Constant)
-    # Binding-site Vars stay untouched; init_args are value children → rewritten.
+
     assert "i" not in replaced and "a" not in replaced and "b" not in replaced
     assert "a0" in replaced and "b0" in replaced
     assert all(isinstance(e, Constant) for e in out.init_args)
 
 
-# ── StmtVisitor / StmtMutator ─────────────────────────────────────────────
-
-
 def _simple_for_body() -> For:
     i = _var("i", _i32())
-    body = Sequential(body=(
-        _eval_call(Copy(), _var("src"), _var("dst")),
-        _eval_call(Fill(), _var("t"), _const(0.0)),
-    ))
+    body = Sequential(
+        body=(
+            _eval_call(Copy(), _var("src"), _var("dst")),
+            _eval_call(Fill(), _var("t"), _const(0.0)),
+        )
+    )
     return For(
         induction_var=i,
         start=_const(0, _i32()),
@@ -166,10 +167,13 @@ def _simple_for_body() -> For:
 
 
 def test_stmt_walk_stays_in_the_stmt_tree_and_shares_unchanged_siblings() -> None:
-    """``StmtVisitor`` walks child Stmts only — embedded Expr fields are NOT
+    """``StmtVisitor`` walks child Stmts only.
+
+    ``StmtVisitor`` walks child Stmts only — embedded Expr fields are NOT
     traversed (use ``StmtExprMutator`` for that) — and replacing one
     ``Evaluate(Copy)`` rebuilds the For body while sharing the untouched
-    ``Evaluate(Fill)`` sibling."""
+    ``Evaluate(Fill)`` sibling.
+    """
     seen: list[str] = []
     visited_vars: list[str] = []
 
@@ -181,7 +185,7 @@ def test_stmt_walk_stays_in_the_stmt_tree_and_shares_unchanged_siblings() -> Non
             seen.append("For")
             self.generic_visit(stmt)
 
-        def visit_Var(self, var):  # would only fire if Expr-walk happened
+        def visit_Var(self, var):
             visited_vars.append(var.name)
 
     V().visit(_simple_for_body())
@@ -198,8 +202,8 @@ def test_stmt_walk_stays_in_the_stmt_tree_and_shares_unchanged_siblings() -> Non
 
     out = ReplaceCopy().visit(s)
     assert out is not s
-    assert out.body.body[0] is not s.body.body[0]  # Copy replaced
-    assert out.body.body[1] is s.body.body[1]      # Fill shared
+    assert out.body.body[0] is not s.body.body[0]
+    assert out.body.body[1] is s.body.body[1]
 
 
 def test_stmt_mutator_covers_all_subclasses_with_identity_invariant() -> None:
@@ -215,7 +219,9 @@ def test_stmt_mutator_covers_all_subclasses_with_identity_invariant() -> None:
         Return(),
         For(
             induction_var=i,
-            start=_const(0, _i32()), stop=_const(8, _i32()), step=_const(1, _i32()),
+            start=_const(0, _i32()),
+            stop=_const(8, _i32()),
+            step=_const(1, _i32()),
             body=_seq(_eval_call(Copy(), _var("s"), _var("d"))),
         ),
         While(cond=_var("c"), body=_seq(_eval_call(Copy(), _var("s2"), _var("d2")))),
@@ -235,14 +241,14 @@ def test_stmt_mutator_covers_all_subclasses_with_identity_invariant() -> None:
         assert m.visit(s) is s, f"identity broken on {type(s).__name__}"
 
 
-# ── StmtExprMutator ──────────────────────────────────────────────────────
-
-
 def test_stmt_expr_mutator_rewrites_expr_fields_tuples_and_symbolref_leaf() -> None:
-    """Rewrites scalar Expr fields (``For.stop``) and tuple Expr fields
+    """Test stmt expr mutator rewrites expr fields tuples and symbolref leaf.
+
+    Rewrites scalar Expr fields (``For.stop``) and tuple Expr fields
     (``Evaluate.args``) with partial-share semantics, and visits an ``Evaluate``
     whose callable is a ``SymbolRef`` (an Expr leaf) without error — guarding
-    against a missing SymbolRef branch in the Expr child/rebuild tables."""
+    against a missing SymbolRef branch in the Expr child/rebuild tables.
+    """
     s = _simple_for_body()
 
     class RewriteConst(StmtExprMutator):
@@ -258,7 +264,6 @@ def test_stmt_expr_mutator_rewrites_expr_fields_tuples_and_symbolref_leaf() -> N
     ref = SymbolRef(name="callee", type=ct)
     call_stmt = Evaluate(callable=ref, args=(a, b, c))
 
-    # A no-op mutator preserves identity of the whole Evaluate, SymbolRef included.
     assert StmtExprMutator().visit_stmt(call_stmt) is call_stmt
 
     class ReplaceB(StmtExprMutator):
@@ -266,17 +271,17 @@ def test_stmt_expr_mutator_rewrites_expr_fields_tuples_and_symbolref_leaf() -> N
             return _var("b2") if var.name == "b" else var
 
     out = ReplaceB().visit_stmt(call_stmt)
-    assert out.callable is ref          # SymbolRef leaf unchanged → shared
+    assert out.callable is ref
     assert out.args[0] is a and out.args[2] is c
     assert out.args[1] is not b
 
 
-# ── PrimFunction walk + rewrite ──────────────────────────────────────────
-
-
 def test_prim_function_walk_and_identity_preserving_rewrite() -> None:
-    """``walk_prim_function`` is read-only; ``rewrite_prim_function`` with a
-    no-op mutator returns the original PrimFunction."""
+    """``walk_prim_function`` is read-only.
+
+    ``walk_prim_function`` is read-only; ``rewrite_prim_function`` with a
+    no-op mutator returns the original PrimFunction.
+    """
     seen: list[str] = []
     s = _simple_for_body()
     pf = PrimFunction(name="foo", params=(), body=Sequential(body=(s,)))

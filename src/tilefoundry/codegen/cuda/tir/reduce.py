@@ -13,10 +13,13 @@ _REDUCE_TAG = {
 
 
 def _axes_pack_typename(axes: tuple) -> str:
-    """Render the HIR ``axes`` tuple as a ``cute::tuple<cute::Int<i>...>``
+    """Axes pack typename.
+
+    Render the HIR ``axes`` tuple as a ``cute::tuple<cute::Int<i>...>``
     template type for the runtime entry point. Using cute's native
     tuple keeps the reduce dispatch idiomatic with the rest of the
-    codegen."""
+    codegen.
+    """
     args = ", ".join(f"cute::Int<{int(a)}>" for a in axes)
     return f"cute::tuple<{args}>"
 
@@ -29,9 +32,9 @@ def _emit(call, ctx: CodegenContext) -> None:
     op_tag = _REDUCE_TAG[call.target.kind]
     axes_t = _axes_pack_typename(call.target.axes)
 
-    # Single public entry for every case. The runtime ``reduce`` derives the
-    # tier (sharded) or the extents (plain, non-sharded) from the operands;
-    # a workspace arg is passed only when the lowering sized one.
+
+
+
     if len(call.args) >= 3:
         ws_n = ctx.name_for(call.args[2])
         ctx.emit(

@@ -71,8 +71,11 @@ def _problem():
 
 
 def test_a_buffer_that_carries_a_dependence_gets_more_than_one_slot() -> None:
-    """The property that makes this a pipeline: `h` is the accumulator the
-    matmul carries along k, so it has to hold two tiles at once."""
+    """The property that makes this a pipeline: `h` is the accumulator the matmul carries along k.
+
+    The property that makes this a pipeline: `h` is the accumulator the
+    matmul carries along k, so it has to hold two tiles at once.
+    """
     problem = _problem()
     carried = {buffer.id: buffer.carried_distances for buffer in problem.buffers}
     assert carried["h"] == (("MM", (0, 0, 1)),)
@@ -86,6 +89,7 @@ def test_a_buffer_that_carries_a_dependence_gets_more_than_one_slot() -> None:
 
 def test_ring_depth_counts_tiles_not_iterations() -> None:
     """A distance shorter than the tile it runs inside spans one tile."""
+
     def depth(distance: int, tile: int) -> int:
         problem = PipelineProblem(
             topology="thread",
@@ -127,9 +131,7 @@ def test_a_statement_records_what_it_holds_against_the_tile_store() -> None:
     solution = solve_pipeline_problem(problem)
     ring = {buffer.id: buffer.ring_depth for buffer in solution.buffers}
     matmul_solution = next(item for item in solution.statements if item.id == "MM")
-    assert matmul_solution.footprint_bytes == sum(
-        held[name] * ring[name] for name in held
-    )
+    assert matmul_solution.footprint_bytes == sum(held[name] * ring[name] for name in held)
     assert matmul_solution.fits_capacity is (
         matmul_solution.footprint_bytes <= problem.capacity_bytes
     )

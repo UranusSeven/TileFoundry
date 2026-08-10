@@ -3,6 +3,7 @@
 Covers static and dynamic CTA launches, implicit and explicit CPU entries,
 multi-CTA execution, and device-placement and shape negatives.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -25,9 +26,6 @@ class ExternalH200Target(CudaTarget):
     name = "tests.integration.external_h200"
 
 
-# Multi-CTA elementwise: the cta mesh splits the rows, so CTA i owns row i.
-# Running only one CTA would leave the other rows wrong, which the full-output
-# assertion catches.
 @func(topologies=(Topology("cta", _ROWS),))
 def double_rows(a: Tensor[(_ROWS, _COLS), "f32"]) -> Tensor[(_ROWS, _COLS), "f32"]:
     with Mesh(("cta",), layout=Layout(shape=(_ROWS,), strides=(1,))) as cta:
@@ -36,13 +34,11 @@ def double_rows(a: Tensor[(_ROWS, _COLS), "f32"]) -> Tensor[(_ROWS, _COLS), "f32
         return reshard(out, layout=(128 @ cta, 12), storage=gmem)  # noqa: F405
 
 
-# Explicit host entry launching the device kernel above.
 @prim_func(target=CpuTarget())
 def host_double(a: Tensor[(_ROWS, _COLS), "f32"], out: Tensor[(_ROWS, _COLS), "f32"]):
     launch(double_rows, a, out, grid=(_ROWS, 1, 1), block=(1, 1, 1))  # noqa: F821
 
 
-# Within-CTA per-row reduce: a single CTA reduces the row across its threads.
 @func(topologies=(Topology("thread", 6 * 32),))
 def row_mean(a: Tensor[(1, 1536), "f32"]) -> Tensor[(1, 1), "f32"]:
     with Mesh(("thread",), (6, 32), ("w", "t")) as m:
@@ -53,7 +49,7 @@ def row_mean(a: Tensor[(1, 1536), "f32"]) -> Tensor[(1, 1), "f32"]:
 
 def _randn_rows() -> torch.Tensor:
     torch.manual_seed(0)
-    # Non-uniform per-row data so a wrong CTA region cannot pass by luck.
+
     return torch.randn(_ROWS, _COLS, dtype=torch.float32, device="cuda")
 
 
@@ -123,28 +119,22 @@ def test_implicit_entry_within_cta_reduce() -> None:
 
 
 def test_launch_rejects_cpu_tensor_at_host_wrapper() -> None:
-    """A CPU tensor handed to a CUDA launch must error at the host wrapper's
-    device-placement check (naming the argument and the expected device)."""
+    """A CPU tensor handed to a CUDA launch must error at the host wrapper's device-placement check.
+
+    A CPU tensor handed to a CUDA launch must error at the host wrapper's
+    device-placement check (naming the argument and the expected device).
+    """
     rm = tilefoundry.compile(
         double_rows,
         target=CudaTarget("nvidia.h200_sxm"),
     )
-    x_cpu = torch.randn(_ROWS, _COLS, dtype=torch.float32)  # host tensor
+    x_cpu = torch.randn(_ROWS, _COLS, dtype=torch.float32)
     out = torch.empty(_ROWS, _COLS, dtype=torch.float32, device="cuda")
-    # The host wrapper's placement check names the offending argument and the
-    # expected device type: ``tilefoundry: argument 'a' must be a kDLCUDA tensor``.
+
     with pytest.raises(Exception, match=r"argument 'a' must be a kDLCUDA tensor"):
         rm(x_cpu, out)
 
 
-# --- Dynamic (launch-provided) CTA extent ------------------------------------
-#
-# The tensor is tiled ``(Ntile, TILE)``: the outer ``Ntile`` axis is a dynamic
-# dimension variable (the CTA count, supplied by the host launch) and ``TILE``
-# is the static inner extent each CTA owns. The cta mesh extent is ``None``
-# (launch-provided), and the cta ``Split`` acts only on the dynamic outer axis,
-# so each CTA owns a single ``(1, TILE)`` tile — a static register fragment with
-# a dynamic number of CTAs.
 _TILE = 12
 _NT = DimVar("Ntile", 1, 64)
 
@@ -173,8 +163,6 @@ def dyn_double(a: Tensor[(_NT, _TILE), "f32"]) -> Tensor[(_NT, _TILE), "f32"]:
         )
 
 
-# A dynamic CTA extent has no compile-time grid, so it must be launched
-# explicitly — the host wrapper reads the grid from the tensor's runtime shape.
 @prim_func(target=CpuTarget())
 def host_dyn_double(a: Tensor[(_NT, _TILE), "f32"], out: Tensor[(_NT, _TILE), "f32"]):
     launch(dyn_double, a, out, grid=(_NT, 1, 1), block=(1, 1, 1))  # noqa: F821
@@ -190,9 +178,12 @@ def _dyn_module() -> Module:
 
 
 def test_dynamic_cta_two_shapes_one_compile() -> None:
-    """One compiled artifact launches the dynamic-CTA kernel at two different
+    """Test dynamic cta two shapes one compile.
+
+    One compiled artifact launches the dynamic-CTA kernel at two different
     ``Ntile`` shapes via the host-computed grid; both match torch with no
-    recompile."""
+    recompile.
+    """
     rm = tilefoundry.compile(_dyn_module(), target=CudaTarget("nvidia.h200_sxm"))
     for nt in (4, 8):
         torch.manual_seed(nt)
@@ -204,28 +195,39 @@ def test_dynamic_cta_two_shapes_one_compile() -> None:
 
 
 def test_dynamic_cta_rejects_implicit_entry() -> None:
-    """A dynamic-CTA kernel has no compile-time grid, so the implicit
+    """A dynamic-CTA kernel has no compile-time grid.
+
+    A dynamic-CTA kernel has no compile-time grid, so the implicit
     auto-inserted host entry cannot derive one — it must error loudly rather
-    than guess a CTA count."""
+    than guess a CTA count.
+    """
     mod = Module(
-        name="m", functions=(dyn_double.entry_function(),), entry="dyn_double",
-        topologies=dyn_double.effective_topologies()
+        name="m",
+        functions=(dyn_double.entry_function(),),
+        entry="dyn_double",
+        topologies=dyn_double.effective_topologies(),
     )
     with pytest.raises(Exception, match=r"cannot derive its grid"):
         tilefoundry.compile(mod, target=CudaTarget("nvidia.h200_sxm"))
 
 
 def test_dynamic_thread_topology_rejected() -> None:
-    """Only a ``cta`` topology may carry a launch-provided (``None``) extent; a
+    """Only a ``cta`` topology may carry a launch-provided (``None``) extent.
+
+    Only a ``cta`` topology may carry a launch-provided (``None``) extent; a
     dynamic thread/warp extent has no launch source and is rejected at
-    construction."""
+    construction.
+    """
     with pytest.raises(ValueError, match=r"only a 'cta' topology"):
         Topology("thread", None)
 
 
 def _launch_entry_with_grid_x(extent):
-    """A CPU host entry whose single launch uses *extent* as ``grid_x`` — for
-    exercising the grid/block extent verifier on constructed IR."""
+    """A CPU host entry whose single launch uses *extent* as ``grid_x``.
+
+    A CPU host entry whose single launch uses *extent* as ``grid_x`` — for
+    exercising the grid/block extent verifier on constructed IR.
+    """
     from tilefoundry.ir.core import Constant, Var  # noqa: PLC0415
     from tilefoundry.ir.tir.launch import Launch  # noqa: PLC0415
     from tilefoundry.ir.tir.prim_function import PrimFunction  # noqa: PLC0415
@@ -238,17 +240,18 @@ def _launch_entry_with_grid_x(extent):
     a = Var(type=t, name="a")
     i64 = TensorType.scalar(DType.i64)
     one = Constant(type=i64, value=1)
-    ref = SymbolRef(
-        name="dev", type=CallableType(return_type=UnitType(), parameters=(t,))
-    )
+    ref = SymbolRef(name="dev", type=CallableType(return_type=UnitType(), parameters=(t,)))
     args = (ref, extent, one, one, one, one, one, a)
     body = Sequential(body=(Evaluate(callable=Launch(), args=args),))
     return PrimFunction(name="host", params=(a,), body=body, target=CpuTarget())
 
 
 def test_launch_extent_rejects_raw_dimvar() -> None:
-    """A grid/block extent slot must be an Expr; a raw ``DimVar`` Op (which is
-    not an Expr) is rejected by verify ([tir §1.3](docs/spec/tir.md#13-primfunction))."""
+    """A grid/block extent slot must be an Expr.
+
+    A grid/block extent slot must be an Expr; a raw ``DimVar`` Op (which is
+    not an Expr) is rejected by verify ([tir §1.3](docs/spec/tir.md#13-primfunction)).
+    """
     from tilefoundry.ir.core import VerifyError  # noqa: PLC0415
     from tilefoundry.ir.tir.verify import verify_prim_function  # noqa: PLC0415
 
@@ -258,8 +261,11 @@ def test_launch_extent_rejects_raw_dimvar() -> None:
 
 
 def test_launch_extent_rejects_external_shapeof() -> None:
-    """A grid/block ``ShapeOf`` extent must reference a forwarded / entry
-    parameter; a ShapeOf of an unrelated Var is rejected by verify."""
+    """A grid/block ``ShapeOf`` extent must reference a forwarded / entry parameter.
+
+    A grid/block ``ShapeOf`` extent must reference a forwarded / entry
+    parameter; a ShapeOf of an unrelated Var is rejected by verify.
+    """
     from tilefoundry.ir.core import Var, VerifyError  # noqa: PLC0415
     from tilefoundry.ir.tir.shape import ShapeOf  # noqa: PLC0415
     from tilefoundry.ir.tir.verify import verify_prim_function  # noqa: PLC0415
