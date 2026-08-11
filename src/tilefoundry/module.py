@@ -34,6 +34,104 @@ class _Entry:
 _DECLARING: list[_Entry] = []
 
 
+def enclosing_declaration(frame: FrameType | None) -> _Entry | None:
+    """The active ``@module`` declaration whose class body encloses *frame*.
+
+    Matched on the declaring frame rather than on one being open anywhere: an
+    unrelated or stale open declaration must not make a standalone function
+    look like a member of a class body it was never written in.
+    """
+    while frame is not None:
+        if "__qualname__" in frame.f_locals:
+            for entry in reversed(_DECLARING):
+                if entry.frame is frame.f_back:
+                    return entry
+        elif frame.f_code.co_name == "<module>":
+            return None
+        frame = frame.f_back
+    return None
+
+
+def _retarget_module_calls(owner: str, functions, attached: dict) -> None:
+    """Rebuild each marked call against the child attached under its binding.
+
+    Runs before ``Module`` construction seals the functions. The record is
+    repointed at the attached child before the rebuild reads it, because
+    attaching may have copied the Module the class body named. A binding the
+    class body does not attach is refused: there is no child to rebuild against,
+    and collecting it would leave the call pointing outside the tree being built.
+    """
+    from tilefoundry.ir.core import (  # noqa: PLC0415 — avoid import cycle
+        FunctionScope,
+        TypeInferContext,
+        get_metadata,
+    )
+    from tilefoundry.ir.core.expr import (  # noqa: PLC0415 — avoid import cycle
+        Call,
+        child_exprs,
+    )
+    from tilefoundry.ir.hir.function import Function as HirFunction  # noqa: PLC0415
+    from tilefoundry.ir.hir.function import elaborate  # noqa: PLC0415
+    from tilefoundry.parser.base import _ModuleCallee  # noqa: PLC0415
+
+    seen: set[int] = set()
+    unattached: list[str] = []
+
+    def visit(expr) -> None:
+        if expr is None or id(expr) in seen:
+            return
+        seen.add(id(expr))
+        if isinstance(expr, Call) and isinstance(expr.target, HirFunction):
+            record = get_metadata(expr, _ModuleCallee)
+            if record is None:
+                visit(expr.target)
+            elif record.binding not in attached:
+                unattached.append(record.binding)
+            else:
+                child = attached[record.binding]
+                entry = child.entry_function()
+                object.__setattr__(
+                    expr,
+                    "metadata",
+                    tuple(
+                        _ModuleCallee(record.binding, child)
+                        if isinstance(m, _ModuleCallee)
+                        else m
+                        for m in expr.metadata
+                    ),
+                )
+                object.__setattr__(
+                    expr,
+                    "target",
+                    elaborate(
+                        entry,
+                        tuple(a.type for a in expr.args),
+                        TypeInferContext(scope=FunctionScope(child, entry)),
+                        call=expr,
+                    ),
+                )
+                object.__setattr__(
+                    expr,
+                    "metadata",
+                    tuple(m for m in expr.metadata if not isinstance(m, _ModuleCallee)),
+                )
+            for arg in expr.args:
+                visit(arg)
+            return
+        for child in child_exprs(expr):
+            visit(child)
+
+    for fn in functions:
+        visit(fn)
+    if unattached:
+        raise ValueError(
+            f"@module {owner!r}: call(s) to Module(s) {sorted(set(unattached))} that "
+            f"no class-body binding attaches; it binds {sorted(attached)}. A Module "
+            f"call is rebuilt against the child attached under the binding it names, "
+            f"so a name nothing binds has no child to call"
+        )
+
+
 def _validate(topologies) -> tuple:
     from tilefoundry.ir.types.shard.mesh import Topology  # noqa: PLC0415
 
@@ -81,6 +179,7 @@ def module(
         functions = []
         child_modules = []
         methods = {}
+        attached: dict[str, Module] = {}
         for name, value in vars(cls_inner).items():
             if name == "__call__":
 
@@ -96,7 +195,9 @@ def module(
             if isinstance(value, Module):
 
 
-                child_modules.append(value.renamed(name) if value.name != name else value)
+                child = value if value.name == name else value.renamed(name)
+                child_modules.append(child)
+                attached[name] = child
                 continue
             if isinstance(value, (tuple, list)) and value and all(
                 isinstance(m, Module) for m in value
@@ -146,6 +247,7 @@ def module(
                 f"{mod_dupes} (a class-body alias of a nested @module is not "
                 f"allowed; one name maps to one child module)"
             )
+        _retarget_module_calls(cls_inner.__name__, functions, attached)
         if entry is not None and entry not in names:
             raise ValueError(
                 f"@module {cls_inner.__name__!r}: entry {entry!r} names no "

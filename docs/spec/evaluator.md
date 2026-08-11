@@ -108,6 +108,13 @@ corresponding positional input:
   tensor's concrete shape. A later occurrence of the same `DimVar` MUST
   agree with the first binding.
 
+- constraints:
+  - `evaluate` is the exact public entry: it MUST take one input per declared
+    parameter and MUST take no resource context. A run whose constants come from
+    a loaded reading instead is `LoadedModule` execution
+    ([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)),
+    not this entry.
+
 ## 3. `register_eval` and the eval context
 
 Each op's value semantics are a handler registered against the op

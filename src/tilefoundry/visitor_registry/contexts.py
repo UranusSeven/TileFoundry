@@ -40,18 +40,33 @@ def _constant_type(value: object) -> TensorType:
     return TensorType.meta_scalar(dtype)
 
 
+@dataclass(frozen=True)
+class FunctionScope:
+    """Where a walk is reading: one Module tree, and whose body it is in.
+
+    A `Function` carries no execution context and one object is reachable from
+    more than one program, so anything answered about the function being read --
+    which Module owns it, what it may reach -- is answered within the tree the
+    walk was given rather than globally.
+    """
+
+    module: Module
+    function: Function
+
+
 @dataclass
 class TypeInferContext:
     """Cache walk-local types and format type-inference errors.
 
-    Derivation lives in ``TypeInferVisitor``. ``mesh_scope`` carries enclosing
-    scopes to statement verifiers without generic verification importing
-    operation classes. ``elaboration_cache`` memoizes function instances by
-    template identity and argument types for one parse or elaboration walk.
+    Derivation lives in ``TypeInferVisitor``. ``scope`` says where the walk is
+    reading. ``mesh_scope`` carries enclosing scopes to statement verifiers
+    without generic verification importing operation classes.
+    ``elaboration_cache`` memoizes function instances by template identity and
+    argument types for one parse or elaboration walk.
     See [visitor-registry §4](docs/spec/visitor-registry.md#4-instance-1--typeinfer).
     """
 
-    module: Any = None
+    scope: FunctionScope | None = None
     cache: dict[int, Type] = field(default_factory=dict)
     mesh_scope: tuple = ()
     elaboration_cache: dict[tuple, Any] = field(default_factory=dict)
@@ -182,6 +197,7 @@ class Cost:
 
 
 __all__ = [
+    "FunctionScope",
     "TypeInferContext",
     "VerifyContext",
     "CostContext",

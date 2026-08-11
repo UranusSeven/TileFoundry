@@ -16,7 +16,7 @@ from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.types.shard import Topology
 from tilefoundry.target import Target
-from tilefoundry.visitor_registry.contexts import CostContext
+from tilefoundry.visitor_registry.contexts import CostContext, FunctionScope
 from tilefoundry.visitor_registry.visitors import CostEvaluator
 
 from .errors import AnalysisError
@@ -171,12 +171,13 @@ def analyze_compute_cost(
     callee's totals rather than re-walking its body.
     """
     topologies = _resolved_topologies(module.effective_topologies(), target)
-    whole = CostEvaluator(CostContext(module=module))
-    local = CostEvaluator(
-        CostContext(module=module, level=level, topologies=topologies)
-    )
     totals: dict[int, _Totals] = {}
     for fn in reversed(reachable_functions(function)):
+        scope = FunctionScope(module, fn)
+        whole = CostEvaluator(CostContext(scope=scope))
+        local = CostEvaluator(
+            CostContext(scope=scope, level=level, topologies=topologies)
+        )
         flops: dict[str, int] = {}
         flops_per_unit: dict[str, int] = {}
         traffic: dict[str, TrafficBytes] = {}

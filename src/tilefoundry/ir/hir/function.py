@@ -12,7 +12,7 @@ from tilefoundry.ir.types import TensorType, Type, callable_type_for
 from tilefoundry.ir.types.dim import is_dim_expr
 from tilefoundry.ir.types.substitute import substitute_shape_dim
 from tilefoundry.visitor_registry import register_typeinfer
-from tilefoundry.visitor_registry.contexts import TypeInferContext
+from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 
 
 @dataclass(frozen=True)
@@ -105,6 +105,7 @@ class Function(Expr):
             conv.seal()
 
 
+from tilefoundry.ir.hir._call_binding import binding_for  # noqa: E402
 from tilefoundry.ir.visitor import ExprMutator  # noqa: E402
 
 
@@ -124,6 +125,12 @@ def canonical_specialization_signature(
         else:
             parts.append(repr(pat))
     return ";".join(parts)
+
+
+def _scope_for(ctx: TypeInferContext, callee: "Function") -> "FunctionScope | None":
+    """*ctx*'s scope moved to *callee*, whose body is about to be read."""
+    scope = ctx.scope
+    return None if scope is None else dataclasses.replace(scope, function=callee)
 
 
 def _bind_param_type(
@@ -172,35 +179,45 @@ def elaborate(
 
     Dispatch prototypes and already-equal bindings return unchanged. Other
     templates rebuild per distinct type tuple and reuse the construction
-    session's elaboration cache. ``call`` anchors binding errors when present.
+    session's elaboration cache. ``call`` anchors binding errors when present,
+    and is what says how the call binds: one whose callee's constants come from
+    a Module reading binds the non-constant parameters alone.
 
     See [hir §1.1](docs/spec/hir.md#11-function).
     """
     if ctx is None:
         ctx = TypeInferContext()
-    expected = len(callee.params)
+    binding = binding_for(callee, call, ctx)
+    expected = len(binding.params)
     got = len(arg_types)
     if got != expected:
+        kind = "activation(s)" if binding.from_reading else "parameter(s)"
         ctx.error(
             call if call is not None else callee,
             f"hir Function call {callee.name!r}: arity mismatch — "
-            f"callee declares {expected} parameter(s), call passed {got}",
+            f"callee declares {expected} {kind}, call passed {got}",
         )
-    bound_types = [
-        _bind_param_type(ctx, callee, i, param, arg_ty, call)
-        for i, (param, arg_ty) in enumerate(zip(callee.params, arg_types))
-    ]
+    given = iter(enumerate(arg_types))
+    bound_types = []
+    for param in callee.params:
+        if binding.from_reading and param.is_const:
+            bound_types.append(param.type)
+            continue
+        index, arg_ty = next(given)
+        bound_types.append(_bind_param_type(ctx, callee, index, param, arg_ty, call))
     if callee.variants or callee.body is None:
         return callee
     if all(bt == p.type for bt, p in zip(bound_types, callee.params)):
         return callee
 
-    cache_key = (id(callee), arg_types)
+    cache_key = (id(callee), arg_types, binding.from_reading)
     cached = ctx.elaboration_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    instance = _elaborate_from_bound_types(callee, bound_types, ctx)
+    instance = _elaborate_from_bound_types(
+        callee, bound_types, ctx, scope=binding.scope
+    )
     ctx.elaboration_cache[cache_key] = instance
     return instance
 
@@ -211,12 +228,16 @@ def _elaborate_from_bound_types(
     ctx: TypeInferContext,
     *,
     dims: "Mapping[str, int] | None" = None,
+    scope: "FunctionScope | None" = None,
 ) -> "Function":
     """Rebuild ``callee`` with parameters at *bound_types*.
 
     Calls and specializations share this path. Optional *dims* also substitute
     loop bounds and shape-valued operation attributes that are not reachable
-    through expression types.
+    through expression types. The rebuild records ``callee`` as its origin, so
+    the instance a `Call` targets stays connected to the function a Module owns
+    without matching on the name they share; a call site chooses no extent and
+    so records none.
     """
     new_params = tuple(
         Var(type=bt, name=p.name, is_const=p.is_const) for bt, p in zip(bound_types, callee.params)
@@ -350,18 +371,25 @@ def _elaborate_from_bound_types(
             pinned.append(rebuilt)
             return dataclasses.replace(rebuilt, type=self.body_ctx.type_of(rebuilt))
 
+    inner = scope if scope is not None else _scope_for(ctx, callee)
     if dims is None:
-        body_ctx = TypeInferContext(module=ctx.module, elaboration_cache=ctx.elaboration_cache)
+        body_ctx = TypeInferContext(
+            scope=inner, elaboration_cache=ctx.elaboration_cache
+        )
     else:
-        body_ctx = TypeInferContext(module=ctx.module)
+        body_ctx = TypeInferContext(scope=inner)
     new_body = _Elaborator(body_ctx).visit(callee.body)
-    return Function.build(
+    derived = Function.build(
         name=callee.name,
         params=new_params,
         body=new_body,
         return_type=new_body.type,
         specializations=callee.specializations,
     )
+    from .specialize import _record_provenance  # noqa: PLC0415 — avoid import cycle
+
+    _record_provenance(derived, callee, dims)
+    return derived
 
 
 def _specialize_callee(
@@ -447,10 +475,15 @@ def _typeinfer_hir_function_call(call: Call, ctx) -> Type:
     """
     callee: Function = call.target  # type: ignore[assignment]
     arg_types = tuple(ctx.type_of(a) for a in call.args)
+    binding = binding_for(callee, call, ctx)
     instance = elaborate(callee, arg_types, ctx, call=call)
     if instance.body is None:
         return instance.return_type
-    return TypeInferContext(module=ctx.module).type_of(instance.body)
+    inner = binding.scope
+    body_ctx = TypeInferContext(
+        scope=None if inner is None else dataclasses.replace(inner, function=instance)
+    )
+    return body_ctx.type_of(instance.body)
 
 
 __all__ = [

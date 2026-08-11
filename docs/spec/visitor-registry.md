@@ -163,19 +163,32 @@ class AnalysisRegistry(Generic[Key]):          # Key = type[Op] or type[Stmt]
 Context:
 
 ```python
+@dataclass(frozen=True)
+class FunctionScope:
+    """Where a walk is reading: one Module tree, and whose body it is in.
+
+    Attributes:
+        module: attribute; the Module tree the walk answers questions within.
+        function: attribute; the Function whose body the walk is reading.
+    """
+
+    module: Module
+    function: Function
+
+
 @dataclass
 class TypeInferContext:
     """Walk-local type cache, mesh scope, and elaboration cache.
 
     Attributes:
-        module: attribute; module being checked, or ``None`` when no module is
-            required.
+        scope: attribute; where the walk is reading, or ``None`` when it was
+            given no scope.
         cache: attribute; memoized ``id(expr)`` to inferred ``Type``.
         mesh_scope: attribute; enclosing mesh scope tuple.
         elaboration_cache: attribute; memoized specialization instances.
     """
 
-    module: Any = None
+    scope: FunctionScope | None = None
     cache: dict[int, Type] = field(default_factory=dict)
     mesh_scope: tuple = ()
     elaboration_cache: dict[tuple, Any] = field(default_factory=dict)
@@ -184,7 +197,21 @@ class TypeInferContext:
     def error(self, node: Expr | Stmt, msg: str) -> NoReturn: ...
 ```
 
+`FunctionScope` is the whole of what a walk states about where it is. A
+`Function` carries no execution context and one object is reachable from more
+than one program, so anything answered about the body being read — which Module
+owns it, what a call in it may reach — is answered within the tree the walk was
+given ([core-ir §1](./core-ir.md#1-module)). A walk given no scope answers
+nothing of that kind rather than guessing.
+
 - constraints:
+  - `scope` MUST be the only context state describing where a walk is reading,
+    and the pair MUST be reachable from the package root together, since one is
+    how the other is constructed.
+  - A walk-visible query answering a question about one construct — which Module
+    a particular kind of callee belongs to, how a particular call binds its
+    arguments ([hir §1.1](./hir.md#11-function)) — MUST NOT be added to the
+    context; such a question is resolved by whoever asks it, from `scope`.
   - `type_of` is a walk-local cache only — it holds no dispatch rule of its
     own. A cache miss delegates to `TypeInferVisitor(self).visit(expr)`
     (below), whose `visit_Call` is what consults
@@ -355,7 +382,7 @@ Context (extends `TypeInferContext` to share the type-of cache):
 
 ```python
 @dataclass
-class VerifyContext(TypeInferContext):   # inherits module / cache / type_of
+class VerifyContext(TypeInferContext):   # inherits scope / cache / type_of
     """Type inference context extended with the active mesh stack.
 
     Attributes:

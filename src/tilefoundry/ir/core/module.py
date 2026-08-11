@@ -27,6 +27,123 @@ _MISSING_PREPARED_WEIGHT = (
 )
 
 
+def subtree(root: "Module"):
+    """*root* and every Module below it, owners before the children they hold."""
+    yield root
+    for child in root.modules:
+        yield from subtree(child)
+
+
+def owning_module(root: "Module", function: object) -> "Module | None":
+    """The one node of *root*'s subtree that owns *function*, else ``None``.
+
+    A Function carries no execution context and one object is reachable from
+    more than one program, so the question is asked within a supplied tree. It
+    is answered by identity and by recorded origin, never by a name a copy
+    keeps. None covers both no owner and more than one: an unanswerable
+    question states nothing rather than defaulting to the root.
+    """
+    found: "Module | None" = None
+    for node in subtree(root):
+        if node.owns(function, derived=True):
+            if found is not None:
+                return None
+            found = node
+    return found
+
+
+def child_module_of(root: "Module", caller: object, callee: object) -> "Module | None":
+    """The direct child of *caller*'s owner that owns *callee*, else ``None``.
+
+    What a collected call no longer carries: the parser's binding record is
+    consumed, so which calls supply activations alone is re-derived from
+    ownership within *root*. It fails closed -- a same-owner call, and one
+    whose ends no single node owns, keeps its exact declared arity.
+    """
+    if not isinstance(callee, HirFunction) or caller is None:
+        return None
+    owner = owning_module(root, caller)
+    called = owning_module(root, callee)
+    if owner is None or called is None or called is owner:
+        return None
+    return called if any(child is called for child in owner.modules) else None
+
+
+def _calls_in(function) -> tuple:
+    """Every ``Call`` on a Function that the body of *function* makes.
+
+    Its own body and nothing else: a variant this dispatch did not select is
+    not running, and a converter runs offline rather than here.
+    """
+    from tilefoundry.ir.core.expr import Call, child_exprs  # noqa: PLC0415 -- cycle
+
+    found: list[Call] = []
+    seen: set[int] = set()
+
+    def visit(expr) -> None:
+        if expr is None or id(expr) in seen:
+            return
+        seen.add(id(expr))
+        if isinstance(expr, Call) and isinstance(expr.target, HirFunction):
+            found.append(expr)
+            for arg in expr.args:
+                visit(arg)
+            return
+        for child in child_exprs(expr):
+            visit(child)
+
+    visit(getattr(function, "body", None))
+    return tuple(found)
+
+
+def _extended_dims(params, arg_types, dims: dict) -> dict:
+    """*dims* plus the extents these argument types give *params*' DimVar axes."""
+    from tilefoundry.ir.types.dim import DimVar  # noqa: PLC0415 -- avoid import cycle
+
+    out = dict(dims)
+    for param, arg_type in zip(params, arg_types):
+        declared = getattr(param.type, "shape", None) or ()
+        given = getattr(arg_type, "shape", None) or ()
+        for axis, extent in zip(declared, given):
+            if (
+                isinstance(axis, DimVar)
+                and axis.name not in out
+                and isinstance(extent, int)
+                and not isinstance(extent, bool)
+            ):
+                out[axis.name] = extent
+    return out
+
+
+def _selected_target(call, dims: dict):
+    """The Function *call* runs, choosing a prototype's variant from *dims*.
+
+    A dispatch this walk cannot resolve is left as the prototype, whose body is
+    ``None``, so the walk stops there rather than claiming a branch.
+    """
+    from tilefoundry.ir.core.pattern import DimVarRangePat  # noqa: PLC0415 -- cycle
+    from tilefoundry.ir.hir.specialize import (  # noqa: PLC0415 -- avoid import cycle
+        SpecializationError,
+        variant_for,
+    )
+
+    callee = call.target
+    if not callee.variants:
+        return callee
+    stated = {
+        pattern.dim_var
+        for variant in callee.variants
+        for pattern in variant.specializations
+        if isinstance(pattern, DimVarRangePat)
+    }
+    if not stated <= set(dims):
+        return callee
+    try:
+        return variant_for(callee, dims)
+    except SpecializationError:
+        return callee
+
+
 def _validate_declared(module_name, source, value, decl_type) -> None:
     """Refuse a checkpoint value that disagrees with its declared tensor type."""
     from tilefoundry.evaluator.value import to_torch_dtype  # noqa: PLC0415 -- avoid evaluator cycle
@@ -285,7 +402,8 @@ class Module:
 
         Declared functions and their variants count. Structural equality and
         matching names do not. With ``derived=True``, a recorded
-        ``_specialized_from`` chain may lead back to an owned function.
+        ``_specialized_from`` chain may lead back to an owned function; the
+        whole chain is walked, because a rebuild may itself be rebuilt.
 
         See [core-ir §1](docs/spec/core-ir.md#1-module).
         """
@@ -298,7 +416,11 @@ class Module:
         if not derived:
             return False
         origin = getattr(function, "_specialized_from", None)
-        return origin is not None and self.owns(origin)
+        while origin is not None:
+            if self.owns(origin):
+                return True
+            origin = getattr(origin, "_specialized_from", None)
+        return False
 
     def entry_function(self) -> ModuleFunction:
         if self.entry is None:
@@ -387,8 +509,11 @@ class Module:
         canonical weights to *out_dir* as one safetensors shard plus an index.
         See [runtime §1.1.2](docs/spec/runtime.md#112-weight-converter-and-prepare--forward).
         """
-        flat: dict[str, object] = {}
-        self._prepare_into(raw, "", flat, device)
+        staged: dict[str, object] = {}
+        self._prepare_into(raw, "", staged, device)
+        flat = {
+            name: value.detach().contiguous().cpu() for name, value in staged.items()
+        }
 
         import json  # noqa: PLC0415 -- stdlib, only needed here
         from pathlib import Path  # noqa: PLC0415
@@ -403,11 +528,24 @@ class Module:
             json.dumps({"weight_map": {name: shard for name in flat}})
         )
 
-    def _prepare_into(self, raw, prefix: str, flat: dict, device: str) -> None:
+    def _prepare_into(self, raw, prefix: str, flat: dict, device: str) -> "LoadedModule":
+        """Stage this node's canonical weights, children before their owner.
+
+        A converter is an HIR body and may call a child, so the children it
+        could reach are staged first and handed to it as a reading. Everything
+        staged lands on *device*, which is what a converter then runs on;
+        publishing takes the CPU copies.
+        """
         import torch  # noqa: PLC0415 -- optional runtime dep
 
-        from tilefoundry.evaluator import evaluate  # noqa: PLC0415 -- avoid IR→evaluator cycle
+        from tilefoundry.evaluator.interpreter import (  # noqa: PLC0415 -- IR→evaluator
+            _run_bound,
+        )
 
+        children = tuple(
+            child._prepare_into(raw.subtree(child.name), f"{prefix}{child.name}.", flat, device)
+            for child in self.modules
+        )
         converter_map: dict[str, ModuleFunction] = {}
         for fn in self.functions:
             for weight_name, conv in getattr(fn, "converters", ()):
@@ -422,21 +560,26 @@ class Module:
         def _fetch(name):
 
             parts = raw.load_group(name)
-            return torch.stack(parts) if parts is not None else raw.load(name)
+            value = torch.stack(parts) if parts is not None else raw.load(name)
+            return value.to(device)
 
+        staged: dict[str, object] = {}
+        reading = LoadedModule(module=self, constants=staged, modules=children)
         for w, decl_type in self.weights.items():
             conv = converter_map.get(w)
             key = prefix + w
             if conv is None:
                 value = _fetch(w)
             else:
-                value = evaluate(conv, *[_fetch(p.name) for p in conv.params], device=device)
+                value = _run_bound(
+                    conv, [_fetch(p.name) for p in conv.params],
+                    device=device, reading=reading,
+                )
             source = f"converter for weight {key!r}" if conv is not None else f"raw weight {key!r}"
             _validate_declared(self.name, source, value, decl_type)
-            flat[key] = value.detach().contiguous().cpu()
-
-        for child in self.modules:
-            child._prepare_into(raw.subtree(child.name), f"{prefix}{child.name}.", flat, device)
+            staged[w] = value
+            flat[key] = value
+        return reading
 
     def cloned(self) -> "Module":
         """An independent copy of the IR graph: functions, bodies, children.
@@ -509,18 +652,66 @@ class LoadedModule:
             f"LoadedModule {self.name!r} has no function, child module, or method {name!r}"
         )
 
+    def _reached(
+        self, fn: ModuleFunction, dims: dict | None = None
+    ) -> tuple[tuple[str, "LoadedModule", object], ...]:
+        """Every (path, reading, function) a call from *fn* under this one runs.
+
+        The same resolver execution uses, so what is checked beforehand is what
+        will be reached. Reachability follows the bodies that run: a variant no
+        dispatch selects, an offline converter, and an attached child no call
+        reaches are all absent. *dims* are the extents the run was given, which
+        is what lets a nested dispatch be resolved the way execution resolves it.
+        """
+        from tilefoundry.evaluator.interpreter import (  # noqa: PLC0415 -- IR→evaluator
+            child_reading,
+        )
+        from tilefoundry.ir.hir._call_binding import (  # noqa: PLC0415 -- cycle
+            bound_params,
+        )
+
+        found: list[tuple[str, LoadedModule, object]] = []
+        seen: set[tuple[int, int]] = set()
+
+        def visit(path: str, reading: "LoadedModule", function, extents: dict) -> None:
+            key = (id(reading), id(function))
+            if key in seen:
+                return
+            seen.add(key)
+            found.append((path, reading, function))
+            for call in _calls_in(function):
+                declared = call.target
+                child = child_reading(reading, declared)
+                supplied = bound_params(declared, from_reading=child is not None)
+                inner = _extended_dims(
+                    supplied, tuple(arg.type for arg in call.args), extents
+                )
+                callee = _selected_target(call, inner)
+                if child is None:
+                    visit(path, reading, callee, inner)
+                else:
+                    where = f"{path}.{child.name}" if path else child.name
+                    visit(where, child, callee, inner)
+
+        visit("", self, fn, dict(dims or {}))
+        return tuple(found)
+
     def _run_bound(self, fn: ModuleFunction, *acts):
         """Run bound.
 
         Evaluate *fn* over *acts*, its ``ConstTensor`` parameters filled by
-        name from these bindings.
+        name from these bindings and a reached child's from that child's own.
 
         Weights and activations must already agree on one device; nothing moves
         implicitly.
 
         [runtime §1.1.2](docs/spec/runtime.md#112-weight-converter-and-prepare--forward)
         """
-        from tilefoundry.evaluator import evaluate  # noqa: PLC0415 -- avoid IR→evaluator cycle
+        from tilefoundry.evaluator.interpreter import (  # noqa: PLC0415 -- IR→evaluator
+            _dim_bindings,
+            _run_bound,
+            _selected_body,
+        )
 
         expected = sum(1 for p in fn.params if not p.is_const)
         if len(acts) != expected:
@@ -532,38 +723,56 @@ class LoadedModule:
         args = []
         activations = iter(acts)
         for param in fn.params:
-            if param.is_const:
-                try:
-                    args.append(self.constants[param.name])
-                except KeyError:
-                    raise KeyError(
-                        f"LoadedModule {self.name!r}: weight {param.name!r} of "
-                        f"{fn.name!r} was not read by load(resource)"
-                    ) from None
-            else:
-                args.append(next(activations))
-        return evaluate(fn, *args, device=self._placement(fn, acts))
+            args.append(self.constants[param.name] if param.is_const else next(activations))
+        reached = self._reached(_selected_body(fn, args), _dim_bindings(fn, args))
+        self._require_bindings(fn, reached)
+        return _run_bound(
+            fn, args, device=self._placement(fn, acts, reached), reading=self
+        )
 
-    def _placement(self, fn: ModuleFunction, acts: tuple) -> str | None:
+    def _require_bindings(self, fn: ModuleFunction, reached: tuple) -> None:
+        """Refuse a reached reading that cannot cover its callee's constants."""
+        missing: list[str] = []
+        for path, reading, function in reached:
+            absent = [
+                param.name
+                for param in function.params
+                if param.is_const and param.name not in reading.constants
+            ]
+            if absent:
+                where = path or reading.name
+                missing.append(f"{where}: {function.name!r} needs {sorted(absent)}")
+        if missing:
+            raise KeyError(
+                f"LoadedModule {self.name!r}: {fn.name!r} reaches reading(s) with no "
+                f"binding for a declared ConstTensor -- {'; '.join(missing)}. Every "
+                f"reached child fills its own constants from load(resource)"
+            )
+
+    def _placement(self, fn: ModuleFunction, acts: tuple, reached: tuple) -> str | None:
         """Placement.
 
-        The one device all bound constants and tensor activations agree on, or
-        ``None`` when none names one.
+        The one device the tensor activations and every reached reading's
+        constants agree on, or ``None`` when none names one. An attached child
+        no call reaches has no say.
 
         [runtime §1.1.2](docs/spec/runtime.md#112-weight-converter-and-prepare--forward)
         """
         where: dict[str, list[str]] = {}
-        for name, value in self.constants.items():
-            device = getattr(value, "device", None)
-            if device is not None:
-                where.setdefault(str(device), []).append(f"weight {name!r}")
+        for path, reading, _function in reached:
+            for name, value in reading.constants.items():
+                device = getattr(value, "device", None)
+                if device is not None:
+                    label = f"{path}.{name}" if path else name
+                    where.setdefault(str(device), []).append(f"weight {label!r}")
         for index, value in enumerate(acts):
             device = getattr(value, "device", None)
             if device is not None:
                 where.setdefault(str(device), []).append(f"activation {index}")
         if len(where) > 1:
             spread = "; ".join(
-                f"{device}: {', '.join(names)}" for device, names in sorted(where.items())
+                f"{device}: {', '.join(sorted(set(names)))}"
+                for device, names in sorted(where.items())
             )
             raise ValueError(
                 f"LoadedModule {self.name!r}: {fn.name!r} was given tensors on "

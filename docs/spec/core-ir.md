@@ -80,7 +80,9 @@ class Module:
     another owner MUST NOT change what the first owner's subtree resolves.
   - `owns(function)` MUST use identity and accept the Module's direct functions
     and their specialization variants. With `derived=True`, it MUST also follow
-    a derived function's recorded specialization origin; equal copies and
+    a rebuilt function's recorded origin
+    ([hir §2](./hir.md#2-function-specialization-api)) for the whole chain, not
+    only its first edge — a rebuild may itself be rebuilt; equal copies and
     same-name functions from another Module MUST remain unowned.
 
 A `Module` is a static ownership and execution-context container, not a dynamic

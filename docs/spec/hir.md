@@ -68,7 +68,9 @@ the current kernel invocation and never begins another one, regardless of which
 `Module` owns the callee. A `Module` is a static container and an invocation is
 a dynamic event: Python entering one root twice is two invocations, and a Python
 loop entering it N times is N. Module ownership, topology equality, call-graph
-depth, and source nesting take no part in this rule.
+depth, source nesting, and how often a call site repeats take no part in this
+rule: a repeated site and a site a loop varies repeat device work inside the
+invocation they are already in.
 
 | Caller | Callee | Meaning |
 |---|---|---|
@@ -127,9 +129,35 @@ parameter propagates through the whole body, including through a `Tuple` or
 that instance's (re-derived) body type, never a stale `return_type` field
 carried over from a different call site.
 
+How a `Call` binds is part of what it states: which declared parameters
+`Call.args` supply, and the scope
+([visitor-registry §4](./visitor-registry.md#4-instance-1--typeinfer)) the
+callee's body is read in. Argument types bind to the supplied parameters in
+order; a parameter the call does not supply keeps its declared type in the
+rebuilt signature, which for a `ConstTensor` is already concrete — no value it
+stands for enters the IR, and what fills it comes from outside
+([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)). The
+binding is part of the elaboration cache key. It MUST be stated by the call in
+the scope it is read in, never counted from how many arguments the call passes,
+and it is not a question the context answers.
+
+Omitting a parameter is valid only where, within that scope, the callee is
+uniquely owned by a direct child of the caller's owner
+([core-ir §1](./core-ir.md#1-module)); before collection the authored binding
+answers the same question of the child it names. Ownership that is missing,
+ambiguous, or not a direct child supplies every declared parameter, as does
+`elaborate` with no call in hand, so a standalone or low-level call cannot
+acquire implicit constants.
+
+Caller and callee MUST resolve one effective `Target` and one effective topology
+hierarchy: a same-kernel call is one execution context, whichever `Module` owns
+each end. Inheritance is the canonical spelling, and a callee declaring the
+caller's hierarchy explicitly is accepted only when the resolved tuples are
+equal. A mismatch is invalid; it is not a nested launch.
+
 Argument ↔ parameter binding is:
 
-- Arity MUST match — exactly one argument per parameter.
+- Arity MUST match — exactly one argument per supplied parameter.
 - A parameter that is a `TensorType` with `layout is None` is a **template
   wildcard**: it binds to the argument's full type, including any
   `ShardLayout`, once the argument's logical `shape` and `dtype` match.
@@ -152,6 +180,12 @@ op, not at the boundary. A dispatch-prototype callee
 (`variants != ()`, `body is None`) is not elaborated: the call's
 result is the declared `return_type` and the `None` body is never inspected
 (variant selection is **Shape dispatch and specializations** below).
+
+An elaborated instance MUST record the function it was rebuilt from, the same
+record a specialization writes (`origin_of`, **Function specialization API**
+below), so the instance in a `Call.target` stays connected to the function a
+Module owns without matching on the name they share. It records no bound
+dimensions: a call site binds parameter types, it does not choose an extent.
 
 Elaboration memoizes per construction session — one parser run, or one
 top-level `elaborate` call and every nested call it re-elaborates — keyed
@@ -1308,7 +1342,7 @@ BOUND_DIMS = "_specialized_dims"
 
 
 def origin_of(function: object) -> Function | None:
-    """Return the source function of a derived specialization.
+    """Return the source function a rebuilt function came from.
 
     Args:
         function: Candidate derived function.
@@ -1320,7 +1354,7 @@ def origin_of(function: object) -> Function | None:
 
 
 def bound_dims_of(function: object) -> tuple[tuple[str, int], ...] | None:
-    """Return the sorted dimensions bound on a derived specialization.
+    """Return the sorted dimensions a rebuild chose, if it chose any.
 
     Args:
         function: Candidate derived function.
@@ -1363,12 +1397,15 @@ def specialize_function(
     ...
 
 
-def specialize_concretely(fn: Function, dims: Mapping[str, int]) -> Function:
+def specialize_concretely(
+    fn: Function, dims: Mapping[str, int], ctx: TypeInferContext | None = None
+) -> Function:
     """Specialize a function with no residual symbolic dimensions.
 
     Args:
         fn: Function or dispatch prototype.
         dims: Complete concrete dimension bindings.
+        ctx: Optional shared type-inference context.
 
     Returns:
         A concrete function.
@@ -1419,12 +1456,19 @@ def is_concrete(fn: Function) -> bool:
   - `specialize_function` MUST reject an empty binding, an unknown dimension,
     or a selected implementation with no body. It MUST record the chosen
     implementation and sorted bindings on a rebuilt function so `origin_of`
-    and `bound_dims_of` can recover them.
+    and `bound_dims_of` can recover them. A rebuild that chose no extent — a
+    call site's elaboration — MUST record its origin and no bindings, so
+    `bound_dims_of` stays `None` and two call sites of one callee are not
+    reported as one program at one size.
   - `specialize_concretely` MUST require a non-empty string-to-integer mapping
     and MUST reject any residual dimension after specialization.
   - Provenance and bound-dimension records MUST NOT participate in structural
     equality or hashing; ownership checks use the recorded origin rather than
     a function name.
+  - The recorded origin MUST be the function actually rebuilt, and nothing may
+    re-point it afterwards. Two call sites reaching two copies of one source
+    function hold two rebuilds recording two origins; one shared instance
+    re-pointed instead would answer both with whichever was written last.
   - `residual_dims` and `dim_vars_reached` MUST inspect the whole function
     graph, including signatures, bodies, Op attributes, loop bounds, variants,
     and called functions. `is_concrete` additionally checks the return type.
