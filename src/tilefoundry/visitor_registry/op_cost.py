@@ -13,10 +13,12 @@ import math
 
 from tilefoundry.ir.core import Call
 from tilefoundry.ir.core.kinds import BinaryKind
+from tilefoundry.ir.hir.cuda.nn.mma import Mma_SM80_16x8x16, Wgmma_SM90_64x128x16
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.clamp import Clamp
 from tilefoundry.ir.hir.math.softplus import Softplus
 from tilefoundry.ir.hir.math.unary import Unary
+from tilefoundry.ir.hir.nn.conv2d import Conv2D
 from tilefoundry.ir.hir.nn.gelu import Gelu
 from tilefoundry.ir.hir.nn.layer_norm import LayerNorm
 from tilefoundry.ir.hir.nn.matmul import MatMul
@@ -27,22 +29,33 @@ from tilefoundry.ir.hir.nn.sigmoid import Sigmoid
 from tilefoundry.ir.hir.nn.silu import Silu
 from tilefoundry.ir.hir.nn.softmax import SoftMax
 from tilefoundry.ir.hir.nn.tanh import Tanh
+from tilefoundry.ir.hir.shape.shape_compose import ShapeCompose
+from tilefoundry.ir.hir.shape.shape_extract import ShapeExtract
+from tilefoundry.ir.hir.sharding.local import Local
 from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.tensor.argmax import ArgMax
+from tilefoundry.ir.hir.tensor.cache_update import CacheUpdate
 from tilefoundry.ir.hir.tensor.cast import Cast
 from tilefoundry.ir.hir.tensor.concat import Concat
 from tilefoundry.ir.hir.tensor.full_like import FullLike
 from tilefoundry.ir.hir.tensor.gather import Gather
+from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
 from tilefoundry.ir.hir.tensor.quant import Quant
+from tilefoundry.ir.hir.tensor.rank import Rank
 from tilefoundry.ir.hir.tensor.reduce import Reduce
 from tilefoundry.ir.hir.tensor.repeat_interleave import RepeatInterleave
 from tilefoundry.ir.hir.tensor.reshape import Reshape
+from tilefoundry.ir.hir.tensor.shape_of import ShapeOf
 from tilefoundry.ir.hir.tensor.slice import Slice
+from tilefoundry.ir.hir.tensor.split import Split
+from tilefoundry.ir.hir.tensor.stack import Stack
 from tilefoundry.ir.hir.tensor.topk import TopK
 from tilefoundry.ir.hir.tensor.transpose import Transpose
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.hir.tensor.zeros import Zeros
 from tilefoundry.ir.types import DType, TensorType, Type, numel, tensor_bytes
+from tilefoundry.ir.types.shard import ShardLayout
+from tilefoundry.ir.types.shard.shard_layout import layout_axis_to_tensor_axis
 
 from .contexts import Cost, CostContext, TrafficBytes
 from .registries import register_cost_evaluator
@@ -109,6 +122,50 @@ def _matmul(call: Call, ctx: CostContext) -> Cost:
     batch = math.prod(output.shape[:-2])
     flops = 2 * batch * m * k * n
     return Cost({lhs.dtype: flops}, _traffic((lhs, rhs), output))
+
+
+@register_cost_evaluator(Mma_SM80_16x8x16)
+@register_cost_evaluator(Wgmma_SM90_64x128x16)
+def _mma(call: Call, ctx: CostContext) -> Cost:
+    a, b = _input_types(call, ctx)
+    output = _output_type(call, ctx)
+    if not all(isinstance(type_, TensorType) for type_ in (a, b, output)):
+        raise ValueError("MMA cost requires tensor inputs and output")
+    if isinstance(call.target, Mma_SM80_16x8x16):
+        m, n, k = 16, 8, 16
+    else:
+        m, n, k = 64, 128, 16
+    return Cost({a.dtype: 2 * m * n * k}, _traffic((a, b), output))
+
+
+@register_cost_evaluator(Conv2D)
+def _conv2d(call: Call, ctx: CostContext) -> Cost:
+    input_, weight, bias = _input_types(call, ctx)
+    output = _output_type(call, ctx)
+    if not all(
+        isinstance(type_, TensorType)
+        for type_ in (input_, weight, bias, output)
+    ):
+        raise ValueError("Conv2D cost requires tensor inputs and output")
+    global_weight = ctx.type_of(call.args[1])
+    logical_weight_shape = weight.shape
+    if isinstance(global_weight.layout, ShardLayout):
+        logical_weight_shape = [1] * len(global_weight.shape)
+        axes = layout_axis_to_tensor_axis(
+            global_weight.layout.layout.shape, global_weight.shape
+        )
+        for extent, logical_axis in zip(weight.shape, axes):
+            logical_weight_shape[logical_axis] *= extent
+    flops = (
+        2
+        * numel(output)
+        * logical_weight_shape[1]
+        * logical_weight_shape[2]
+        * logical_weight_shape[3]
+    )
+    return Cost(
+        {input_.dtype: flops}, _traffic((input_, weight, bias), output)
+    )
 
 
 @register_cost_evaluator(Reduce)
@@ -203,6 +260,39 @@ def _slice(call: Call, ctx: CostContext) -> Cost:
     return Cost({}, (TrafficBytes(read=kept), TrafficBytes(write=kept)))
 
 
+@register_cost_evaluator(InsertSlice)
+def _insert_slice(call: Call, ctx: CostContext) -> Cost:
+    """Read and write the update window without charging the untouched dst."""
+    _, update, offsets = _input_types(call, ctx)
+    window = tensor_bytes(update)
+    return Cost(
+        {},
+        (
+            TrafficBytes(),
+            TrafficBytes(read=window),
+            TrafficBytes(read=tensor_bytes(offsets)),
+            TrafficBytes(write=window),
+        ),
+    )
+
+
+@register_cost_evaluator(CacheUpdate)
+def _cache_update(call: Call, ctx: CostContext) -> Cost:
+    """Charge the statically bounded new window, never the whole cache."""
+    _, cur_pos, s, new = _input_types(call, ctx)
+    window = tensor_bytes(new)
+    return Cost(
+        {},
+        (
+            TrafficBytes(),
+            TrafficBytes(read=tensor_bytes(cur_pos)),
+            TrafficBytes(read=tensor_bytes(s)),
+            TrafficBytes(read=window),
+            TrafficBytes(write=window),
+        ),
+    )
+
+
 @register_cost_evaluator(SoftMax)
 def _softmax(call: Call, ctx: CostContext) -> Cost:
     return _elementwise(call, ctx)
@@ -292,6 +382,21 @@ def _quant(call: Call, ctx: CostContext) -> Cost:
 @register_cost_evaluator(TupleGetItem)
 def _tuple_get_item(call: Call, ctx: CostContext) -> Cost:
     return Cost({}, _idle(call))
+
+
+@register_cost_evaluator(Rank)
+@register_cost_evaluator(ShapeOf)
+@register_cost_evaluator(ShapeCompose)
+@register_cost_evaluator(ShapeExtract)
+@register_cost_evaluator(Local)
+def _metadata_view(call: Call, ctx: CostContext) -> Cost:
+    return Cost({}, _idle(call))
+
+
+@register_cost_evaluator(Split)
+@register_cost_evaluator(Stack)
+def _structure(call: Call, ctx: CostContext) -> Cost:
+    return Cost({}, _traffic(_input_types(call, ctx), _output_type(call, ctx)))
 
 
 @register_cost_evaluator(FullLike)

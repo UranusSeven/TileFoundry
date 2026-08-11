@@ -616,6 +616,16 @@ their input when it states one. An input with `layout=None` produces a view with
   layout carries the sliced shape and the retained strides (multiplied by any
   slice step). A runtime-bounded `Slice` MUST remain accepted with `layout=None`.
 
+##### Rank and ShapeOf
+
+- `Rank` produces a rank-0 `i64`; `ShapeOf` produces a rank-1 `i64` vector with
+  one entry per input axis.
+- Both results are host shape metadata with `layout=EMPTY_LAYOUT` and
+  `storage=None`, not device-resident tensors.
+- Evaluation MUST read the concrete runtime tensor rank and extents. A symbolic
+  input `TensorType.shape` is the result bound, not the value returned at
+  runtime.
+
 ##### ArgMax
 
 ```python
@@ -633,8 +643,12 @@ class ArgMax(Op):
 
 - constraints:
   - `x` MUST have rank at least one and `axis` MUST resolve within that rank.
-  - The result MUST remove `axis`, use dtype `i64`, and preserve `x`'s layout
-    and storage.
+  - The result MUST remove `axis`, use dtype `i64`, preserve storage, and derive
+    a layout over the reduced result shape. A `Split` on a surviving logical
+    axis propagates through the registered relation.
+  - The reduction axis MUST NOT be `Split`-sharded. A winning index cannot be
+    recovered from independent per-device winners, so typeinfer requires an
+    explicit `Reshard` instead of silently completing that split.
   - `x` MUST NOT carry a `Partial` state because a winning index cannot be
     recovered from an unpaired per-device partial reduction.
 
@@ -678,12 +692,23 @@ class Quant(Op):
 
 - constraints:
   - `x` MUST have rank at least one and MUST NOT carry a `Partial` state.
-  - For a static last extent, `group` MUST divide that extent.
+  - `scheme` is exactly `"per_token_group"`; packed block formats are a
+    different operation boundary. `group` MUST be a positive, non-boolean
+    integer, and `target_dtype` is exactly `fp8e4m3`.
+  - For a static last extent, `group` MUST divide that extent. For a symbolic
+    extent, the scale extent is the symbolic floor division by `group`, and
+    evaluation rejects an indivisible runtime extent before reshaping.
   - The result MUST be `(x_q, x_scale)`: `x_q` preserves `x.shape` with
-    `target_dtype`; `x_scale` has dtype `f32` and, for a static last extent,
-    replaces it by `x.shape[-1] // group`. For a symbolic last extent,
-    `x_scale` retains the original last extent. Both fields preserve layout
-    and storage.
+    `fp8e4m3`; `x_scale` has dtype `f32` and replaces the last extent by
+    `x.shape[-1] // group`. Both fields preserve storage and receive freshly
+    derived layouts over their own shapes. Outer-axis splits propagate. A
+    last-axis split propagates only when its factorization proves that every
+    owner holds complete groups and the scale split is representable;
+    otherwise typeinfer requires an explicit `Reshard`. A fully `Broadcast`
+    `ShardLayout` pins no mesh and produces unsharded result layouts.
+  - Evaluation computes each group's f32 absolute maximum and scale
+    `absmax / 448`, divides, clamps to `[-448, 448]`, then casts to `fp8e4m3`.
+    An all-zero group uses scale one and produces no NaN.
 
 ##### RepeatInterleave
 
@@ -726,11 +751,50 @@ class Split(Op):
 ```
 
 - constraints:
+  - `axis` MUST resolve in `[-rank, rank)`, and `num_splits` MUST be positive.
   - A static selected extent MUST be divisible by `num_splits`; every output
     field has that extent divided by `num_splits` and otherwise preserves the
     input type.
   - A symbolic selected extent is retained in each output until a tighter
     symbolic quotient is available.
+  - Evaluation materializes `num_splits` equal tensors in axis order. Each
+    element carries exactly its corresponding inferred `TupleType` field,
+    including that field's storage and shard layout; the tuple aggregate has no
+    independent layout or storage.
+
+##### Stack
+
+```python
+class Stack(Op):
+    """Stack equal-shaped tensors along a new axis; produces a Tensor.
+
+    Attributes:
+        inputs: input; variadic tensors to stack.
+        axis: attribute; inserted result axis.
+        is_variadic: attribute; Whether the input parameter consumes all args.
+    """
+
+    inputs: Tensor
+    axis: int
+    is_variadic: ClassVar[bool] = True
+```
+
+- constraints:
+  - At least one input is required; every input MUST have the same shape and
+    dtype. `axis` MUST resolve in `[-rank-1, rank]`.
+  - The operation materializes one distinct result. The inserted axis is local
+    and unsharded, and the result layout is freshly derived over the result
+    shape rather than copied from any input.
+  - Stack states a relation in which input `i` accesses the result slice whose
+    inserted-axis coordinate is `i`; every old logical axis projects to the
+    corresponding result axis on the other side of the insertion. Shared shard
+    propagation derives any representable ownership from that relation.
+  - Compatible `Split` ownership carries to the shifted old logical axis. A
+    fully replicated input contributes no sharding. Incompatible input meshes
+    or per-axis states, a non-uniform `Partial` across result slices, and an
+    unrepresentable result layout MUST fail naming the conflicting input and
+    requiring an explicit `Reshard`; typeinfer MUST NOT select input zero's
+    layout or silently discard real ownership.
 
 ##### TupleGetItem
 
@@ -944,6 +1008,9 @@ class InsertSlice(Op):
   - When `dst` is complete, an `update` carrying a `Partial` MUST be rejected;
     the write result cannot preserve that secondary value state. An explicit
     `Reshard(update, Broadcast)` completes it.
+  - `ComputeCostMetadata` charges no traffic for the untouched `dst`, one
+    window-sized `update` read, the scalar or structural tuple `offsets` read,
+    and one window-sized result write.
 
 ##### CacheUpdate
 ```python
@@ -980,8 +1047,10 @@ class CacheUpdate(Op):
     carry the identical mesh and per-mesh-axis state; a complete `cache`
     rejects a `new` carrying `Partial`. Typeinfer rejects either mismatch.
   - No affine access relation is registered because the data-dependent write
-    boundaries are opaque. Traffic analysis therefore charges the full tensor
-    types.
+    boundaries are opaque to the polyhedral footprint path. The cost evaluator
+    instead supplies the traffic consumed by memory and roofline analysis: no
+    traffic for the untouched `cache`, one read for each runtime scalar, and a
+    `new`-bounded read and result write.
 
 ##### TopK
 ```python
@@ -1057,14 +1126,41 @@ Consensus torch.nn.functional ops.
     is `Broadcast` / replicated. On each mesh axis, one `Partial(sum)` is
     therefore allowed; a double-Partial input or a non-`sum` reduction is
     rejected.
-  - `Conv2D` applies the same per-axis multilinear constraint to `input`,
-    `weight`, and `bias`. A `Partial(sum)` on `input` is preserved only when
-    the other value inputs are replicated. A secondary `Partial` on `weight`
-    or `bias` is rejected when the result layout cannot preserve that state.
-  - `SoftMax` / `LayerNorm` normalize across an axis (a non-monotonic
-    combination of every value on that axis), so no `reduction` provably
-    commutes; typeinfer rejects any `Partial` operand, including secondary
-    affine inputs.
+  - `Conv2D` requires rank-4 NCHW input and OIHW weight, a rank-1 bias, and one
+    common operand dtype. `stride` and `dilation` are positive length-2 tuples,
+    `padding` is a non-negative length-2 tuple, and `groups` is positive. Input
+    and output channels MUST be divisible by `groups`, the weight's input
+    channel extent MUST equal `input_channels / groups`, and the bias extent
+    MUST equal the output channels.
+  - `Conv2D` states its grouped input / weight / bias / output relation over
+    output positions and the input-channel and kernel contraction dimensions.
+    Shared shard propagation derives a fresh result layout: input batch and
+    compatible weight/bias output-channel splits survive. A contraction split
+    of the input-channel axis MUST be aligned on input and weight at the same
+    mesh axis; a single-sided channel split is not a representable local
+    convolution. A contraction split produces `Partial(sum)` only when the bias
+    carries the same per-mesh-axis `Partial(sum)` state, so completing the
+    partial result adds the bias exactly once. A translated/halo access,
+    incompatible contraction, mesh, or per-axis state that
+    the relation cannot represent MUST fail naming the operand and requiring an
+    explicit `Reshard`; no input layout is copied or real ownership discarded.
+  - `Conv2D` costs `2 * numel(output) * weight.shape[1] * kh * kw` flops after
+    topology projection, where the weight extents are reconstructed on logical
+    I/KH/KW axes from any factorized local layout. Traffic has exactly four
+    slots: complete reads of input, weight, and bias followed by one complete
+    result write.
+  - `SoftMax` normalizes across an axis (a non-monotonic combination of every
+    value on that axis), so no `reduction` provably commutes; typeinfer rejects
+    every `Partial` input.
+  - `LayerNorm(axis=a)` normalizes over the complete trailing shape
+    `x.shape[a:]`, after resolving `a` in `[-rank, rank)`. Weight and bias shapes
+    MUST each equal that suffix exactly rather than merely broadcast to it.
+    `x` MUST use `f32`, `f16`, or `bf16`. Weight and bias dtypes MUST agree and
+    either match `x`, or be `f32` when `x` is `f16`/`bf16`; the result dtype is
+    `x`'s.
+  - `LayerNorm` rejects every `Partial` operand and every `Split` on a logical
+    normalized-suffix axis of `x`, weight, or bias. A `Split` on an `x` prefix
+    axis remains on the same-shape result.
 
 ##### Gelu
 ```python
@@ -1214,15 +1310,44 @@ class Wgmma_SM90_64x128x16(Mma):
 - constraints:
   - `Mma` is a marker base used for family dispatch and has no independent
     callable parameter surface.
-  - Both concrete operations MUST return a value-form tensor in `dtype_acc`,
-    preserving `a`'s layout and resolving storage from both operands.
-  - `Mma_SM80_16x8x16` returns shape `(16, 8)` and is warp-level;
-    `Wgmma_SM90_64x128x16` returns shape `(64, 128)` and is four-warp-level.
+  - HIR MMA is the two-input value `a @ b`; it has no accumulator input. The
+    evaluator converts the rounded operands to `dtype_acc` before multiplying.
+    The independent handwritten TIR MMA surface has an in-place accumulator,
+    but there is no HIR-to-TIR compile route between these contracts.
+  - `Mma_SM80_16x8x16` requires `a.shape == (16, 16)` and
+    `b.shape == (16, 8)`, and returns `(16, 8)`. `Wgmma_SM90_64x128x16`
+    requires `(64, 16)` and `(16, 128)`, and returns `(64, 128)`.
+  - Each operand dtype MUST equal its declared `dtype_a` / `dtype_b`. Supported
+    `(dtype_a, dtype_b, dtype_acc)` combinations are `(f16, f16, f16)`,
+    `(bf16, bf16, bf16)`, `(f16, f16, f32)`, `(bf16, bf16, f32)`, and
+    `(f32, f32, f32)`. Each orientation MUST be `N` or `T`; orientation names
+    the hardware encoding and does not transpose either logical HIR input.
+  - Plain logical input Types remain valid for evaluation and Analyze. Their
+    result has a fresh row-major logical layout when either operand has a plain
+    layout. Fully `Broadcast` `ShardLayout` inputs carry no real ownership and
+    therefore pin no result mesh.
+  - Only the known SM80 BF16/BF16/F32 TN A/B fragment pair in RMEM derives the
+    known C fragment. Its A/B layouts, `Split` bindings, thread topology, and
+    mesh shape MUST match. Mesh coordinate names do not participate in
+    identity; the derived C layout uses `a`'s physically compatible mesh. Any
+    other genuine SM80 shard claim or fragment in non-RMEM storage MUST fail
+    with an explicit `Reshard` / materialize-to-RMEM remedy.
+  - WGMMA has no representable fragment contract yet. A genuine WGMMA shard
+    claim MUST fail with an explicit `Reshard` remedy, while plain logical
+    WGMMA remains evaluable and analyzable.
+  - Cost is `2*M*N*K` in the operand dtype with exactly three traffic slots:
+    A read, B read, and result write. Byte residency and topology projection
+    come only from the selected operand/result Types.
+  - `HirToTirPass` MUST reject both concrete HIR MMA Ops by name before
+    emitting TIR; see [passes §7.1](./passes.md#71-hirtotirpass).
 
 #### `ir/hir/shape/`
 
 Shape-level Ops on whole shape values (per-axis dim Ops are
 [types §3](./types.md#3-dtype)).
+
+Shape values are host metadata: their tensor types use `EMPTY_LAYOUT` and
+`storage=None`, and their evaluators move no device bytes.
 
 ##### ShapeExtract
 ```python
@@ -1329,6 +1454,8 @@ class Local(Op):
   - `dtype` and `storage` are preserved.
   - The shard wrapper is stripped, leaving the base `Layout`.
   - Static split sizes divide by mesh extent; symbolic sizes pass through.
+  - `Local` only names the current topology position's existing view; it
+    materializes no value and moves no bytes.
 
 ## 2. Function specialization API
 

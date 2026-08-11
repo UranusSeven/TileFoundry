@@ -298,47 +298,18 @@ TIR shape based on whether `storage` is provided:
   a plain tensor (no `ShardLayout`) and copy from the shard view
   into the plain storage.
 
-#### `Mma_SM80_16x8x16` SSA Op lowering
+#### CUDA HIR MMA refusal
 
-The HIR `Mma_SM80_16x8x16` value Op lowers to a three-step TIR
-sequence:
+`HirToTirPass` MUST reject both `Mma_SM80_16x8x16` and
+`Wgmma_SM90_64x128x16` by their concrete HIR Op name before lowering either
+operand or emitting allocations, copies, fills, or `TirMma`. Their logical HIR
+value/type/cost models are available to evaluation and Analyze only; there is
+no HIR compile route.
 
-1. `LetStmt` allocating a per-thread fragment buffer of shape
-   `(2, 2)` `f32` (matching the SM80 `CLayout` value-axis extent —
-   four elements per lane);
-2. `Evaluate(Fill, (r, 0.0))` to zero-initialise the
-   accumulator so the underlying PTX `a*b + c` produces `a @ b`
-   exactly;
-3. `Evaluate(TirMma, (a, b, r))`.
-
-Outer-level `add(acc, mma(a, b))` accumulation patterns lower to a
-separate `tir.arith.Binary` downstream.
-
-The cute MMA fragment → `ShardLayout` recipe — the general
-arch-specific contract for lowering an MMA SSA Op's A / B / C fragments
-to a row-major `ShardLayout` — is owned here. It depends on the cute
-atom traits and on the row-major reinterpretation the CUDA target
-chooses, so it lives in this lowering pass, not in
-[shard](./shard.md). For an arbitrary cute MMA atom:
-
-1. From the cute `MMA_Traits<Atom>::ALayout` / `BLayout` / `CLayout`
-   extract the nested
-   `Layout<Shape<Shape<...>, Shape<...>>, Stride<Stride<...>, Stride<...>>>`
-   — the outer nested shape is the **thread layout**, the inner is the
-   **value layout**.
-2. Re-derive the per-axis stride under TileFoundry's row-major
-   interpretation of the (M, K) / (K, N) / (M, N) tile. Cute is
-   column-major by default, so a strict sort by stride is required.
-3. Sort all axes (thread + value) by ascending stride to flatten the
-   cute nested layout into a TileFoundry flat `Layout(shape, strides)`.
-4. For each thread-mesh axis, attach a `Split(tensor_axis)` attr
-   pointing at the corresponding axis position in the flattened layout.
-   The remaining axes are per-thread *value* axes (no `ShardAttr`);
-   their product equals the PTX register count per lane.
-
-Worked example: `SM80_16x8x16_F32BF16BF16F32_TN` with
-`Layout(shape=(4, 8), strides=(1, 4))` aligning with cute's
-`Shape<_4, _8>` ThrID decomposition.
+The independent handwritten `T.cuda.mma` atom and CUDA runtime surface remains
+available and is specified by [tir §2.3](./tir.md#23-tir-ops). This pass MUST
+NOT translate HIR fragments into that surface, modify its atom layouts, or rely
+on CUDA codegen's legacy `atom=None` fallback.
 
 #### Dispatch lowering
 

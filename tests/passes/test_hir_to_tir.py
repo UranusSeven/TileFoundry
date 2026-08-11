@@ -20,6 +20,7 @@ from tilefoundry.dsl import (
 )
 from tilefoundry.ir.core import Call, Constant, Var
 from tilefoundry.ir.core.module import Module
+from tilefoundry.ir.hir.cuda.nn.mma import Mma_SM80_16x8x16, Wgmma_SM90_64x128x16
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.grid_region import GridRegionExpr
 from tilefoundry.ir.hir.nn.relu import ReLU as HirReLU
@@ -191,3 +192,48 @@ def test_the_hir_walks_reach_every_child_of_a_grid_region() -> None:
     )
 
     assert _collect_hir_callee_names(in_yield) == {"callee_fn"}
+
+
+def _mma_module(op, a_type, b_type, result_type) -> Module:
+    a = Var(type=a_type, name="a")
+    b = Var(type=b_type, name="b")
+    body = Call(type=result_type, target=op, args=(a, b))
+    fn = HirFunction.build(
+        name="mma_kernel", params=(a, b), body=body, return_type=result_type
+    )
+    return Module(name="mma_test", functions=(fn,), entry=fn.name)
+
+
+@pytest.mark.parametrize(
+    ("op", "a_type", "b_type", "result_type", "name"),
+    [
+        pytest.param(
+            Mma_SM80_16x8x16(
+                dtype_a=DType.bf16, dtype_b=DType.bf16, dtype_acc=DType.f32
+            ),
+            TensorType((16, 16), DType.bf16, None, StorageKind.RMEM),
+            TensorType((16, 8), DType.bf16, None, StorageKind.RMEM),
+            TensorType((16, 8), DType.f32, None, StorageKind.RMEM),
+            "Mma_SM80_16x8x16",
+            id="sm80",
+        ),
+        pytest.param(
+            Wgmma_SM90_64x128x16(
+                dtype_a=DType.bf16, dtype_b=DType.bf16, dtype_acc=DType.f32
+            ),
+            TensorType((64, 16), DType.bf16, None, StorageKind.GMEM),
+            TensorType((16, 128), DType.bf16, None, StorageKind.GMEM),
+            TensorType((64, 128), DType.f32, None, StorageKind.GMEM),
+            "Wgmma_SM90_64x128x16",
+            id="wgmma",
+        ),
+    ],
+)
+def test_hir_mma_lowering_rejects_each_concrete_op_by_name(
+    op, a_type, b_type, result_type, name
+) -> None:
+    with pytest.raises(
+        ValueError,
+        match=rf"HirToTirPass: {name} HIR compile route is unsupported",
+    ):
+        HirToTirPass().run(_mma_module(op, a_type, b_type, result_type))
