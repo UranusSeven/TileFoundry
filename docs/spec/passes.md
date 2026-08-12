@@ -276,6 +276,12 @@ depends on pass-internal cooperation (dispatch-group resolution, the
 reshard cross-CTA sync fence, tuple-carry field lookup) MAY call other
 `_Lowerer` methods directly; this is the exception, not the norm.
 
+A unit-stride HIR `Slice` lowers to a `TensorView` at the per-axis absolute
+element starts; `InsertSlice` uses the same coordinate convention. Neither
+multiplies an already-absolute coordinate by a window extent. A non-divisible
+tile loop whose body consumes such a fixed-shape window MUST raise until a
+handwritten residual-tail lowering is supplied.
+
 #### Mesh structure derivation
 
 `HirToTirPass` MUST NOT fabricate mesh structure. `cta_mesh` and

@@ -13,3 +13,8 @@ class EvalContext:
     args: tuple[Any, ...]
     result_type: Any
     device: str = "cpu"
+    dim_bindings: dict[str, int] | None = None
+
+    def __post_init__(self) -> None:
+        if self.dim_bindings is None:
+            object.__setattr__(self, "dim_bindings", {})

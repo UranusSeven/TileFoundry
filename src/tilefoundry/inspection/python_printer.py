@@ -39,6 +39,7 @@ from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
 from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.specialize import dim_vars_reached, display_name, origin_of
+from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.types import DType, TensorType, TupleType
 from tilefoundry.ir.types.dim import (
@@ -138,6 +139,8 @@ def _shape_entry_str(entry: object, *, nested: bool) -> str:
     if isinstance(entry, int):
         return str(entry)
     if isinstance(entry, DimVar):
+        return entry.name
+    if isinstance(entry, Var):
         return entry.name
     if isinstance(entry, Constant):
         return str(entry.value)
@@ -344,7 +347,7 @@ def _attr_tuple_str(value: tuple) -> str:
 
 def _is_dim_entry(entry: object) -> bool:
     """Whether *entry* is a dimension rather than a plain attribute value."""
-    return isinstance(entry, (DimVar, Constant)) or (
+    return isinstance(entry, (DimVar, Var, Constant)) or (
         isinstance(entry, Call)
         and isinstance(entry.target, (DimConst, *_DIM_INFIX_OPS, *_DIM_FUNC_OPS))
     )
@@ -750,6 +753,7 @@ def _emit_def(
             _op_names_set.add(_op_name(expr.target))
 
     _forced_names: dict[int, str] = {}
+    _tile_window_steps: dict[int, object] = {}
 
 
     _grid_internal_ids: set[int] = set()
@@ -758,6 +762,8 @@ def _emit_def(
     for expr in _order:
         if not isinstance(expr, GridRegionExpr):
             continue
+        if expr.start == 0 and expr.step != 1:
+            _tile_window_steps[id(expr.induction_var)] = expr.step
         for carry, init, value in zip(
             expr.carried_args, expr.init_args, expr.yield_values
         ):
@@ -810,7 +816,10 @@ def _emit_def(
                 _assign_name(carry)
 
     def _tuple_literal(elements) -> str:
-        inner = ", ".join(_expr_ref(el) for el in elements)
+        inner = ", ".join(
+            repr(el.value) if isinstance(el, Constant) else _expr_ref(el)
+            for el in elements
+        )
         if len(elements) == 1:
             inner += ","
         return f"({inner})"
@@ -907,6 +916,46 @@ def _emit_def(
         if isinstance(target, HirFunction):
             binding = _module_callee_binding(target, child_entries)
             return f"{binding or target.name}({args_str})"
+        if isinstance(target, Slice):
+            indexers = []
+            starts = expr.args[1]
+            if not isinstance(starts, Tuple):
+                raise ValueError("canonical_source: Slice starts must be a Tuple")
+            for axis, (start, size, stride) in enumerate(
+                zip(starts.elements, target.sizes, target.strides)
+            ):
+                if (
+                    isinstance(start, Var)
+                    and stride == 1
+                    and _tile_window_steps.get(id(start)) == size
+                ):
+                    indexers.append(_expr_ref(start))
+                    continue
+                dim = expr.args[0].type.shape[axis]
+                if (
+                    isinstance(start, Constant)
+                    and start.value == 0
+                    and size == dim
+                    and stride == 1
+                ):
+                    indexers.append(":")
+                    continue
+                if not (
+                    isinstance(start, Constant)
+                    and isinstance(start.value, int)
+                    and isinstance(size, int)
+                    and isinstance(stride, int)
+                ):
+                    raise ValueError(
+                        "canonical_source: non-tile runtime Slice cannot be "
+                        "represented by the current subscript surface"
+                    )
+                begin = int(start.value)
+                stop = begin + size * stride
+                indexers.append(
+                    f"{begin}:{stop}" if stride == 1 else f"{begin}:{stop}:{stride}"
+                )
+            return f"{_arg_ref(expr.args[0])}[{', '.join(indexers)}]"
 
         alias_name = _kinded_alias_name(target)
         suppress_attrs = {"kind"} if alias_name is not None else set()
@@ -959,7 +1008,8 @@ def _emit_def(
             return
         if isinstance(expr, Tuple):
             for element in expr.elements:
-                _emit_expr(element, level)
+                if not isinstance(element, Constant):
+                    _emit_expr(element, level)
             printed.add(key)
             return
         if isinstance(expr, GridRegionExpr):
