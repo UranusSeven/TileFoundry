@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .layout import Layout, LayoutBase
+from .layout import ComposedLayout, Layout, LayoutBase
 from .layout_algebra import try_c_order_strides
 from .mesh import Mesh
 
@@ -54,6 +54,19 @@ class ShardLayout(LayoutBase):
     @property
     def shape(self) -> tuple:
         return self.layout.shape
+
+
+def shard_layout_of(layout: object) -> "ShardLayout | None":
+    """Return the distribution carried directly or by a static-offset view."""
+    if isinstance(layout, ShardLayout):
+        return layout
+    if (
+        isinstance(layout, ComposedLayout)
+        and layout.inner is None
+        and isinstance(layout.outer, ShardLayout)
+    ):
+        return layout.outer
+    return None
 
 
 def canonical_shard_layout(logical_shape: tuple, mesh: Mesh, attrs: tuple) -> "ShardLayout":
@@ -124,12 +137,17 @@ def canonical_shard_layout(logical_shape: tuple, mesh: Mesh, attrs: tuple) -> "S
     )
 
 
-def shard_layout_local_shape(sl: "ShardLayout") -> tuple[int, ...]:
-    """Derive one thread's local shape from a global ``ShardLayout``.
+def shard_layout_local_shape(
+    sl: "ShardLayout", *, require_static: bool = True
+) -> tuple:
+    """Derive one shard's local shape from a global ``ShardLayout``.
 
     Each ``Split`` divides its bound layout position by the mesh extent;
-    repeated splits multiply their divisors. Other attributes do not consume a
-    layout position.
+    repeated splits multiply their divisors. Equal symbolic extents yield one;
+    other symbolic splits are undecidable before binding. Other attributes do
+    not consume a layout position. ``require_static`` keeps lowering and
+    codegen on their concrete-shape boundary while type inference may retain an
+    unconsumed symbolic extent.
 
     See [shard §7](docs/spec/shard.md#7-shardlayout).
     """
@@ -146,14 +164,24 @@ def shard_layout_local_shape(sl: "ShardLayout") -> tuple[int, ...]:
             if isinstance(mesh_ext, int) and isinstance(local[k], int):
                 if mesh_ext != 0:
                     local[k] //= mesh_ext
+            elif local[k] == mesh_ext:
+                local[k] = 1
+            else:
+                raise ValueError(
+                    f"shard_layout_local_shape: layout dim {k} ({local[k]!r}) "
+                    f"and mesh axis {mesh_axis_idx} extent {mesh_ext!r} do not "
+                    "have a decidable divisibility relation; bind symbolic "
+                    "dimensions before local projection"
+                )
 
-    for i, d in enumerate(local):
-        if not isinstance(d, int):
-            raise ValueError(
-                f"shard_layout_local_shape: per-shard dim {i} ({d!r}) is not "
-                "static after sharding; bind symbolic dimensions before local "
-                "projection"
-            )
+    if require_static:
+        for i, d in enumerate(local):
+            if not isinstance(d, int):
+                raise ValueError(
+                    f"shard_layout_local_shape: per-shard dim {i} ({d!r}) is not "
+                    "static after sharding; bind symbolic dimensions before local "
+                    "projection"
+                )
     return tuple(local)
 
 
@@ -173,6 +201,10 @@ def layout_axis_to_tensor_axis(layout_shape: tuple, tensor_shape: tuple) -> list
     for t_axis, t_dim in enumerate(tensor_shape):
         t_dim_int = static_dim_value(t_dim)
         if t_dim_int is None:
+            if layout_idx < len(layout_shape) and layout_shape[layout_idx] == t_dim:
+                result.append(t_axis)
+                layout_idx += 1
+                continue
             while layout_idx < len(layout_shape):
                 result.append(t_axis)
                 layout_idx += 1
@@ -214,6 +246,7 @@ __all__ = [
     "P",
     "B",
     "ShardLayout",
+    "shard_layout_of",
     "canonical_shard_layout",
     "shard_layout_local_shape",
     "layout_axis_to_tensor_axis",
