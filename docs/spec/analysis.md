@@ -6,6 +6,7 @@ This spec owns TileFoundry's fact layer: everything a later stage decides
 | Surface | Entry | What it states |
 |---|---|---|
 | Polyhedral model | `extract(hir) -> TileGraph` | one HIR `Function` body as isl domains, access relations and auto-inferred dependences — target-independent |
+| Program check | `check_program(module, function, level=...)` | whether one authored program and its declared topology are valid for a consuming algorithm |
 | Composed measurement | `analyze(module, function, analysis=...)` | one root analysis and its dependency closure, leaving typed Metadata on the IR |
 
 Per-Op semantic derivation — typeinfer, the forward access relation, shard
@@ -143,9 +144,8 @@ dependents) and classifies every node it meets:
     per-shard local shape when it carries a `ShardLayout`: each mesh `Split`'s
     target *tensor* axis divided by that mesh axis's extent, tensor rank
     preserved. A `Partial` / `Broadcast` / `Dynamic` mesh axis consumes no
-    tensor axis; a launch-provided (deferred) mesh extent narrows its axis to
-    `1`. Narrowing is centralized in the extraction, so every registered
-    relation is sharding-aware without knowing sharding exists.
+    tensor axis. Narrowing is centralized in the extraction, so every
+    registered relation is sharding-aware without knowing sharding exists.
   - A `Split`-sharded axis whose extent is not a static integer, or is not
     evenly divisible by its mesh extent, MUST raise `ExtractError`.
   - An op with no registered forward relation MUST raise `ExtractError` naming
@@ -454,11 +454,10 @@ class TimelineMetadata(IRMetadata):
     program alone. Flops MUST come from the op's registered cost evaluator
     ([visitor-registry](./visitor-registry.md)) over the types as written, and
     bytes from the logical types the operands and result carry. `flops_per_unit`
-    MUST come from the same evaluator over types projected to the analysed level.
-    Only that field MAY read the target, and only to resolve a launch-provided
-    mesh extent through `topology_limit`; that per-unit projection MUST round up
-    to the largest share one unit performs in a wave. An op with no registered
-    cost evaluator MUST raise `AnalysisError`.
+    MUST come from the same evaluator over types projected to the analysed level
+    using the program's authored topology and Mesh extents. It MUST NOT
+    substitute a target capacity for missing program geometry. An op with no
+    registered cost evaluator MUST raise `AnalysisError`.
   - `ValueLifetime.binding` MUST identify one value within its function. An
     authored name does not: the parser attaches an assignment's name to every
     nested expression of its right-hand side, so several values answer to one name
@@ -515,7 +514,7 @@ Each owns one record type and declares what it needs.
 
 | Selector | Requires | Owns | Rests on |
 |---|---|---|---|
-| `compute-cost` | — | `ComputeCostMetadata` | the authored program; `topology_limit` for a launch-provided per-unit extent |
+| `compute-cost` | — | `ComputeCostMetadata` | the authored program |
 | `memory` | `compute-cost` | `MemoryMetadata` | `MemoryHierarchyFacts` |
 | `roofline` | `memory`, `compute-cost` | `RooflineMetadata` | `ThroughputFacts` |
 | `timeline` | `roofline` | `TimelineMetadata` | `ParallelCapacityFacts` |
@@ -527,10 +526,9 @@ Each owns one record type and declares what it needs.
     analyzer, and MUST NOT resolve an undeclared Target to a default.
   - A family MUST read a dependency's record rather than recompute what it
     states. A number with two derivations has two answers.
-  - Global logical work and lifetime MUST remain target-independent.
-    `flops_per_unit` MAY depend on a target's parallel width when a mesh extent is
-    launch-provided. Physical capacity, hierarchy relationships, and throughput
-    comparisons are target-aware.
+  - Global logical work, per-unit work, and lifetime MUST remain
+    target-independent. Physical capacity, hierarchy relationships, and
+    throughput comparisons are target-aware.
 
 ### 2.3 Memory hierarchy facts
 
@@ -670,6 +668,39 @@ class ParallelCapacityFacts:
 
 ## 3. Composed analysis
 
+`tilefoundry.analysis.check_program` is the shared, reusable gate before an
+analysis or schedule algorithm runs.
+
+```python
+def check_program(
+    module: "Module",
+    function: "Function",
+    *,
+    level: str | None = None,
+) -> None: ...
+```
+
+- constraints:
+  - The operation MUST infer types over the full reachable Function graph and
+    validate its caller/callee execution context, and MUST NOT run an analysis
+    or schedule algorithm or attach derived Metadata.
+  - The reachable Function and Mesh geometry and every effective Module
+    topology extent MUST be concrete before this operation runs. Public Analyze
+    and Schedule calls with `dims` MUST resolve all three through one binding
+    pass before calling this gate; a residual dimension expression MUST fail
+    before any consuming algorithm runs.
+  - Every effective Module topology MUST name a level the resolved Target
+    supports. A resolved static extent MUST be positive and within that level's
+    finite hardware limit. A rejection MUST name the level, its extent, and the
+    reason.
+  - A non-`None` `level` MUST name exactly one effective Module topology.
+  - Analyze and Schedule MUST call this operation before any consuming
+    algorithm.
+  - Authored-analysis readiness is not a program-level check. Analyze MUST
+    separately reject schedule constraints and unresolved local layouts before
+    running an analyzer; Schedule MAY consume or diagnose those inputs under
+    its own algorithm contract.
+
 `tilefoundry.analysis.api.analyze` is the dependency-composed measurement
 operation. One call selects one root analysis by name; the operation resolves
 what that root transitively needs, runs each member once, and reports what ran.
@@ -737,23 +768,27 @@ def analyze(
     ([core-ir §1](./core-ir.md#1-module)). A Function derived by specialising one
     of these MUST be refused, so that ownership is settled before anything is
     rebuilt.
-  - `dims` states one extent per dimension the Function declares as a range. An
-    analysis counts elements and holds them against a machine, and neither has an
-    answer for a range, so a Function stating a range MUST be analysed at a
-    chosen size rather than as authored.
+  - `dims` states one extent per dimension reached through the Function graph,
+    its Mesh geometry, or the effective Module topology expressions. An analysis
+    counts elements and holds them against a machine, and has no answer for a
+    range in any of those positions, so the program MUST be analysed at a chosen
+    size rather than as authored.
   - `dims=None` MUST behave as a call that states no size: the Function is
     analysed as authored, and `AnalysisResult.function` MUST be the object the
     caller supplied.
   - When `dims` is stated it MUST be non-empty; every key MUST name a dimension
-    the Function declares as a range; every value MUST be an integer inside that
+    reached through the Function graph, its Mesh geometry, or the effective
+    Module topology expressions; every value MUST be an integer inside that
     dimension's declared bounds; every dimension the Function selects a variant
     on MUST be given a value; and no dimension MAY remain a range after
     substitution. Each of these MUST fail with an Analysis domain error. A stated
     `dims` MUST NOT be silently ignored, including when the Function declares no
     range at all.
   - Variant resolution and substitution MUST happen after the ownership check and
-    before any algorithm runs. Exactly one variant MUST cover the stated size;
-    none and more than one MUST both fail.
+    before the shared program check or any algorithm runs. Function types, Mesh
+    geometry, and effective topology extents MUST use the same resolved binding.
+    Exactly one variant MUST cover the stated size; none and more than one MUST
+    both fail.
   - When `dims` is stated, `AnalysisResult.function` MUST be the concrete Function
     the records were written onto, derived from the Function the caller supplied,
     and MUST record both that Function as the one it was specialised from and the

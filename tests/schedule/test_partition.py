@@ -14,6 +14,7 @@ from dataclasses import replace
 import pytest
 from ortools.sat.python import cp_model
 
+from tests.fixtures.logical.authored_constraint import AuthoredConstraint
 from tests.fixtures.logical.gqa_static import static_online_attend
 from tilefoundry import func
 from tilefoundry.dsl import Tensor
@@ -93,6 +94,20 @@ def test_partition_schedules_through_the_public_operation_without_rewriting() ->
     assert result.plan.proof.best_bound_ns <= result.plan.proof.objective_ns
     assert result.plan.root_results
     assert as_script(result.module) == before
+
+
+def test_partition_accepts_an_authored_where_constraint_through_schedule() -> None:
+    module = AuthoredConstraint
+    function = module.entry_function()
+
+    plan = schedule(
+        module,
+        function,
+        topology="cta",
+        options=_SOLVER,
+    ).plan
+
+    assert plan.root_results
 
 
 def test_partition_program_states_the_program_without_asking_the_hardware() -> None:

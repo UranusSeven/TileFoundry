@@ -6,8 +6,9 @@ import sys
 import textwrap
 from typing import Mapping
 
-from tilefoundry.analysis.api import analyze
-from tilefoundry.analysis.preflight import infer_authored_types, validate_authored
+from tilefoundry.analysis import analyze, check_program
+from tilefoundry.analysis.check import _program_dim_vars, _resolve_program_geometry
+from tilefoundry.analysis.preflight import validate_authored
 from tilefoundry.analysis.walk import reachable_functions
 from tilefoundry.cli.source import load_authored_ir, suggested_extents
 from tilefoundry.inspection import PythonPrintOptions, as_script
@@ -17,7 +18,7 @@ from tilefoundry.inspection.analysis_report import (
     report,
     selected_types,
 )
-from tilefoundry.ir.hir.specialize import dim_vars_reached, specialize_concretely
+from tilefoundry.ir.hir.specialize import SpecializationError
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 
 EVIDENCE: dict[str, str] = {
@@ -101,7 +102,7 @@ def run_authored_analysis(
     stated = {} if dims is None else dims
     unbound = [
         (name, dim_var)
-        for name, dim_var in dim_vars_reached(function).items()
+        for name, dim_var in _program_dim_vars(module, function).items()
         if name not in stated
     ]
     if unbound:
@@ -112,16 +113,17 @@ def run_authored_analysis(
         )
         raise ValueError(f"analyze needs one EXTENT for every open dimension: {guidance}")
     if not analyses:
-        checked = (
-            specialize_concretely(
-                function, dims, TypeInferContext(scope=FunctionScope(module, function))
+        try:
+            checked_module, checked = _resolve_program_geometry(
+                module,
+                function,
+                dims,
+                TypeInferContext(scope=FunctionScope(module, function)),
             )
-            if dims is not None
-            else function
-        )
-        functions = reachable_functions(checked)
-        infer_authored_types(functions, module)
-        validate_authored(functions)
+        except SpecializationError as error:
+            raise ValueError(f"analyze: {error}") from None
+        check_program(checked_module, checked)
+        validate_authored(reachable_functions(checked))
         annotated = as_script(module, options=PythonPrintOptions(show_types=True))
         sys.stdout.write(annotated)
         return 0

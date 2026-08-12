@@ -28,6 +28,7 @@ class Target:
     def get_analyzer(self, selector: str) -> Analyzer: ...
     def get_scheduler(self, topology: str) -> Scheduler: ...
     def get_code_generator(self) -> CodeGenerator: ...
+    def validate_program_topology(self, topology: Topology) -> None: ...
     def get_facts(
         self,
         facts_type: type[FactsT],
@@ -82,6 +83,10 @@ def registered_targets() -> Mapping[str, type[Target]]: ...
   - Target values MUST remain immutable hardware values. Their service getters
     select immutable descriptors and Facts; normal Python inheritance carries
     those selections to a subclass unless it overrides or refuses them.
+  - `validate_program_topology` MUST reject a level outside `topology_levels`
+    and any resolved static extent that is not positive or exceeds the finite
+    `TopologyLimitFacts` bound for that level. The shared program check MUST use
+    this method rather than reproduce a backend's topology limits.
   - A provider MAY import `Analyzer` and `Scheduler` from `tilefoundry.target`
     to construct getter results. That package MUST NOT expose `CodeGenerator`
     or `LinkableModule` as provider API.
@@ -253,17 +258,12 @@ thread mesh layouts.
     the CUDA grid is a launch shape rather than an SM allocation, so its static
     extent is unbounded here. The `"thread"` Facts projection MUST equal
     `architecture.max_threads_per_cta`.
-  - Only `cta` MAY have a launch-provided (`None`) extent; every other level
-    MUST have a static extent.
-  - A launch-provided level MUST NOT be scheduled, because scheduling requires
-    its static extent.
-  - A launch-provided level has no declared position count. When a Mesh names
-    that one level, analysis reads its logical position count from
-    `size(mesh.layout)`; a Mesh naming multiple levels is refused for this
-    name-keyed reading rather than assigned to one of them.
+  - `Topology.size` MUST be an explicit `ShapeDim`; construction with `None`
+    MUST fail for every topology level.
+  - An unresolved symbolic topology extent MUST NOT be scheduled, because
+    scheduling requires a static extent.
   - Static declared topology extents MUST be positive integers within their
-    target resource limits. `Topology("cta", None)` MUST remain valid for the
-    handwritten dynamic-launch compile path.
+    target resource limits.
   - Unsupported topology levels MUST fail at the generic lowering boundary.
 
 ### 4.1 `CudaArchitecture`

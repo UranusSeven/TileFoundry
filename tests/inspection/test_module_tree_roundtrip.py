@@ -10,8 +10,16 @@ absent.
 from __future__ import annotations
 
 from tests._source import import_dsl
+from tests.fixtures.placed.derived_prefill import DerivedPrefill
 from tilefoundry import func, module
-from tilefoundry.dsl import ConstTensor, DimVar, DimVarRangePat, Mesh, Tensor, tf  # noqa: F401
+from tilefoundry.dsl import (  # noqa: F401
+    ConstTensor,
+    DimVar,
+    DimVarRangePat,
+    Mesh,
+    Tensor,
+    tf,
+)
 from tilefoundry.inspection import as_script
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.specialize import origin_of
@@ -56,6 +64,21 @@ class _Tree:
         @func
         def helper(x: Tensor[(4,), "f32"]) -> Tensor[(4,), "f32"]:
             return tf.relu(x)
+
+
+def test_a_derived_topology_and_mesh_geometry_survive_the_round_trip() -> None:
+    source = as_script(DerivedPrefill)
+    imported = import_dsl(source)
+
+    assert 'prefill_n = DimVar("prefill_n", 1, 65)' in source
+    assert 'topology_only = DimVar("topology_only", 1, 1025)' in source
+    assert 'Topology("cta", ceildiv(prefill_n, 8))' in source
+    assert 'Topology("thread", topology_only)' in source
+    assert imported.topologies == DerivedPrefill.topologies
+    assert imported.entry_function().params[0].type == (
+        DerivedPrefill.entry_function().params[0].type
+    )
+    assert as_script(imported) == source
 
 
 def _child(mod: Module, name: str) -> Module:

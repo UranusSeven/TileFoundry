@@ -10,10 +10,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from tilefoundry.analysis.check import _resolve_program_geometry, check_program
+from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
-from tilefoundry.ir.hir.specialize import SpecializationError, specialize_concretely
-from tilefoundry.ir.types.shape_helpers import static_dim_value
+from tilefoundry.ir.hir.specialize import SpecializationError
 from tilefoundry.ir.types.shard import Topology
 from tilefoundry.target import Target, UnsupportedCapabilityError
 from tilefoundry.target.services import Scheduler
@@ -54,17 +55,6 @@ def _topology(module: Module, name: str) -> Topology:
         level = module.resolve_topology(name)
     except ValueError as error:
         raise ScheduleError(f"schedule: {error}") from None
-    extent = static_dim_value(level.size)
-    if extent is None:
-        raise ScheduleError(
-            f"schedule: topology {name!r} has extent {level.size!r}, which is "
-            "not known until launch; scheduling a level requires its static "
-            "extent. The rule: tilefoundry spec target topology-levels"
-        )
-    if extent < 1:
-        raise ScheduleError(
-            f"schedule: topology {name!r} extent {extent} must be positive"
-        )
     return level
 
 
@@ -119,16 +109,18 @@ def schedule(
             f"schedule: {function.name!r} is not a function of module "
             f"{module.name!r}"
         )
-    if dims is not None:
-        try:
-            function = specialize_concretely(function, dims)
-        except SpecializationError as error:
-            raise ScheduleError(f"schedule: {error}") from None
+    result_module = module
+    try:
+        module, function = _resolve_program_geometry(module, function, dims)
+    except SpecializationError as error:
+        raise ScheduleError(f"schedule: {error}") from None
 
     target = module.resolve_target()
-    for declared_topology in module.effective_topologies():
-        target.validate_program_topology(declared_topology)
     level = _topology(module, topology)
+    try:
+        check_program(module, function, level=topology)
+    except AnalysisError as error:
+        raise ScheduleError(f"schedule: {error}") from None
     algorithm = _algorithm(target, topology)
     resolved_options = _options(options)
 
@@ -139,9 +131,9 @@ def schedule(
             f"{type(target).__name__} returned a {type(plan).__name__}, not a "
             "SchedulePlan"
         )
-    plan.verify(module, function, level)
+    plan.verify(result_module, function, level)
     return ScheduleResult(
-        module=module, function=function, topology=level, plan=plan
+        module=result_module, function=function, topology=level, plan=plan
     )
 
 
