@@ -8,19 +8,28 @@ implementation output, so a formula round-trip cannot validate itself.
 
 from __future__ import annotations
 
+import json
+import re
+from dataclasses import MISSING
+from dataclasses import fields as dataclass_fields
+from typing import get_args, get_origin
+
 import isl
 import pytest
 
 import tilefoundry.analysis.api as analysis_api
 import tilefoundry.cli.analyze as cli_analyze
+from tests.analysis.test_analysis_families import _oversized_working_set
 from tests.fixtures.logical.authored_constraint import AuthoredConstraint
 from tests.fixtures.logical.gqa_static import static_online_attend
+from tests.fixtures.placed.moe_mega_kernel import MoEMegaKernel
 from tests.fixtures.placed.rmsnorm import RmsnormModule
 from tilefoundry import func, module
 from tilefoundry.analysis import (
     AnalysisError,
     OccurrenceProvenance,
     TileGraph,
+    analyze,
     check_program,
     extract,
 )
@@ -28,9 +37,30 @@ from tilefoundry.analysis.preflight import validate_authored
 from tilefoundry.analysis.walk import postorder, values_of
 from tilefoundry.dsl import ConstTensor, Tensor
 from tilefoundry.dsl.tf import *  # noqa: F401,F403 -- op names resolved dynamically
+from tilefoundry.inspection.analysis_report import render_analysis
+from tilefoundry.inspection.values import (
+    ENTRIES,
+    ENTRY,
+    FIELD,
+    FIELDS,
+    PAIR,
+    PER_UNIT,
+    TRIPS,
+    AdvisorySummary,
+    Prose,
+    comment_of,
+    declared_records,
+    expr_fields,
+    family_of,
+    render_comment,
+    render_record,
+)
 from tilefoundry.ir.core import (
+    BindingMetadata,
     Call,
     SourceSpanMetadata,
+    TotalAndPerUnit,
+    TripInterval,
     TypeInferContext,
     Var,
     binding_name,
@@ -56,6 +86,7 @@ from tilefoundry.visitor_registry.access_relation import (
     AccessRelations,
     access_relation_registry,
 )
+from tilefoundry.visitor_registry.contexts import TrafficBytes
 
 REPEATS = 4
 B, S, H, D = 1, 5, 2, 3
@@ -536,3 +567,171 @@ def test_a_quantised_scale_is_written_once_per_group() -> None:
     scale = relation.outputs[1]
     assert isinstance(scale, isl.map)
     assert "128" in str(scale)
+
+
+_KEYED = re.compile(rf'(?P<key>[\w-]+){FIELD}(?P<value>"(?:[^"\\]|\\.)*"|\S+)')
+
+
+def _emitted(text: str, family: str) -> dict[str, str]:
+    """One comment taken apart by the record and field layers of the ladder.
+
+    The record layer splits outside a quoted value, which is the whole reason a
+    value that holds a separator has to bracket itself. That the pairs rejoin to
+    exactly what was read is how the split is held to being one.
+    """
+    if text.startswith(f"{family}{FIELD}"):
+        return {family: text[len(family) + len(FIELD) :]}
+    head, _, rest = text.partition(FIELDS)
+    assert head == family, text
+    keyed = list(_KEYED.finditer(rest))
+    assert FIELDS.join(match.group(0) for match in keyed) == rest, rest
+    return {match["key"]: match["value"] for match in keyed}
+
+
+def _assert_shape(text: str, declared: object) -> None:
+    """One value keeps the shape its declared type renders in.
+
+    Which is also how the separator ladder is checked: an inner value holding an
+    outer separator would not match the shape its own type renders in.
+    """
+    if declared is int:
+        assert re.fullmatch(r"-?\d+", text), (text, declared)
+    elif declared is Prose:
+        assert re.fullmatch(r'"(?:[^"\\]|\\.)*"', text), (text, declared)
+    elif declared is str:
+        assert FIELD not in text and FIELDS not in text, (text, declared)
+    elif declared is TrafficBytes:
+        assert re.fullmatch(rf"r-?\d+{re.escape(PAIR)}w-?\d+", text), text
+    elif declared is TripInterval:
+        assert re.fullmatch(rf"\[[^{ENTRIES}]+{ENTRIES}[^{ENTRIES}]+\)(\{TRIPS}\d+)?", text), text
+    elif get_origin(declared) is TotalAndPerUnit:
+        (inner,) = get_args(declared)
+        total, separator, per_unit = text.partition(PER_UNIT)
+        assert separator == PER_UNIT, text
+        _assert_shape(total, inner)
+        _assert_shape(per_unit, inner)
+    elif get_origin(declared) is dict:
+        key_type, value_type = get_args(declared)
+        for entry in text.split(ENTRIES):
+            key, separator, value = entry.partition(ENTRY)
+            assert separator == ENTRY, entry
+            _assert_shape(key, key_type)
+            _assert_shape(value, value_type)
+    elif get_origin(declared) is tuple:
+        (item_type,) = (arg for arg in get_args(declared) if arg is not Ellipsis)
+        for item in text.split(ENTRIES):
+            _assert_shape(item, item_type)
+    else:
+        raise AssertionError(f"{declared} has no rendering: {text}")
+
+
+_PROSE_PROBE = 'l2 holds 2 B, spills; says "no" over \\'
+
+
+def _analysed_mega() -> tuple[dict[type, list[tuple[object, object]]], tuple[object, ...]]:
+    """What one real analysis leaves on the IR, and the views it reports."""
+    result = analyze(
+        MoEMegaKernel,
+        MoEMegaKernel.entry_function(),
+        analysis=("compute-cost", "memory", "roofline", "timeline"),
+    )
+    rendered = render_analysis(result)
+    function = result.function
+    found: dict[type, list[tuple[object, object]]] = {}
+    for expr in (function, *postorder(function.body)):
+        for value in expr.metadata:
+            found.setdefault(type(value), []).append((value, expr))
+    return found, rendered.summary
+
+
+def _every_stated_record() -> dict[type, list[object]]:
+    """Every declared record, from real analyses, plus one prose probe.
+
+    The mega kernel fits its caches, so an advisory needs the second program;
+    the probe then carries every separator the ladder uses, which is what a
+    quoted value has to survive.
+    """
+    found, views = _analysed_mega()
+    stated: dict[type, list[object]] = {
+        record_type: [record for record, _ in records]
+        for record_type, records in found.items()
+    }
+    for view in views:
+        stated.setdefault(type(view), []).append(view)
+    advisory = render_analysis(
+        analyze(_oversized_working_set, _oversized_working_set.entry_function(), analysis="memory")
+    )
+    stated.setdefault(AdvisorySummary, []).extend(
+        view for view in advisory.summary if isinstance(view, AdvisorySummary)
+    )
+    stated[AdvisorySummary].append(AdvisorySummary(Prose(_PROSE_PROBE)))
+
+    assert set(declared_records()) <= set(stated)
+    assert {BindingMetadata, OccurrenceProvenance} <= set(stated)
+    assert len(stated[AdvisorySummary]) > 1
+    return stated
+
+
+def test_a_record_comment_states_only_what_it_declared() -> None:
+    """Every key on a comment maps back to a field or a declared projection.
+
+    A key spelled by hand drifts from the field it reports -- five did -- and a
+    projection nobody declared can grow a sixth. So the walk is held to the
+    declarations: every key is one of them, every value keeps the shape its
+    declared type renders in, and a record that measured nothing states its
+    family name and stops. Metadata that is not a report states nothing at all,
+    and a summary line is held to the same rules as an annotated equation.
+    """
+    for record_type, records in _every_stated_record().items():
+        declared = comment_of(record_type)
+        if declared is None:
+            assert all(render_comment(record) is None for record in records)
+            continue
+        keys = {emission.key.replace("_", "-"): emission for emission in declared.emissions}
+        for record in records:
+            emitted = _emitted(render_comment(record), declared.family)
+            for key, value in emitted.items():
+                emission = keys.get(key) or (
+                    declared.emissions[0] if key == declared.family else None
+                )
+                assert emission is not None, (key, declared)
+                assert not emission.opt_in, (key, "asked for nothing")
+                _assert_shape(value, emission.type)
+                if emission.type is Prose:
+                    assert json.loads(value) == str(emission.of(record))
+
+    for record_type in declared_records():
+        if any(field.default is MISSING for field in dataclass_fields(record_type)):
+            continue
+        declared = comment_of(record_type)
+        nothing = _emitted(render_comment(record_type()), declared.family)
+        assert set(nothing) <= {declared.family, "waves"}, nothing
+        assert nothing.get("waves", "1") == "1"
+
+
+def test_a_reported_record_keys_every_field_by_its_own_name() -> None:
+    """JSON is the record's own field names, and the comment cannot crop it.
+
+    A handwritten projection could rename a key and no output assertion would
+    notice, and a comment leaving a key out must not take it out of what programs
+    read: a default, a zero, and a null are facts a consumer branches on. So the
+    report states every field a record has, under the field's own name, and the
+    only key it may leave out is one read from the expression, which is where a
+    Function Call has no operand split to state.
+    """
+    found, _ = _analysed_mega()
+    for record_type, records in found.items():
+        if comment_of(record_type) is None:
+            continue
+        names = {field.name for field in dataclass_fields(record_type)}
+        for record, expr in records:
+            reported = render_record(record, expr)
+
+            assert set(reported) <= names
+            assert names - set(reported) <= expr_fields(record_type)
+            for key, value in _emitted(
+                render_comment(record), family_of(record_type)
+            ).items():
+                stated = reported.get(key.replace("-", "_"))
+                if isinstance(stated, int | str):
+                    assert value == str(stated), (key, value, stated)

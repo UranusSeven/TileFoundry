@@ -38,7 +38,13 @@ from tilefoundry.analysis.compute_cost import _call_movement
 from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.walk import postorder
 from tilefoundry.dsl import ConstTensor, DimVar, Mesh, Tensor, Topology, tf
-from tilefoundry.inspection.analysis_report import render_json, render_text, report
+from tilefoundry.inspection.analysis_report import (
+    render_analysis,
+    render_json,
+    render_text,
+    report,
+)
+from tilefoundry.inspection.values import render_comment
 from tilefoundry.ir.core import Call, Constant, Tuple, Var, get_metadata
 from tilefoundry.ir.hir import Function
 from tilefoundry.ir.hir.math.binary import Binary
@@ -908,6 +914,11 @@ def test_a_cache_too_small_is_advisory_and_only_where_the_scopes_agree() -> None
     assert any("l2 holds" in note for note in record.advisories)
     assert not any("l1 holds" in note for note in record.advisories)
 
+    lines = render_text(render_analysis(result)).splitlines()
+    assert [f"# advisory={json.dumps(note)}" for note in record.advisories] == [
+        line for line in lines if line.startswith("# advisory")
+    ]
+
 
 def test_a_shared_block_reports_what_the_program_leaves_the_cache() -> None:
     """The sharing edge makes L1's usable size depend on the program.
@@ -1091,8 +1102,8 @@ def test_mega_kernel_preserves_placement_costs_and_timeline_order() -> None:
     assert cost.traffic_per_unit == (("gmem", TrafficBytes(read=256, write=256)),)
     assert cost.traffic_per_unit_at("gmem") == TrafficBytes(read=256, write=256)
     assert (
-        "bytes=gmem:r30720/w30720 per-unit-bytes=gmem:r256/w256 operands="
-        in cost.format_comment()
+        "traffic=gmem:r30720/w30720@r256/w256"
+        in render_comment(cost, opt_in=frozenset({"operands"}))
     )
 
     records = tuple(get_metadata(call, TimelineMetadata) for call in calls)
@@ -1347,7 +1358,8 @@ def test_a_report_shows_the_requested_analyses_and_reads_the_same_either_way() -
     entry = _entry(_CudaAdd)
     result = analyze(_CudaAdd, entry, analysis="roofline")
 
-    data = report(result)
+    rendered = render_analysis(result)
+    data = rendered.data
 
     assert data["requested"] == ["roofline"]
     assert data["executed"] == ["compute-cost", "memory", "roofline"]
@@ -1360,14 +1372,16 @@ def test_a_report_shows_the_requested_analyses_and_reads_the_same_either_way() -
     assert get_metadata(result.function, MemoryMetadata) is not None
     cost = get_metadata(_calls(result.function)[-1], ComputeCostMetadata)
     assert cost is not None
-    assert " operands=0:r" in cost.format_comment()
-    assert ",result:r" in cost.format_comment()
+    asked = render_comment(cost, opt_in=frozenset({"operands"}))
+    assert " operands=0:r" in asked
+    assert ",result:r" in asked
+    assert "operands" not in render_comment(cost)
 
     payload = json.loads(render_json(data))
     assert payload == data
-    text = render_text(data)
-    assert f"by={payload['function_records']['roofline']['bound_by']}" in text
-    assert "# flops " in text
-    assert "# traffic " in text
-    assert "# peak-footprint " in text
+    text = render_text(rendered)
+    bound = payload["function_records"]["roofline"]
+    assert f"# roofline ideal-ns={bound['ideal_ns']} bound-by={bound['bound_by']}" in text
+    assert "# compute-cost flops=f32:256@256 traffic=gmem:r2048/w1024@r2048/w1024" in text
+    assert "# peak-footprint=gmem:2048" in text
     assert "operands" not in text

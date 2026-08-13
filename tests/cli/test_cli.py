@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import tomllib
@@ -638,6 +639,13 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> N
     second = capsys.readouterr().out
     assert first == second
 
+    assert cli.main(["analyze", selector, *flags, "--operands"]) == 0
+    asked = capsys.readouterr().out
+    assert "operands=" not in first
+    assert "operands=0:r30720/w0,result:r0/w30720" in asked
+    assert cli.main(["analyze", selector, *flags, "--operands", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == payload
+
     header, annotated = first.split("\n\n", 1)
     lines = annotated.splitlines()
     assert payload["requested"] == payload["executed"] == [
@@ -661,12 +669,38 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> N
     assert "offset=120" in annotated
 
     summary = payload["function_records"]["timeline"]
-    assert (
+    cost = payload["function_records"]["compute-cost"]
+    whole, unit = cost["traffic"]["gmem"], cost["traffic_per_unit"]["gmem"]
+    peak = payload["function_records"]["memory"]["footprint"]
+    bound = payload["function_records"]["roofline"]
+    assert header.splitlines() == [
+        "# analysis target=nvidia.h200_sxm module=MoEMegaKernel function=experts "
+        f"topology={payload['topology']}",
+        f"# selection requested={','.join(payload['requested'])} "
+        f"executed={','.join(payload['executed'])}",
+        "# compute-cost "
+        f"flops=f32:{cost['flops']['f32']}@{cost['flops_per_unit']['f32']} "
+        f"traffic=gmem:r{whole['read']}/w{whole['write']}"
+        f"@r{unit['read']}/w{unit['write']}",
+        f"# peak-footprint=gmem:{peak[0]['peak_bytes']}",
+        f"# roofline ideal-ns={bound['ideal_ns']} bound-by={bound['bound_by']}",
         "# timeline root=MoEMegaKernel::experts "
-        f"local-makespan={summary['local_makespan_ns']}ns "
+        f"local-makespan-ns={summary['local_makespan_ns']} "
         f"waves={summary['waves']} "
-        f"estimated-kernel={summary['estimated_kernel_ns']}ns"
-    ) in header.splitlines()
+        f"estimated-kernel-ns={summary['estimated_kernel_ns']}",
+    ]
+    assert payload["totals"]["flops"] == cost["flops"]
+    assert payload["totals"]["traffic"] == cost["traffic"]
+
+    hoisted = {
+        line.split(" = ", 1)[0] for line in lines if " = Mesh((Topology(" in line
+    }
+    assert hoisted == {"cta", "cta_2", "cta_3", "cta_4"}
+    annotated_types = [
+        line.split("  # ", 1)[1].split("; ", 1)[0] for line in lines if "  # Tensor[" in line
+    ]
+    assert 'Tensor[(120, 64), "f32", (120 @ cta_2.tile, 64)]' in annotated_types
+    assert 'Tensor[(120, 64), "f32", (12 @ cta_3.tile, 10, 64)]' in annotated_types
 
     rows = payload["calls"]
     assert len(rows) == 7
@@ -685,10 +719,12 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> N
         stop = starts[index + 1] - 1 if index + 1 < len(starts) else len(lines)
         statement = "\n".join(lines[start - 1 : stop])
         timeline = row["timeline"]
-        assert (
-            f"timeline start={timeline['start_ns']}ns end={timeline['end_ns']}ns"
-            in statement
-        )
-    assert len([line for line in lines if "; timeline " in line]) == len(rows)
+        assert f"timeline=[{timeline['start_ns']},{timeline['end_ns']})" in statement
+        annotated_meshes = set(re.findall(r"@ (\w+)\.", statement.split("  # ", 1)[1]))
+        assert annotated_meshes <= hoisted
+        placed_meshes = set(re.findall(r"mesh=(\w+),", statement))
+        if annotated_meshes and placed_meshes:
+            assert annotated_meshes == placed_meshes
+    assert len([line for line in lines if "; timeline=" in line]) == len(rows)
     assert len({row["value"] for row in rows}) == len(rows)
     assert "units=" not in annotated

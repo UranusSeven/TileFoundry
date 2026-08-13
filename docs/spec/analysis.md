@@ -327,18 +327,24 @@ Each owns its record types and declares its dependencies and output additions.
 
 | Selector | Requires | Owns | Rests on | Text summary adds | Annotates equations |
 |---|---|---|---|---|---|
-| `compute-cost` | - | `ComputeCostMetadata` | the authored program | `flops`, `traffic` | every measured Call |
+| `compute-cost` | - | `ComputeCostMetadata` | the authored program | `compute-cost` | every measured Call |
 | `memory` | `compute-cost` | `MemoryMetadata` | `MemoryHierarchyFacts` | `peak-footprint`, `advisory` | none |
-| `roofline` | `memory`, `compute-cost` | `RooflineMetadata` | `ThroughputFacts` | bounded dependency evidence, `ideal-bound` | every measured Call |
-| `timeline` | `compute-cost` | `TimelineMetadata`, `TimelineSummaryMetadata` | `ThroughputFacts`, `ParallelCapacityFacts` | local makespan, waves, estimated kernel time | every measured Call |
+| `roofline` | `memory`, `compute-cost` | `RooflineMetadata` | `ThroughputFacts` | bounded dependency evidence, `roofline` | every measured Call |
+| `timeline` | `compute-cost` | `TimelineMetadata`, `TimelineSummaryMetadata` | `ThroughputFacts`, `ParallelCapacityFacts` | `timeline` | every measured Call |
 
 Every compact text summary begins with these two lines:
 
 ```text
 # example
-# analysis target=<target> module=<module> function=<function> topology=<level|none>
-# analyses=<selector>[,<selector>...] executed=<selector>[,<selector>...]
+# analysis target=<target> module=<module> function=<function> topology=<level>
+# selection requested=<selector>[,<selector>...] executed=<selector>[,<selector>...]
 ```
+
+Every summary line is one record walked exactly as an annotated equation is
+([inspection §2.8](./inspection.md#28-record-comment-forms)), so the two surfaces
+cannot spell one value two ways. What the report is about and what was asked of it
+are records of the report rather than of the IR; every other summary line is a
+record of the selected Function.
 
 The JSON report carries the same identity and selection in `target`, `module`,
 `function`, `topology`, `requested`, and `executed`. Whole-function
@@ -373,22 +379,20 @@ def render_analysis(result: AnalysisResult) -> AnalysisRendering:
   receives neither a comment nor a report row.
 - A parameterized loop occurrence MUST stay one record. Neither surface expands
   it into one entry per trip.
-- A compute-cost comment MUST place `per-unit-bytes` immediately after global
-  `bytes`, and JSON MUST expose all four quantities without reconstructing any
-  of them from the others.
+- A compute-cost comment MUST state one unit's share beside the whole quantity it
+  is a share of, and JSON MUST expose all four quantities without reconstructing
+  any of them from the others.
 
-The output forms below share these placeholders:
+A value renders by the type its field holds, and those forms and their separators
+are owned by [inspection §2.8](./inspection.md#28-record-comment-forms). What this
+layer settles is which type a field holds and what its keys name:
 
-| Placeholder | Form | Empty value |
-|---|---|---|
-| `<flopset>` | `<dtype>:<int>[,<dtype>:<int>...]` | `0` |
-| `<levelset>` | `<level>:r<int>/w<int>[,<level>:r<int>/w<int>...]` | `0` |
-| `<peakset>` | `<level>:<int>[,<level>:<int>...]` | `0` |
-| `<operandset>` | `<position>:r<int>/w<int>[,<position>:r<int>/w<int>...]`, where position is an argument integer or `result` | omitted |
-| `<resource>` | `compute`, `memory`, `balanced`, `unrated`, or `none` | `none` |
-
-Summary sets use `=` and comma-space separators; annotation sets use `:` and
-comma separators. This difference is intentional.
+- A mapping's key is a dtype, a storage level, or an operand position -- an
+  argument integer, or `result` for the value the Call produces.
+- `<resource>` is `compute`, `memory`, `balanced`, `unrated`, or `none`.
+- Bytes moved are `TrafficBytes`; a whole quantity paired with one unit's share
+  is `TotalAndPerUnit`; a Call's occurrence on the timeline is one
+  `TripInterval`.
 
 - constraints:
   - A family MUST obtain hardware only through a Facts aggregate it declares
@@ -419,6 +423,16 @@ comma separators. This difference is intentional.
     recorded by the analysis that computed it.
   - Text and JSON MUST be built from one intermediate report and MUST carry the
     same conclusions.
+  - A family's JSON projection MUST be its record's fields under their own names,
+    with nothing left out: a default, a `null`, and an empty mapping are each a
+    fact a program branches on, and a key spelled by hand is a key that can drift
+    from the field it reports. A field whose projection needs the expression the
+    record is attached to MUST be declared as one, and MAY be absent where the
+    program offers no such reading -- `operands` on a Function Call, which charges
+    a callee total no operand position names. A comment over the same record MAY
+    state fewer keys, or projected ones
+    ([inspection §2.8](./inspection.md#28-record-comment-forms)), and what it
+    leaves out MUST stay in the JSON projection.
   - A compact text summary MUST contain whole-function facts only. Per-value
     facts MUST stay on their annotated equations; JSON MAY retain operand names
     and types in its structured projection.
@@ -456,20 +470,22 @@ class ComputeCostMetadata(IRMetadata):
 | `traffic` | Multiply the evaluator's per-operand movement by the same factor, charge concrete tensor leaves to their storage levels, and group by level. A Type with leaves at several levels keeps those leaf bytes separate. A `UMAT` leaf has no residency of its own: when it appears in `Call.args`, charge its own bytes at the target's established `rmem` materialization level; when it appears only in an Op attribute, charge nothing. A Function Call takes the callee's grouped total. | No |
 | `operands` | Multiply each evaluator entry by the same factor and keep order `(*call.args, call)`. A Function Call has no operand split. | No |
 
-Requesting this family adds these summary lines, each prefixed by `# `:
+Requesting this family adds one summary line, prefixed by `# `: the Function's own
+record, stated exactly as a Call's is. The whole program's work is not a second
+record.
 
 ```text
-flops <dtype>=<int>[, <dtype>=<int>...]
-traffic <level>=r<int>/w<int>[, <level>=r<int>/w<int>...]
+compute-cost flops=<dtype>:<int>@<int>[,...] traffic=<level>:r<int>/w<int>@r<int>/w<int>[,...]
 ```
 
-An empty flop or traffic set prints as `0` after its label.
-
-Every measured Call receives this annotation; `operands` is omitted for a
-Function Call:
+Every measured Call receives this annotation. Each key pairs the whole quantity
+with one unit's share, so the two `*_per_unit` fields are not separate keys.
+`operands` is the same traffic split by operand, one layer finer, so it is
+emitted only when asked for ([cli Analyze](./cli.md#analyze)) and is absent from a
+Function Call, which has no split:
 
 ```text
-compute-cost flops=<flopset> per-unit=<flopset> bytes=<levelset> per-unit-bytes=<levelset>[ operands=<operandset>]
+compute-cost flops=<dtype>:<int>@<int>[,...] traffic=<level>:r<int>/w<int>@r<int>/w<int>[,...][ operands=<position>:r<int>/w<int>[,...]]
 ```
 
 Each reported Call's JSON projection is under its `compute-cost` key. `operands`
@@ -655,17 +671,20 @@ class MemoryHierarchyFacts:
 Requesting memory adds one summary line and one line per advisory:
 
 ```text
-peak-footprint <level>=<int>[, <level>=<int>...]
-advisory <text>
+peak-footprint=<level>:<int>[,<level>:<int>...]
+advisory="<text>"
 ```
 
-An empty footprint prints as `peak-footprint 0`; no advisory line is emitted
-when there is no advisory.
+An empty footprint states the family name alone; each advisory is its own line, so
+a program with none adds none. An advisory is a sentence, so it is quoted and
+escaped ([inspection §2.8](./inspection.md#28-record-comment-forms)); JSON carries
+the same text raw.
 
-The record's single-line comment form is:
+The record's single-line comment form projects the footprint it holds; `traffic`
+and `lifetimes` are read from JSON, not from a line:
 
 ```text
-memory peak=<peakset> persistent=<int> advisories=<int>
+memory peak=<level>:<int>[,...] persistent=<int> advisories=<int>
 ```
 
 The `analyze` equation printer emits no memory annotation because the record is
@@ -764,13 +783,15 @@ Requesting roofline adds the exact summed compute-cost `flops` and `traffic`,
 the memory record's per-level peak, and this verdict to the summary:
 
 ```text
-ideal-bound=<int>ns by=<resource>
+roofline ideal-ns=<int> bound-by=<resource>
 ```
 
-Every measured Call receives this annotation:
+Every measured Call receives this annotation. `compute_ns` and `memory_ns` are
+the two numbers the verdict was read off, so they are in JSON rather than on the
+line:
 
 ```text
-roofline bound=<int>ns by=<resource> compute=<int>ns memory=<int>ns
+roofline ideal-ns=<int> bound-by=<resource>
 ```
 
 Reported Call and Function records use the same projection under their
@@ -890,14 +911,24 @@ class ParallelCapacityFacts:
 Requesting timeline adds this Function verdict to the summary:
 
 ```text
-timeline root=<Module>::<Function> local-makespan=<int>ns waves=<int>
-estimated-kernel=<int>ns
+timeline root=<Module>::<Function> local-makespan-ns=<int> waves=<int> estimated-kernel-ns=<int>
 ```
 
-Every measured Call receives this annotation:
+`root` is the report's own identity, composed by inspection from the module and
+function it already states; it is not a field of `TimelineSummaryMetadata` and does
+not appear in that record's JSON projection. `waves` is stated even when it is one,
+because how many passes over the machine a plan takes is a conclusion and one wave
+is an answer.
+
+Every measured Call receives this annotation, one interval whether or not it
+repeats: a single trip states its own bounds, and a repeated occurrence states
+them offset by the trip index, with the trip count as a suffix. The trip count is
+not a second key, because a reader deriving the later intervals reads it off the
+interval it is a coefficient in:
 
 ```text
-timeline start=<int>ns end=<int>ns
+timeline=[<int>,<int>)
+timeline=[<int>t+<int>,<int>t+<int>)*<int>
 ```
 
 Reported Call and Function records use distinct projections under their

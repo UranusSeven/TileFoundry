@@ -1,0 +1,468 @@
+"""How a record renders as one line of comment.
+
+A record states typed fields ([core-ir §2](docs/spec/core-ir.md#2-expr)); what
+they look like is decided here, so a family arrives by declaring what it has
+rather than by writing a form string -- which is how five came to spell one value
+five ways. A value earns a rendering of its own only where Python cannot already
+read it: an ``int``, a token, and a mapping of them get none. The constants below
+are the ladder of [inspection §2.8](docs/spec/inspection.md#28-record-comment-forms),
+one each, and nothing else in the tree spells one.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field, fields, is_dataclass
+from typing import get_args, get_origin, get_type_hints
+
+from tilefoundry.analysis.metadata import (
+    ComputeCostMetadata,
+    MemoryMetadata,
+    RooflineMetadata,
+    TimelineMetadata,
+    TimelineSummaryMetadata,
+)
+from tilefoundry.ir.core.metadata import IRMetadata, SourceSpanMetadata
+from tilefoundry.ir.core.values import TotalAndPerUnit, TripInterval
+from tilefoundry.visitor_registry.contexts import TrafficBytes
+
+PAIR = "/"
+PER_UNIT = "@"
+ENTRY = ":"
+ENTRIES = ","
+FIELD = "="
+FIELDS = " "
+PARTS = "; "
+TRIPS = "*"
+
+
+class Prose(str):
+    """Text that is a sentence rather than a token.
+
+    A token renders bare, which only works while it holds no separator. A
+    sentence holds several -- spaces, commas, a semicolon -- so it renders as a
+    quoted, escaped string literal, which brackets it: a reader splits a layer
+    outside the quotes ([inspection §2.8](docs/spec/inspection.md#28-record-comment-forms)).
+    """
+
+
+def _trip_interval(value: TripInterval, render: Callable[[object], str]) -> str:
+    """One interval, offset by the trip index when it repeats."""
+    if value.trips <= 1:
+        return f"[{value.start}{ENTRIES}{value.end})"
+    offset = f"{value.stride}t+"
+    return f"[{offset}{value.start}{ENTRIES}{offset}{value.end}){TRIPS}{value.trips}"
+
+
+RENDER: dict[type, Callable[..., str]] = {
+    Prose: lambda value, render: json.dumps(str(value)),
+    TrafficBytes: lambda value, render: f"r{value.read}{PAIR}w{value.write}",
+    TotalAndPerUnit: (
+        lambda value, render: f"{render(value.total)}{PER_UNIT}{render(value.per_unit)}"
+    ),
+    TripInterval: _trip_interval,
+}
+
+
+def render_value(value: object) -> str:
+    """One value, rendered by its own type or as the entries it holds."""
+    for value_type, render in RENDER.items():
+        if isinstance(value, value_type):
+            return render(value, render_value)
+    entries = _entries_of(value)
+    if entries is not None:
+        return ENTRIES.join(f"{key}{ENTRY}{render_value(item)}" for key, item in entries)
+    if isinstance(value, tuple | list):
+        return ENTRIES.join(render_value(item) for item in value)
+    return str(value)
+
+
+def _entries_of(value: object) -> tuple[tuple[object, object], ...] | None:
+    """*value* as key/value pairs, or ``None`` when it is not a mapping."""
+    if isinstance(value, Mapping):
+        return tuple(value.items())
+    if isinstance(value, tuple) and all(
+        isinstance(item, tuple) and len(item) == 2 for item in value
+    ):
+        return value
+    return None
+
+
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class Projection:
+    """One key a comment emits: its name, its type, and where its value is read.
+
+    A field is the identity projection of itself. Anything else -- a sum, a
+    count, several fields folded into one value -- is declared here, which is
+    what keeps the next one from appearing unannounced.
+
+    *default* is the value this key says nothing by, so it is left out. Without
+    one, an empty mapping says nothing and every other value is emitted.
+    """
+
+    key: str
+    type: object
+    of: Callable[..., object]
+    default: object = _UNSET
+    opt_in: bool = False
+
+
+@dataclass(frozen=True)
+class RecordComment:
+    """What one record type emits, in order, under which family name."""
+
+    family: str
+    emissions: tuple[Projection, ...]
+
+
+_COMMENTS: dict[type[IRMetadata], RecordComment] = {}
+
+
+def _derived_family(record: type) -> str:
+    """The family name the class name already states."""
+    stem = record.__name__.removesuffix("Metadata")
+    return re.sub(r"(?<!^)(?=[A-Z])", "-", stem).lower()
+
+
+def _field_projections(record: type[IRMetadata], names: tuple[str, ...]) -> tuple[Projection, ...]:
+    hints = get_type_hints(record)
+    defaults = {item.name: item.default for item in fields(record)}
+    return tuple(
+        Projection(name, hints[name], _read(name), defaults[name]) for name in names
+    )
+
+
+def _read(name: str) -> Callable[..., object]:
+    return lambda record: getattr(record, name)
+
+
+def comment(
+    record: type[IRMetadata],
+    *emitted: str | Projection,
+    family: str | None = None,
+) -> None:
+    """Declare that *record* renders as a comment, and what it emits.
+
+    A field is named by its own name; anything else is a ``Projection``. Naming
+    nothing emits every field in declaration order. A record with no declaration
+    renders as ``None``, which is how metadata that is not a report stays out of
+    the comment.
+
+    *family* is only for a record whose reported name is not the one its class
+    name states.
+    """
+    declared = emitted or tuple(item.name for item in fields(record))
+    emissions = tuple(
+        item
+        if isinstance(item, Projection)
+        else _field_projections(record, (item,))[0]
+        for item in declared
+    )
+    _COMMENTS[record] = RecordComment(
+        family=family or _derived_family(record), emissions=emissions
+    )
+
+
+def comment_of(record: type[IRMetadata]) -> RecordComment | None:
+    """What *record* declared it emits, if it declared anything."""
+    return _COMMENTS.get(record)
+
+
+def declared_records() -> tuple[type[IRMetadata], ...]:
+    """Every record type that declared it renders as a comment."""
+    return tuple(_COMMENTS)
+
+
+def family_of(record: type[IRMetadata]) -> str:
+    """The family name *record* is reported under."""
+    declared = _COMMENTS.get(record)
+    return declared.family if declared is not None else _derived_family(record)
+
+
+def render_comment(
+    record: IRMetadata, *, opt_in: frozenset[str] = frozenset()
+) -> str | None:
+    """One record as one comment, or ``None`` when it does not report.
+
+    A key is its declared name with ``_`` written as ``-``; a unit belongs in
+    that name, which is where it is said once. A record declaring one key uses
+    the family name as that key, because for a record of one thing the family
+    and the key say the same thing twice.
+    """
+    declared = _COMMENTS.get(type(record))
+    if declared is None:
+        return None
+    alone = len(declared.emissions) == 1
+    emitted: list[str] = []
+    for emission in declared.emissions:
+        if emission.opt_in and emission.key not in opt_in:
+            continue
+        value = emission.of(record)
+        if _says_nothing(value, emission.default):
+            continue
+        key = declared.family if alone else emission.key.replace("_", "-")
+        emitted.append(f"{key}{FIELD}{render_value(value)}")
+    if alone and emitted:
+        return emitted[0]
+    return FIELDS.join([declared.family, *emitted])
+
+
+def _says_nothing(value: object, default: object) -> bool:
+    """Whether this value adds nothing to the comment it would appear in."""
+    if default is not _UNSET:
+        return value == default
+    entries = _entries_of(value)
+    return entries is not None and not entries
+
+
+_EXPR_FIELDS: dict[type[IRMetadata], dict[str, Callable[..., object]]] = {}
+
+
+def expr_field(
+    record: type[IRMetadata], key: str, of: Callable[..., object]
+) -> None:
+    """Declare that one field is reported from the expression it is attached to.
+
+    A record states what it measured, not what the program calls the things it
+    measured. A field whose report needs those names is read by *of*, which is
+    given the record and its expression, and returns ``None`` where the program
+    offers no such reading.
+    """
+    _EXPR_FIELDS.setdefault(record, {})[key] = of
+
+
+def expr_fields(record: type[IRMetadata]) -> frozenset[str]:
+    """Which of *record*'s fields are reported from its expression."""
+    return frozenset(_EXPR_FIELDS.get(record, {}))
+
+
+def render_record(record: IRMetadata, expr: object) -> dict[str, object]:
+    """One record as report data, keyed by its own field names.
+
+    Nothing is left out and nothing is folded: a default, a ``None``, and an
+    empty mapping are each a fact a program may branch on, and the key is the
+    field name unchanged so a consumer reading the record reads the same word.
+    """
+    from_expr = _EXPR_FIELDS.get(type(record), {})
+    hints = get_type_hints(type(record))
+    reported: dict[str, object] = {}
+    for name in (item.name for item in fields(record)):
+        if name in from_expr:
+            value = from_expr[name](record, expr)
+            if value is not None:
+                reported[name] = value
+            continue
+        reported[name] = _reported_value(getattr(record, name), hints[name])
+    return reported
+
+
+def _reported_value(value: object, declared: object) -> object:
+    """One value as report data, read through the type its field declared.
+
+    The type is what decides, because a value cannot: an empty tuple of pairs and
+    an empty tuple of strings are the same object and different reports.
+    """
+    if value is None:
+        return None
+    if is_dataclass(declared) and isinstance(declared, type):
+        hints = get_type_hints(declared)
+        return {
+            item.name: _reported_value(getattr(value, item.name), hints[item.name])
+            for item in fields(declared)
+        }
+    origin = get_origin(declared)
+    if origin is dict:
+        _, value_type = get_args(declared)
+        return {key: _reported_value(item, value_type) for key, item in value.items()}
+    if origin in (tuple, list):
+        item_type = _item_type(declared)
+        pair = _pair_types(item_type)
+        if pair is not None:
+            return {key: _reported_value(item, pair[1]) for key, item in value}
+        return [_reported_value(item, item_type) for item in value]
+    return value
+
+
+def _item_type(declared: object) -> object:
+    """What one entry of a declared sequence is."""
+    args = [arg for arg in get_args(declared) if arg is not Ellipsis]
+    return args[0] if args else object
+
+
+def _pair_types(declared: object) -> tuple[object, object] | None:
+    """The key and value types of a declared pair, or ``None`` if it is not one."""
+    if get_origin(declared) is not tuple:
+        return None
+    args = get_args(declared)
+    if len(args) != 2 or Ellipsis in args:
+        return None
+    return args[0], args[1]
+
+
+def _paired_flops(record: ComputeCostMetadata) -> dict[str, TotalAndPerUnit[int]]:
+    """Each dtype's work, whole and per unit, as one value."""
+    per_unit = dict(record.flops_per_unit)
+    return {
+        dtype: TotalAndPerUnit(total, per_unit.get(dtype, 0))
+        for dtype, total in record.flops
+    }
+
+
+def _paired_traffic(
+    record: ComputeCostMetadata,
+) -> dict[str, TotalAndPerUnit[TrafficBytes]]:
+    """Each level's traffic, whole and per unit, as one value."""
+    return {
+        level: TotalAndPerUnit(moved, record.traffic_per_unit_at(level))
+        for level, moved in record.traffic
+    }
+
+
+def _by_operand(record: ComputeCostMetadata) -> dict[str, TrafficBytes]:
+    """What each operand moved, positional against ``(*call.args, call)``."""
+    last = len(record.operands) - 1
+    return {
+        ("result" if index == last else str(index)): moved
+        for index, moved in enumerate(record.operands)
+    }
+
+
+def peak_footprint(record: MemoryMetadata) -> dict[str, int]:
+    """How much of each level the function holds at its peak."""
+    return {item.level: item.peak_bytes for item in record.footprint}
+
+
+def _persistent_bytes(record: MemoryMetadata) -> int:
+    """The part of the peak the function cannot reclaim, across levels."""
+    return sum(item.persistent_bytes for item in record.footprint)
+
+
+def _advisory_count(record: MemoryMetadata) -> int:
+    """How many advisories there are; the comment is not where they are read."""
+    return len(record.advisories)
+
+
+def _interval(record: TimelineMetadata) -> TripInterval:
+    """The occurrence's interval, with its repetition folded in."""
+    return TripInterval(record.start_ns, record.end_ns, record.stride_ns, record.trips)
+
+
+def _source_span(record: SourceSpanMetadata) -> str:
+    """Where the expression was authored, as one location."""
+    return f"{record.file}:{record.line}:{record.column}"
+
+
+@dataclass(frozen=True)
+class ReportIdentity(IRMetadata):
+    """Which program, on which machine, this report is about."""
+
+    target: str = ""
+    module: str = ""
+    function: str = ""
+    topology: str = "none"
+
+
+@dataclass(frozen=True)
+class ReportSelection(IRMetadata):
+    """What was asked for, and what running it took."""
+
+    requested: tuple[str, ...] = ()
+    executed: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MemorySummary(IRMetadata):
+    """What one function holds at its peak, per level."""
+
+    peak_bytes: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AdvisorySummary(IRMetadata):
+    """One thing the memory walk observed that a reader should weigh."""
+
+    text: Prose
+
+
+@dataclass(frozen=True)
+class TimelineSummaryView(IRMetadata):
+    """One function's local plan, under the root the report is about.
+
+    ``root`` is the report's own identity composed for a reader, not something
+    the timeline family measured, which is why it lives here and not on
+    ``TimelineSummaryMetadata``. ``waves`` is stated even when it is one: how
+    many passes over the machine a plan takes is a conclusion, and one wave is an
+    answer rather than nothing to say. It is declared with no value it says
+    nothing by, so the suppression rule itself stays one rule.
+    """
+
+    root: str = ""
+    local_makespan_ns: int = 0
+    waves: int = 1
+    estimated_kernel_ns: int = 0
+
+
+comment(
+    ComputeCostMetadata,
+    Projection("flops", dict[str, TotalAndPerUnit[int]], _paired_flops),
+    Projection("traffic", dict[str, TotalAndPerUnit[TrafficBytes]], _paired_traffic),
+    Projection("operands", dict[str, TrafficBytes], _by_operand, opt_in=True),
+)
+comment(
+    MemoryMetadata,
+    Projection("peak", dict[str, int], peak_footprint),
+    Projection("persistent", int, _persistent_bytes, default=0),
+    Projection("advisories", int, _advisory_count, default=0),
+)
+comment(RooflineMetadata, "ideal_ns", "bound_by")
+comment(TimelineMetadata, Projection("interval", TripInterval, _interval))
+comment(TimelineSummaryMetadata, family="timeline")
+comment(SourceSpanMetadata, Projection("span", str, _source_span), family="source")
+comment(ReportIdentity, family="analysis")
+comment(ReportSelection, family="selection")
+comment(MemorySummary, family="peak-footprint")
+comment(AdvisorySummary, family="advisory")
+comment(
+    TimelineSummaryView,
+    "root",
+    "local_makespan_ns",
+    Projection("waves", int, _read("waves")),
+    "estimated_kernel_ns",
+    family="timeline",
+)
+
+
+__all__ = [
+    "AdvisorySummary",
+    "ENTRIES",
+    "ENTRY",
+    "FIELD",
+    "FIELDS",
+    "PAIR",
+    "PARTS",
+    "PER_UNIT",
+    "Prose",
+    "RENDER",
+    "TRIPS",
+    "MemorySummary",
+    "Projection",
+    "RecordComment",
+    "ReportIdentity",
+    "ReportSelection",
+    "TimelineSummaryView",
+    "comment",
+    "comment_of",
+    "declared_records",
+    "expr_field",
+    "expr_fields",
+    "family_of",
+    "peak_footprint",
+    "render_comment",
+    "render_record",
+    "render_value",
+]

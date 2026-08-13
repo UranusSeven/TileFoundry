@@ -41,7 +41,7 @@ def test_logical_analyses_run_and_timeline_requires_result_placement(tf, cmine) 
         "--roofline",
     )
     assert done.returncode == 0, done.stderr
-    for conclusion in ("flops ", "traffic ", "peak-footprint ", "ideal-bound="):
+    for conclusion in ("# compute-cost flops=", "# peak-footprint=", "# roofline ideal-ns="):
         assert conclusion in done.stdout, conclusion
 
     rejected = tf("analyze", f"{cmine}:CMine.root", "--timeline")
@@ -88,10 +88,11 @@ def test_mega_kernel_reports_four_families_on_one_expanded_program(tf) -> None:
         "# analysis target=nvidia.h200_sxm module=MoEMegaKernel function=experts"
     )
     for conclusion in (
-        "# flops f32=",
-        "# peak-footprint ",
-        "# ideal-bound=",
-        "# timeline root=MoEMegaKernel::experts local-makespan=",
+        "# selection requested=compute-cost,memory,roofline,timeline",
+        "# compute-cost flops=f32:",
+        "# peak-footprint=",
+        "# roofline ideal-ns=",
+        "# timeline root=MoEMegaKernel::experts local-makespan-ns=",
     ):
         assert conclusion in text
 
@@ -115,10 +116,10 @@ def test_a_bare_analyze_typechecks_and_prints_only_typed_hir(tf, cmine) -> None:
     assert done.stderr == ""
     assert "# Tensor[" in done.stdout
     assert "# analysis " not in done.stdout
-    assert "compute-cost " not in done.stdout
+    assert "compute-cost" not in done.stdout
     assert "memory peak=" not in done.stdout
-    assert "roofline bound=" not in done.stdout
-    assert "timeline start=" not in done.stdout
+    assert "roofline" not in done.stdout
+    assert "timeline=" not in done.stdout
 
 
 def test_analyze_json_needs_an_explicit_analysis(tf, cmine) -> None:
@@ -177,16 +178,18 @@ def test_analyze_reports_only_the_analyses_that_were_requested(tf, cwide) -> Non
     done = tf("analyze", f"{cwide}:Model", "--roofline")
     assert done.returncode == 0, done.stderr
 
-    assert "# analyses=roofline executed=compute-cost,memory,roofline" in done.stdout
-    assert "# flops " in done.stdout
-    assert "# traffic " in done.stdout
-    assert "# ideal-bound=" in done.stdout
-    assert "# peak-footprint" in done.stdout
-    assert "# timeline local-makespan" not in done.stdout
-    assert "roofline bound=" in done.stdout
-    assert "memory peak=" not in done.stdout
-    assert "compute-cost flops=" not in done.stdout
-    assert "timeline start=" not in done.stdout
+    assert (
+        "# selection requested=roofline executed=compute-cost,memory,roofline"
+        in done.stdout
+    )
+    assert "# compute-cost flops=" in done.stdout
+    assert "# roofline ideal-ns=" in done.stdout
+    assert "# peak-footprint=" in done.stdout
+    assert "# timeline " not in done.stdout
+    assert "; roofline ideal-ns=" in done.stdout
+    assert "; memory peak=" not in done.stdout
+    assert "; compute-cost" not in done.stdout
+    assert "; timeline=" not in done.stdout
 
 
 def test_analyze_failure_reports_line_variable_and_reason(tf, tmp_path) -> None:

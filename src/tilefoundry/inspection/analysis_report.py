@@ -13,15 +13,13 @@ that drift.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 from tilefoundry.analysis import (
     ComputeCostMetadata,
     MemoryMetadata,
     RooflineMetadata,
-    TimelineMetadata,
     TimelineSummaryMetadata,
-    TrafficBytes,
 )
 from tilefoundry.analysis.api import AnalysisResult
 from tilefoundry.analysis.walk import postorder, tensor_types
@@ -30,15 +28,22 @@ from tilefoundry.inspection.python_printer import (
     _PrintedStatement,
     _render_hir_function,
 )
+from tilefoundry.inspection.values import (
+    AdvisorySummary,
+    MemorySummary,
+    Prose,
+    ReportIdentity,
+    ReportSelection,
+    TimelineSummaryView,
+    declared_records,
+    expr_field,
+    family_of,
+    peak_footprint,
+    render_comment,
+    render_record,
+)
 from tilefoundry.ir.core import Call, IRMetadata, binding_name, get_metadata
 from tilefoundry.ir.hir.function import Function
-
-
-def _traffic(traffic: tuple[tuple[str, TrafficBytes], ...]) -> dict[str, dict[str, int]]:
-    return {
-        level: {"read": value.read, "write": value.write}
-        for level, value in traffic
-    }
 
 
 def _type_text(type_: object) -> str:
@@ -63,10 +68,16 @@ def _operand_name(operand: object) -> str:
     return type(operand).__name__.lower()
 
 
-def _operands(record: ComputeCostMetadata, expr: object) -> list[dict[str, object]]:
-    """Each recorded amount, against the operand it was charged to."""
-    if not isinstance(expr, Call):
-        return []
+def _operands(
+    record: ComputeCostMetadata, expr: object
+) -> list[dict[str, object]] | None:
+    """Each recorded amount, against the operand of the program it was charged to.
+
+    ``None`` where there is no such split to report: a Function Call charges its
+    callee's total, and an operand position names nothing there.
+    """
+    if not isinstance(expr, Call) or not record.operands:
+        return None
     operands = (*expr.args, expr)
     return [
         {
@@ -80,103 +91,33 @@ def _operands(record: ComputeCostMetadata, expr: object) -> list[dict[str, objec
     ]
 
 
-def _compute_cost(record: ComputeCostMetadata, expr: object) -> dict[str, object]:
-    projected: dict[str, object] = {
-        "flops": dict(record.flops),
-        "flops_per_unit": dict(record.flops_per_unit),
-        "traffic": _traffic(record.traffic),
-        "traffic_per_unit": _traffic(record.traffic_per_unit),
-    }
-    operands = _operands(record, expr)
-    if operands:
-        projected["operands"] = operands
-    return projected
-
-
-def _roofline(record: RooflineMetadata, expr: object) -> dict[str, object]:
-    return {
-        "compute_ns": record.compute_ns,
-        "memory_ns": record.memory_ns,
-        "ideal_ns": record.ideal_ns,
-        "bound_by": record.bound_by,
-    }
-
-
-def _timeline(record: TimelineMetadata, expr: object) -> dict[str, object]:
-    return {
-        "start_ns": record.start_ns,
-        "end_ns": record.end_ns,
-        "trips": record.trips,
-        "stride_ns": record.stride_ns,
-    }
-
-
-def _timeline_summary(
-    record: TimelineSummaryMetadata, expr: object
-) -> dict[str, object]:
-    return {
-        "local_makespan_ns": record.local_makespan_ns,
-        "waves": record.waves,
-        "estimated_kernel_ns": record.estimated_kernel_ns,
-    }
-
-
-def _memory(record: MemoryMetadata, expr: object) -> dict[str, object]:
-    return {
-        "footprint": [
-            {
-                "level": item.level,
-                "peak_bytes": item.peak_bytes,
-                "persistent_bytes": item.persistent_bytes,
-                "capacity_bytes": item.capacity_bytes,
-            }
-            for item in record.footprint
-        ],
-        "traffic": _traffic(record.traffic),
-        "lifetimes": [
-            {
-                "binding": item.binding,
-                "level": item.level,
-                "bytes": item.bytes,
-                "defined_at": item.defined_at,
-                "last_used_at": item.last_used_at,
-                "persistent": item.persistent,
-            }
-            for item in record.lifetimes
-        ],
-        "advisories": list(record.advisories),
-    }
-
-
-
-
-_RECORDS: tuple[tuple[str, type[IRMetadata], object], ...] = (
-    ("compute-cost", ComputeCostMetadata, _compute_cost),
-    ("memory", MemoryMetadata, _memory),
-    ("roofline", RooflineMetadata, _roofline),
-    ("timeline", TimelineMetadata, _timeline),
-    ("timeline", TimelineSummaryMetadata, _timeline_summary),
-)
+expr_field(ComputeCostMetadata, "operands", _operands)
 
 
 def _records_of(expr: object, selected: frozenset[type[IRMetadata]]) -> dict[str, object]:
     """Every selected record on *expr*, keyed by the family that owns it."""
     result: dict[str, object] = {}
-    for name, metadata_type, project in _RECORDS:
+    for metadata_type in declared_records():
         if metadata_type not in selected:
             continue
         record = get_metadata(expr, metadata_type)
         if record is not None:
-            result[name] = project(record, expr)
+            result[family_of(metadata_type)] = render_record(record, expr)
     return result
 
 
 @dataclass(frozen=True)
 class AnalysisRendering:
-    """One annotated program and the report projected from that rendering."""
+    """One annotated program and the report projected from that rendering.
+
+    *summary* is one record per summary line, in reading order. They are the same
+    records the equations are annotated from, so a summary line and an equation
+    cannot state one number two ways.
+    """
 
     data: dict[str, object]
     annotated: str
+    summary: tuple[IRMetadata, ...] = ()
 
 
 def selected_types(
@@ -199,8 +140,15 @@ def selected_types(
     return tuple(order)
 
 
-def render_analysis(result: AnalysisResult) -> AnalysisRendering:
-    """Render one result once for both annotated source and report data."""
+def render_analysis(
+    result: AnalysisResult, *, operands: bool = False
+) -> AnalysisRendering:
+    """Render one result once for both annotated source and report data.
+
+    *operands* asks the annotation for the per-operand split of the traffic it
+    already states. JSON carries it either way: it is read by programs, and a
+    reader of the text is not looking that closely by default.
+    """
     function = result.function
     selected_types_ = selected_types(result)
     selected = frozenset(selected_types_)
@@ -209,6 +157,7 @@ def render_analysis(result: AnalysisResult) -> AnalysisRendering:
         options=PythonPrintOptions(
             show_types=True,
             comment_metadata_types=selected_types_,
+            comment_opt_in=frozenset({"operands"}) if operands else frozenset(),
         ),
     )
     target = result.module.resolve_target()
@@ -232,7 +181,53 @@ def render_analysis(result: AnalysisResult) -> AnalysisRendering:
         "roofline" in data["requested"] and ComputeCostMetadata in available
     ):
         data["totals"] = _work_totals(function)
-    return AnalysisRendering(data=data, annotated=rendered.source)
+    return AnalysisRendering(
+        data=data,
+        annotated=rendered.source,
+        summary=_summary(function, data, function_records, selected),
+    )
+
+
+def _summary(
+    function: Function,
+    data: dict[str, object],
+    function_records: dict[str, object],
+    selected: frozenset[type[IRMetadata]],
+) -> tuple[IRMetadata, ...]:
+    """One record per summary line: what this report is about, then its findings.
+
+    A conclusion is stated by the record that holds it, on the same terms the
+    equations state theirs. Which lines appear is the same question as which
+    records the report carries, so it is asked of those and not of the text.
+    """
+    views: list[IRMetadata] = [
+        ReportIdentity(
+            target=data["target"],
+            module=data["module"],
+            function=data["function"],
+            topology=data["topology"] or "none",
+        ),
+        ReportSelection(
+            requested=tuple(data["requested"]), executed=tuple(data["executed"])
+        ),
+    ]
+    if "totals" in data:
+        views.append(get_metadata(function, ComputeCostMetadata) or ComputeCostMetadata())
+    if "memory" in function_records:
+        memory = get_metadata(function, MemoryMetadata)
+        views.append(MemorySummary(peak_footprint(memory)))
+        if MemoryMetadata in selected:
+            views.extend(AdvisorySummary(Prose(note)) for note in memory.advisories)
+    if "roofline" in function_records:
+        views.append(get_metadata(function, RooflineMetadata))
+    if "timeline" in function_records:
+        summary = get_metadata(function, TimelineSummaryMetadata)
+        views.append(
+            TimelineSummaryView(
+                root=f"{data['module']}::{data['function']}", **asdict(summary)
+            )
+        )
+    return tuple(views)
 
 
 def report(result: AnalysisResult) -> dict[str, object]:
@@ -273,69 +268,17 @@ def _work_totals(function: Function) -> dict[str, object]:
     record = get_metadata(function, ComputeCostMetadata)
     if record is None:
         return {"flops": {}, "traffic": {}}
-    return {
-        "flops": dict(record.flops),
-        "traffic": _traffic(record.traffic),
-    }
+    reported = render_record(record, function)
+    return {"flops": reported["flops"], "traffic": reported["traffic"]}
 
 
-def _flop_text(flops: dict[str, int]) -> str:
-    return ", ".join(f"{name}={value}" for name, value in sorted(flops.items())) or "0"
-
-
-def _traffic_text(traffic: dict[str, dict[str, int]]) -> str:
-    return (
-        ", ".join(
-            f"{level}=r{value['read']}/w{value['write']}"
-            for level, value in sorted(traffic.items())
-        )
-        or "0"
-    )
-
-
-def render_text(data: dict[str, object]) -> str:
+def render_text(rendering: AnalysisRendering) -> str:
     """The report as one stable line per conclusion, each prefixed with ``#``.
 
-    A conclusion appears only when a record states it, or -- for the work totals
-    -- when it is the exact sum of records that do.
+    Every line is one record walked the way an annotated equation is, so nothing
+    here knows what a family has: a conclusion appears when a record states it.
     """
-    lines = [
-        f"analysis target={data['target']} module={data['module']} "
-        f"function={data['function']} topology={data['topology'] or 'none'}",
-        f"analyses={','.join(data['requested'])} executed={','.join(data['executed'])}",
-    ]
-    totals = data.get("totals")
-    if totals is not None:
-        lines.append(f"flops {_flop_text(totals['flops'])}")
-        lines.append(f"traffic {_traffic_text(totals['traffic'])}")
-    records = data["function_records"]
-    if "memory" in records:
-        memory = records["memory"]
-        lines.append(
-            "peak-footprint "
-            + (
-                ", ".join(
-                    f"{item['level']}={item['peak_bytes']}"
-                    for item in memory["footprint"]
-                )
-                or "0"
-            )
-        )
-        lines.extend(f"advisory {note}" for note in memory.get("advisories", ()))
-    if "roofline" in records:
-        bound = records["roofline"]
-        lines.append(
-            f"ideal-bound={bound['ideal_ns']}ns by={bound['bound_by']}"
-        )
-    if "timeline" in records:
-        timeline = records["timeline"]
-        lines.append(
-            f"timeline root={data['module']}::{data['function']} "
-            f"local-makespan={timeline['local_makespan_ns']}ns "
-            f"waves={timeline['waves']} "
-            f"estimated-kernel={timeline['estimated_kernel_ns']}ns"
-        )
-    return "\n".join(f"# {line}" for line in lines)
+    return "\n".join(f"# {render_comment(view)}" for view in rendering.summary)
 
 
 def render_json(data: dict[str, object]) -> str:
