@@ -40,6 +40,7 @@ from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
 from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.specialize import dim_vars_reached, display_name, origin_of
+from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.types import DType, TensorType, TupleType
@@ -90,6 +91,26 @@ class PythonPrintOptions:
 
     show_types: bool = False
     comment_metadata_types: tuple[type[IRMetadata], ...] = ()
+
+
+@dataclass(frozen=True)
+class _PrintedStatement:
+    """The left-hand side and physical start line of one emitted Call."""
+
+    value: str
+    line: int
+
+
+@dataclass(frozen=True)
+class _PythonRendering:
+    """Rendered source and the Call statements produced in that same pass."""
+
+    source: str
+    statements: dict[int, _PrintedStatement]
+
+
+def _physical_line_count(lines: list[str]) -> int:
+    return sum(line.count("\n") + 1 for line in lines)
 
 
 def _compact_type(ty: object) -> str:
@@ -727,6 +748,9 @@ def _module_callee_binding(target: HirFunction, child_entries: dict[int, str]) -
 def _emit_def(
     fn: HirFunction, def_name: str, mesh_map: dict, indent: str,
     options: PythonPrintOptions, child_entries: dict[int, str] | None = None,
+    *,
+    line_offset: int = 0,
+    statements: dict[int, _PrintedStatement] | None = None,
 ) -> list[str]:
     """Render one function ``def`` block: signature + body (or ``pass`` for a prototype).
 
@@ -757,14 +781,18 @@ def _emit_def(
 
     _forced_names: dict[int, str] = {}
     _tile_window_steps: dict[int, object] = {}
-
-    scalar_iv_uses: set[int] = set()
-    for expr in _order:
-        if not isinstance(expr, Call) or isinstance(expr.target, Slice):
-            continue
-        for arg in expr.args:
-            if isinstance(arg, Var):
-                scalar_iv_uses.add(id(arg))
+    collapsed_slice_ids = {
+        id(expr.args[0])
+        for expr in _order
+        if isinstance(expr, Call)
+        and isinstance(expr.target, Reshape)
+        and len(expr.args) == 1
+        and isinstance(expr.args[0], Call)
+        and isinstance(expr.args[0].target, Slice)
+        and isinstance(expr.args[0].type, TensorType)
+        and isinstance(expr.type, TensorType)
+        and len(expr.type.shape) < len(expr.args[0].type.shape)
+    }
 
     _grid_internal_ids: set[int] = set()
     _nested_grid_ids: set[int] = set()
@@ -774,8 +802,24 @@ def _emit_def(
             continue
         if (
             expr.start == 0
-            and expr.step != 1
-            and id(expr.induction_var) not in scalar_iv_uses
+            and any(
+                isinstance(candidate, Call)
+                and isinstance(candidate.target, Slice)
+                and id(candidate) not in collapsed_slice_ids
+                and len(candidate.args) == 2
+                and isinstance(candidate.args[1], Tuple)
+                and any(
+                    start is expr.induction_var
+                    and size == expr.step
+                    and stride == 1
+                    for start, size, stride in zip(
+                        candidate.args[1].elements,
+                        candidate.target.sizes,
+                        candidate.target.strides,
+                    )
+                )
+                for candidate in _order
+            )
         ):
             _tile_window_steps[id(expr.induction_var)] = expr.step
         for carry, init, value in zip(
@@ -783,7 +827,6 @@ def _emit_def(
         ):
             _forced_names[id(carry)] = _sanitize_name(carry.name)
             _forced_names[id(init)] = _sanitize_name(carry.name)
-            _forced_names[id(value)] = _sanitize_name(carry.name)
         for _ in iter_exprs(expr.body, _grid_internal_ids):
             pass
         for value in expr.yield_values:
@@ -1033,6 +1076,11 @@ def _emit_def(
 
     def _emit_inline_call(expr: Call, level: str) -> None:
         name = _names[id(expr)]
+        if statements is not None:
+            statements[id(expr)] = _PrintedStatement(
+                value=name,
+                line=line_offset + _physical_line_count(lines) + 1,
+            )
         lines.append(
             f"{level}{name} = {_format_call(expr, level)}"
             f"{_comments(expr, options)}"
@@ -1083,10 +1131,10 @@ def _emit_def(
         extent = shape_entry_str(grid.extent)
         step = shape_entry_str(grid.step)
         start = shape_entry_str(grid.start)
-        if grid.start == 0 and grid.step == 1:
-            loop = f"tile({extent})"
-        elif id(grid.induction_var) in _tile_window_steps:
+        if id(grid.induction_var) in _tile_window_steps:
             loop = f"tile({extent}, {step})"
+        elif grid.start == 0 and grid.step == 1:
+            loop = f"range({extent})"
         else:
             loop = f"range({start}, {extent}, {step})"
         lines.append(f"{level}for {grid.induction_var.name} in {loop}:{_comments(grid, options)}")
@@ -1095,6 +1143,8 @@ def _emit_def(
         _emit_expr(grid.body, inner)
         for value in grid.yield_values:
             _emit_expr(value, inner)
+        for carry, value in zip(grid.carried_args, grid.yield_values):
+            lines.append(f"{inner}{_names[id(carry)]} = {_expr_ref(value)}")
 
     for expr in _order:
         if isinstance(expr, Var) or id(expr) in _grid_internal_ids:
@@ -1126,6 +1176,11 @@ def _emit_def(
             continue
         if isinstance(expr, Call):
             name = _names[id(expr)]
+            if statements is not None:
+                statements[id(expr)] = _PrintedStatement(
+                    value=name,
+                    line=line_offset + _physical_line_count(lines) + 1,
+                )
             lines.append(
                 f"{indent}{name} = {_format_call(expr, indent)}"
                 f"{_comments(expr, options)}"
@@ -1235,6 +1290,9 @@ def _emit_header(
 def _emit_decorated_defs(
     fn: HirFunction, mesh_map: dict[int, str], indent: str, options: PythonPrintOptions,
     child_entries: dict[int, str] | None = None,
+    *,
+    line_offset: int = 0,
+    statements: dict[int, _PrintedStatement] | None = None,
 ) -> list[str]:
     """Emit decorated defs.
 
@@ -1244,7 +1302,18 @@ def _emit_decorated_defs(
     See [inspection §2.6](docs/spec/inspection.md#26-specialization-printing).
     """
     lines: list[str] = ["@func"]
-    lines.extend(_emit_def(fn, fn.name, mesh_map, indent, options, child_entries))
+    lines.extend(
+        _emit_def(
+            fn,
+            fn.name,
+            mesh_map,
+            indent,
+            options,
+            child_entries,
+            line_offset=line_offset + _physical_line_count(lines),
+            statements=statements,
+        )
+    )
 
 
     for variant in fn.variants:
@@ -1256,15 +1325,17 @@ def _emit_decorated_defs(
             _emit_def(
                 variant, display_name(variant) or "_", mesh_map, indent, options,
                 child_entries,
+                line_offset=line_offset + _physical_line_count(lines),
+                statements=statements,
             )
         )
     return lines
 
 
-def hir_function_to_python(
+def _render_hir_function(
     fn: HirFunction, *, options: PythonPrintOptions | None = None,
-) -> str:
-    """Convert a HIR Function to canonical Python DSL source.
+) -> _PythonRendering:
+    """Render a HIR Function and locate every Call equation in the same pass.
 
     A normal function prints as a single ``@func``. A dispatch prototype
     (``variants != ()``) prints as a ``pass``-bodied ``@func`` base followed by
@@ -1278,8 +1349,25 @@ def hir_function_to_python(
     lines = _emit_header(
         fn, meshes, mesh_map, indent, dim_vars=dim_vars_reached(fn)
     )
-    lines.extend(_emit_decorated_defs(fn, mesh_map, indent, options or PythonPrintOptions()))
-    return "\n".join(lines) + "\n"
+    statements: dict[int, _PrintedStatement] = {}
+    lines.extend(
+        _emit_decorated_defs(
+            fn,
+            mesh_map,
+            indent,
+            options or PythonPrintOptions(),
+            line_offset=_physical_line_count(lines),
+            statements=statements,
+        )
+    )
+    return _PythonRendering("\n".join(lines) + "\n", statements)
+
+
+def hir_function_to_python(
+    fn: HirFunction, *, options: PythonPrintOptions | None = None,
+) -> str:
+    """Convert a HIR Function to canonical Python DSL source."""
+    return _render_hir_function(fn, options=options).source
 
 
 def as_script(

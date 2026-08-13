@@ -22,6 +22,7 @@ from tilefoundry.dsl.tf import matmul, rms_norm
 from tilefoundry.inspection.python_printer import as_script
 from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.shard import ShardLayout, Topology
+from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.schedule import PlanVerificationError, ScheduleError, ScheduleOptions, schedule
 from tilefoundry.schedule.partition import (
     PartitionedOperation,
@@ -137,14 +138,12 @@ def test_partition_problem_closes_every_hardware_number_before_solving() -> None
     assert all(candidate.duration_ns >= 0 for candidate in problem.candidates.values())
 
 
-def test_partition_prices_a_move_as_one_more_candidate_and_only_where_needed() -> None:
-    """A reshard is not a side channel: it is priced as an ordinary candidate of the same kind.
+def test_partition_keeps_synthesized_gmem_views_zero_copy_and_only_where_needed() -> None:
+    """The public partition boundary makes every synthesized move a zero-copy view.
 
-    A reshard is not a side channel: it is priced as an ordinary candidate of
-    the same kind, with bytes moved and no topology of its own. And it is
-    synthesised only where nothing authored already produces the placement -- a
-    bucket holding both an authored producer and a synthesised one would be
-    charging for a move that has an original.
+    Partition accepts only GMEM tensor values. Its synthesized Reshards therefore
+    change placement without changing storage, so ``moved_bytes`` is always zero.
+    They exist only where no authored candidate already produces the placement.
     """
     _, _, program, facts = _closed()
 
@@ -160,7 +159,13 @@ def test_partition_prices_a_move_as_one_more_candidate_and_only_where_needed() -
     assert all(type(candidate).__name__ == "OpCandidate" for candidate in authored)
     assert all(type(candidate).__name__ == "OpCandidate" for candidate in synthesized)
     for candidate in synthesized:
-        assert candidate.moved_bytes > 0
+        tensors = (*candidate.source_types, *candidate.output_types)
+        assert tensors
+        assert all(
+            isinstance(type_, TensorType) and type_.storage is StorageKind.GMEM
+            for type_ in tensors
+        )
+        assert candidate.moved_bytes == 0
         assert candidate.topology_count == 0
 
     for bucket in problem.buckets.values():
@@ -169,8 +174,6 @@ def test_partition_prices_a_move_as_one_more_candidate_and_only_where_needed() -
             [item for item in producers if item.site_id is not None]
             and [item for item in producers if item.site_id is None]
         )
-
-
 def test_partition_refuses_a_level_the_facts_and_the_program_do_not_share() -> None:
     """Three ways of asking about the wrong level, each answered before a solve.
 

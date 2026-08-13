@@ -32,18 +32,68 @@ class Open:
 '''
 
 
-def test_every_analysis_the_command_offers_runs(tf, cmine) -> None:
+def test_logical_analyses_run_and_timeline_requires_result_placement(tf, cmine) -> None:
     done = tf(
         "analyze",
         f"{cmine}:CMine.root",
         "--compute-cost",
         "--memory",
         "--roofline",
-        "--timeline",
     )
     assert done.returncode == 0, done.stderr
     for conclusion in ("flops ", "traffic ", "peak-footprint ", "ideal-bound="):
         assert conclusion in done.stdout, conclusion
+
+    rejected = tf("analyze", f"{cmine}:CMine.root", "--timeline")
+    assert rejected.returncode == 1
+    assert "timeline:" in rejected.stderr
+    assert "has no cta placement" in rejected.stderr
+
+
+def test_mega_kernel_reports_four_families_on_one_expanded_program(tf) -> None:
+    source = Path(__file__).resolve().parents[1] / "fixtures" / "placed" / "moe_mega_kernel.py"
+    done = tf(
+        "analyze",
+        f"{source}:MoEMegaKernel",
+        "--compute-cost",
+        "--memory",
+        "--roofline",
+        "--timeline",
+        "--json",
+    )
+    assert done.returncode == 0, done.stderr
+    payload = json.loads(done.stdout)
+
+    as_text = tf(
+        "analyze",
+        f"{source}:MoEMegaKernel",
+        "--compute-cost",
+        "--memory",
+        "--roofline",
+        "--timeline",
+    )
+    assert as_text.returncode == 0, as_text.stderr
+    text = as_text.stdout
+    assert as_text.stderr == ""
+
+    families = ["compute-cost", "memory", "roofline", "timeline"]
+    assert payload["requested"] == payload["executed"] == families
+    assert set(payload["function_records"]) == set(families)
+    assert len(payload["calls"]) == 7
+    assert all(
+        set(row) == {"value", "compute-cost", "roofline", "timeline"}
+        for row in payload["calls"]
+    )
+    assert text.startswith(
+        "# analysis target=nvidia.h200_sxm module=MoEMegaKernel function=experts"
+    )
+    for conclusion in (
+        "# flops f32=",
+        "# peak-footprint ",
+        "# ideal-bound=",
+        "# timeline root=MoEMegaKernel::experts local-makespan=",
+    ):
+        assert conclusion in text
 
 
 def test_usage_errors_include_the_command_help(tf) -> None:
@@ -68,7 +118,7 @@ def test_a_bare_analyze_typechecks_and_prints_only_typed_hir(tf, cmine) -> None:
     assert "compute-cost " not in done.stdout
     assert "memory peak=" not in done.stdout
     assert "roofline bound=" not in done.stdout
-    assert "timeline units=" not in done.stdout
+    assert "timeline start=" not in done.stdout
 
 
 def test_analyze_json_needs_an_explicit_analysis(tf, cmine) -> None:
@@ -115,7 +165,12 @@ def test_timeline_resolves_derived_execution_geometry(tf, derived_prefill) -> No
     )
     assert bound.returncode == 0, bound.stderr
     payload = json.loads(bound.stdout)
-    assert payload["function_records"]["timeline"]["grid_units"] == 3
+    timeline = payload["function_records"]["timeline"]
+    assert timeline == {
+        "estimated_kernel_ns": timeline["local_makespan_ns"],
+        "local_makespan_ns": timeline["local_makespan_ns"],
+        "waves": 1,
+    }
 
 
 def test_analyze_reports_only_the_analyses_that_were_requested(tf, cwide) -> None:
@@ -127,43 +182,11 @@ def test_analyze_reports_only_the_analyses_that_were_requested(tf, cwide) -> Non
     assert "# traffic " in done.stdout
     assert "# ideal-bound=" in done.stdout
     assert "# peak-footprint" in done.stdout
-    assert "# theoretical-makespan" not in done.stdout
+    assert "# timeline local-makespan" not in done.stdout
     assert "roofline bound=" in done.stdout
     assert "memory peak=" not in done.stdout
     assert "compute-cost flops=" not in done.stdout
-    assert "timeline units=" not in done.stdout
-
-
-def test_analyze_json_and_text_report_the_same_conclusions(tf, cwide) -> None:
-    analyses = ("--compute-cost", "--memory", "--roofline", "--timeline")
-    as_json = tf("analyze", f"{cwide}:Model", *analyses, "--json")
-    assert as_json.returncode == 0, as_json.stderr
-    payload = json.loads(as_json.stdout)
-
-    as_text = tf("analyze", f"{cwide}:Model", *analyses)
-    assert as_text.returncode == 0, as_text.stderr
-    text = as_text.stdout
-    assert as_text.stderr == ""
-
-    assert payload["target"] == "nvidia.h200_sxm"
-    assert payload["function"] == "main"
-    assert payload["executed"] == ["compute-cost", "memory", "roofline", "timeline"]
-    for level, value in payload["totals"]["traffic"].items():
-        assert f"{level}=r{value['read']}/w{value['write']}" in text
-    for item in payload["function_records"]["memory"]["footprint"]:
-        assert f"{item['level']}={item['peak_bytes']}" in text
-    assert f"by={payload['function_records']['roofline']['bound_by']}" in text
-
-    assert text.startswith(
-        "# analysis target=nvidia.h200_sxm module=Model function=main"
-    )
-    assert "# Tensor[" in text
-    assert "compute-cost flops=f32:" in text
-    header, annotated = text.split("\n\n", 1)
-    assert "operands" not in header
-    assert " operands=" in annotated
-    assert "roofline bound=" in text
-    assert "timeline units=168 waves=2" in text
+    assert "timeline start=" not in done.stdout
 
 
 def test_analyze_failure_reports_line_variable_and_reason(tf, tmp_path) -> None:

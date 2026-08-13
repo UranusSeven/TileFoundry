@@ -6,8 +6,8 @@ This spec owns TileFoundry's fact layer: everything a later stage decides
 | Surface | Entry | What it states |
 |---|---|---|
 | Polyhedral model | `extract(hir) -> TileGraph` | one HIR `Function` body as isl domains, access relations and auto-inferred dependences — target-independent |
-| Program check | `check_program(module, function, level=...)` | whether one authored program and its declared topology are valid for a consuming algorithm |
-| Composed measurement | `analyze(module, function, analysis=...)` | one root analysis and its dependency closure, leaving typed Metadata on the IR |
+| Program check | `check_program(module, function, level=..., budget=...)` | an inlined Function view after validating one authored program and its declared topology |
+| Composed measurement | `analyze(module, function, analysis=...)` | one or more root analyses and their union dependency closure, leaving typed Metadata on the IR |
 
 Per-Op semantic derivation — typeinfer, the forward access relation, shard
 propagation — is owned by [semantic-analysis](./semantic-analysis.md), and the
@@ -323,14 +323,14 @@ they describe: a record on a `Call` describes that call, while a record on a
 ### 2.2 Analysis families
 
 The first families are `compute-cost`, `memory`, `roofline`, and `timeline`.
-Each owns one record type and declares its dependencies and output additions.
+Each owns its record types and declares its dependencies and output additions.
 
 | Selector | Requires | Owns | Rests on | Text summary adds | Annotates equations |
 |---|---|---|---|---|---|
 | `compute-cost` | - | `ComputeCostMetadata` | the authored program | `flops`, `traffic` | every measured Call |
 | `memory` | `compute-cost` | `MemoryMetadata` | `MemoryHierarchyFacts` | `peak-footprint`, `advisory` | none |
 | `roofline` | `memory`, `compute-cost` | `RooflineMetadata` | `ThroughputFacts` | bounded dependency evidence, `ideal-bound` | every measured Call |
-| `timeline` | `roofline` | `TimelineMetadata` | `ParallelCapacityFacts` | `theoretical-makespan` | every measured Call, shared per execution unit |
+| `timeline` | `compute-cost` | `TimelineMetadata`, `TimelineSummaryMetadata` | `ThroughputFacts`, `ParallelCapacityFacts` | local makespan, waves, estimated kernel time | every measured Call |
 
 Every compact text summary begins with these two lines:
 
@@ -345,6 +345,37 @@ The JSON report carries the same identity and selection in `target`, `module`,
 projections are under `function_records`; `calls` is a value-ordered list whose
 entries have a `value` label and one key per selected family. `totals` appears
 when the selected view includes compute cost or roofline's bounded work evidence.
+
+One result is rendered once, and every surface reads that rendering:
+
+```python
+def report(result: AnalysisResult) -> dict[str, object]:
+    """Project one composed Analyze result into a shared rendering structure."""
+    ...
+
+def render_analysis(result: AnalysisResult) -> AnalysisRendering:
+    """Render one annotated program and its report data in a single pass."""
+    ...
+```
+
+- `report` MUST accept one `AnalysisResult` and read every requested family's
+  records from that result's record-bearing Function. It MUST NOT merge
+  independently rebuilt Functions by identity, origin, dimensions, or walk
+  position.
+- Text, JSON, and annotated HIR MUST come from one `render_analysis` call over
+  the same result's Function and selected Metadata types. Each rendered Call
+  record's `value` is `<left-hand-side>:<line>`, where `line` is the physical
+  line containing that statement's `=`, even when its comment ends a later line
+  of the same statement. Both surfaces MUST use the line locations collected by
+  that one printer pass rather than recover them from names or text.
+- A Call equation carrying a record MUST state it in that line's Metadata
+  comment. A carry update is a name rebinding rather than a Call equation, so it
+  receives neither a comment nor a report row.
+- A parameterized loop occurrence MUST stay one record. Neither surface expands
+  it into one entry per trip.
+- A compute-cost comment MUST place `per-unit-bytes` immediately after global
+  `bytes`, and JSON MUST expose all four quantities without reconstructing any
+  of them from the others.
 
 The output forms below share these placeholders:
 
@@ -366,6 +397,12 @@ comma separators. This difference is intentional.
     analyzer, and MUST NOT resolve an undeclared Target to a default.
   - A family MUST read a dependency's record rather than recompute what it
     states. A number with two derivations has two answers.
+  - Before any member of a requested union closure writes Metadata, Analyze MUST
+    establish every requested root's family-specific readiness. Timeline
+    readiness requires a positive `ParallelCapacityFacts` value for the selected
+    topology and one valid result placement for every costed primitive Call.
+    Failing timeline readiness MUST NOT make the same unplaced program invalid
+    for `compute-cost`, `memory`, or `roofline`.
   - Global logical work, per-unit work, and lifetime order MUST remain
     target-independent. Physical capacity, hierarchy relationships, and
     throughput comparisons are target-aware.
@@ -400,12 +437,14 @@ class ComputeCostMetadata(IRMetadata):
         flops: attribute; Flop count per compute DType name, sorted by name.
         flops_per_unit: attribute; Flop count performed by one unit of the analysed topology level.
         traffic: attribute; TrafficBytes per storage level name.
+        traffic_per_unit: attribute; TrafficBytes per storage level name for one unit of the analysed topology level.
         operands: attribute; TrafficBytes per operand, positional against (*call.args, call); present only for a direct primitive call.
     """
 
     flops: tuple[tuple[str, int], ...] = ()
     flops_per_unit: tuple[tuple[str, int], ...] = ()
     traffic: tuple[tuple[str, TrafficBytes], ...] = ()
+    traffic_per_unit: tuple[tuple[str, TrafficBytes], ...] = ()
     operands: tuple[TrafficBytes, ...] = ()
 ```
 
@@ -414,6 +453,7 @@ class ComputeCostMetadata(IRMetadata):
 | `flops` | For a primitive Call, run its registered cost evaluator over operand and result Types as written, then multiply by the enclosing recomputation factor. For a Function Call, take the callee's summed `flops` and multiply by the call site's factor. | No |
 | `flops_per_unit` | Use the same evaluator over Types projected through authored `Split`s at or coarser than the analysed level, then multiply by the same factor. A Function Call takes the equivalently projected callee total. | No; projection reads resolved Mesh and effective Module topology extents. |
 | `traffic` | Multiply the evaluator's per-operand movement by the same factor, charge it to the storage level of that operand's Type, and group by level. A multi-level Type conservatively charges its full logical size at every occupied level in each reported direction. A Function Call takes the callee's grouped total. | No |
+| `traffic_per_unit` | Run the same evaluator over Types projected through authored `Split`s at or coarser than the analysed level, then charge and group the projected movement by storage level. A Function Call takes the equivalently projected callee total. | No; projection reads resolved Mesh and effective Module topology extents. |
 | `operands` | Multiply each evaluator entry by the same factor and keep order `(*call.args, call)`. A Function Call has no operand split. | No |
 
 Requesting this family adds these summary lines, each prefixed by `# `:
@@ -429,7 +469,7 @@ Every measured Call receives this annotation; `operands` is omitted for a
 Function Call:
 
 ```text
-compute-cost flops=<flopset> per-unit=<flopset> bytes=<levelset>[ operands=<operandset>]
+compute-cost flops=<flopset> per-unit=<flopset> bytes=<levelset> per-unit-bytes=<levelset>[ operands=<operandset>]
 ```
 
 Each reported Call's JSON projection is under its `compute-cost` key. `operands`
@@ -439,6 +479,7 @@ appears only for a primitive Call and contains objects in positional order:
 {"flops": {<dtype>: <int>},
  "flops_per_unit": {<dtype>: <int>},
  "traffic": {<level>: {"read": <int>, "write": <int>}},
+ "traffic_per_unit": {<level>: {"read": <int>, "write": <int>}},
  "operands": [{"arg": <position>, "name": <name>, "type": <type>,
                "read": <int>, "write": <int>}, ...]}
 ```
@@ -458,6 +499,10 @@ appears only for a primitive Call and contains objects in positional order:
   - Two primitive operands MAY name the same value; their positions MUST keep
     them distinct. A rendering MUST omit an unavailable operand split rather
     than emit it empty.
+  - A `Reshard` within one storage level MUST report zero movement for both
+    operands; a `Reshard` that changes storage MUST report one full source read
+    and one full destination write. The operand Types then attribute those two
+    amounts to their respective storage levels.
   - Per-level `traffic` and `operands` MUST NOT be assumed equal for a Type that
     occupies several levels: the aggregate is the conservative placement charge
     while the operand entry is the evaluator's movement amount.
@@ -687,19 +732,26 @@ The family reads this target projection:
 
 ```python
 class ThroughputFacts:
-    """Carry the rates used by roofline analysis.
+    """Carry whole-device and one-unit rates used to price work.
 
     Attributes:
         peak_flops_per_second: attribute; Published compute rates by dtype.
         memory_bandwidth_bytes_per_second: attribute; Published memory bandwidth.
         bandwidth_level: attribute; Memory level whose traffic the bandwidth measures.
+        peak_flops_per_second_per_unit: attribute; Published compute rates for one unit.
+        memory_bandwidth_bytes_per_second_per_unit: attribute; One unit's bandwidth share.
+        rate_unit: attribute; Topology level the one-unit rates describe.
     """
 
     peak_flops_per_second: tuple[tuple[DType, int], ...]
     memory_bandwidth_bytes_per_second: int | None
     bandwidth_level: str
+    peak_flops_per_second_per_unit: tuple[tuple[DType, int], ...]
+    memory_bandwidth_bytes_per_second_per_unit: int | None
+    rate_unit: str
 
     def peak_for(self, dtype: DType) -> int | None: ...
+    def peak_per_unit_for(self, dtype: DType) -> int | None: ...
 ```
 
 Requesting roofline adds the exact summed compute-cost `flops` and `traffic`,
@@ -731,6 +783,19 @@ not enter that view. Independently requesting a dependency selects its full form
 as defined in that family's section.
 
 - constraints:
+  - `ThroughputFacts.peak_for` MUST return `None` for a dtype with no published
+    rate; analysis MUST NOT substitute an assumed rate.
+  - `peak_per_unit_for` MUST return `None` for a dtype with no published
+    one-unit rate. Timeline MUST reject non-zero work whose dtype has no such
+    rate and MUST NOT substitute the whole-device rate.
+  - `bandwidth_level` MUST select the traffic level divided by the published
+    bandwidth rather than summing traffic across levels.
+  - Timeline local duration MUST divide `ComputeCostMetadata.flops_per_unit`
+    and `traffic_per_unit` by the matching one-unit rates. It MUST reject
+    non-zero traffic only at storage levels for which the target publishes no
+    bandwidth, and zero work with zero traffic MUST take zero time.
+  - Rate-to-duration divisions MUST use exact integer ceiling division. They
+    MUST NOT pass through floating-point arithmetic.
   - Roofline records MUST be attached to every reachable `Call` and `Function`.
   - Roofline MUST read `ComputeCostMetadata` rather than evaluate the program a
     second time.
@@ -744,32 +809,62 @@ as defined in that family's section.
 
 #### 2.2.4 `timeline`
 
-`timeline` places roofline-bounded execution units on the nominal timeline under
-a fixed parallel capacity.
+`timeline` places compute-cost-priced occurrences on a CTA-local nominal timeline,
+then scales the root schedule by a fixed physical parallel capacity.
 
 ```python
 class TimelineMetadata(IRMetadata):
-    """A modeled placement on the nominal timeline.
+    """One occurrence's CTA-local interval on the nominal timeline.
 
     Attributes:
-        grid_units: attribute; Parallel-unit extent this placement covers.
-        waves: attribute; Number of waves issued.
         start_ns: attribute; Modeled start, in ns.
         end_ns: attribute; Modeled end, in ns.
+        trips: attribute; Number of executions represented by this interval.
+        stride_ns: attribute; Start-to-start distance between repeated executions.
     """
 
-    grid_units: int = 1
-    waves: int = 1
     start_ns: int = 0
     end_ns: int = 0
+    trips: int = 1
+    stride_ns: int = 0
+
+
+class TimelineSummaryMetadata(IRMetadata):
+    """One Function's local schedule and physical-wave estimate.
+
+    Attributes:
+        local_makespan_ns: attribute; Solved CTA-local schedule length, in ns.
+        waves: attribute; Physical waves required by the root topology.
+        estimated_kernel_ns: attribute; Local makespan scaled by waves, in ns.
+    """
+
+    local_makespan_ns: int = 0
+    waves: int = 1
+    estimated_kernel_ns: int = 0
 ```
+
+Occurrence fields are:
 
 | Field | How it is computed | Reads the target |
 |---|---|---|
-| `grid_units` | A Call uses its output's authored extent at `topology`, otherwise one agreeing input extent, otherwise one. A fused unit uses its widest Call; its Calls record that value. A Function records its widest unit, or zero with no work. | `ParallelCapacityFacts.topology` selects the authored extent. |
-| `waves` | On a Call, the unit extent divided into consecutive capacity-sized waves; on a Function, the total waves issued, or zero with no work. | `ParallelCapacityFacts.parallel_units` |
-| `start_ns` | Start of the unit's first wave in the solver's makespan-minimizing placement, subject to its fixed solve budget, producer dependencies, and cumulative capacity. A unit's duration is the sum of its Calls' `RooflineMetadata.ideal_ns`, divided among waves in proportion to their issued units. A Function starts at zero. | `ParallelCapacityFacts.parallel_units` through placement |
-| `end_ns` | End of the same unit's last wave; on a Function, the maximum unit end, or zero with no work. | `ParallelCapacityFacts.parallel_units` through placement |
+| `start_ns` | Start of one occurrence in the makespan-minimizing local schedule subject to producer dependencies and exact participant-set exclusion. | No |
+| `end_ns` | End of that occurrence's first execution. | No |
+| `trips` | One outside a loop; within a loop, the enclosing loop trip count represented by the interval. | No |
+| `stride_ns` | Zero outside a loop; within a loop, the solved makespan of one body execution. | No |
+
+Function summary fields are:
+
+| Field | How it is computed | Reads the target |
+|---|---|---|
+| `local_makespan_ns` | End of the CTA-local schedule, or zero with no work. | No |
+| `waves` | `ceil(N / P)`, where `N` is the static extent of the root topology selected by `ParallelCapacityFacts.topology` and `P` is `parallel_units`. | `ParallelCapacityFacts` |
+| `estimated_kernel_ns` | `local_makespan_ns * waves`. | Through `waves` |
+
+Occurrence intervals remain CTA-local. They are not copied once per wave, and
+neither the root topology extent nor `parallel_units` changes them. The capacity
+`P` is compiler policy for concurrent instances; it is distinct from the
+per-unit rates in `ThroughputFacts` even when both projections derive from the
+same physical unit count today.
 
 The family reads this target projection:
 
@@ -789,31 +884,58 @@ class ParallelCapacityFacts:
 Requesting timeline adds this Function verdict to the summary:
 
 ```text
-theoretical-makespan=<int>ns
+timeline root=<Module>::<Function> local-makespan=<int>ns waves=<int>
+estimated-kernel=<int>ns
 ```
 
-Every measured Call receives this annotation; all Calls fused into one execution
-unit carry the same values:
+Every measured Call receives this annotation:
 
 ```text
-timeline units=<int> waves=<int> start=<int>ns end=<int>ns
+timeline start=<int>ns end=<int>ns
 ```
 
-Reported Call and Function records use the same projection under their
+Reported Call and Function records use distinct projections under their
 `timeline` keys:
 
 ```text
-{"grid_units": <int>, "waves": <int>, "start_ns": <int>, "end_ns": <int>}
+Call: {"start_ns": <int>, "end_ns": <int>, "trips": <int>, "stride_ns": <int>}
+Function: {"local_makespan_ns": <int>, "waves": <int>,
+           "estimated_kernel_ns": <int>}
 ```
 
+`estimated_kernel_ns` is a deterministic comparison estimate, not a runtime
+prediction. It deliberately excludes launch overhead, occupancy, utilization,
+traffic volume, and other execution effects that this family does not model.
+
 - constraints:
-  - A producer-consumer edge MAY fuse only when both values are in local
-    register or shared storage, their storage and Mesh sets agree, and their
-    parallel extents are equal. `Reshard` MUST end an execution unit. Calls
-    connected through fusable edges MUST form one unit, and every Call in that
-    unit MUST carry the same record.
-  - `parallel_units` MUST be a positive capacity used to form waves, not a
-    program rewrite.
+  - A primitive Call is eligible for timeline only when every tensor leaf of its
+    result type carries one `ShardLayout` at the selected topology level and all
+    leaves name the same participant set. An occurrence whose `flops_per_unit`
+    are all zero and whose `traffic_per_unit` is zero at the target's published
+    bandwidth level is structural: it needs no result placement and receives an
+    empty interval at its dependency-ready time. Inputs MUST NOT supply placement
+    for an unplaced result. `Reshard` executes on the placement of its result.
+  - The participant set MUST be the exact image of the result Mesh layout under
+    [shard §5](./shard.md#5-mesh), not an extent inferred from a topology or an
+    operand. A `Broadcast` shard attribute still names placement: attributes
+    describe distribution while the Mesh describes which positions participate.
+  - Every primitive occurrence has one fixed duration and occupies its exact
+    participant set. An SSA consumer MUST start no earlier than its producers
+    end. Two positive-duration occurrences whose participant sets intersect
+    MUST NOT overlap; disjoint sets MAY overlap, while a partial intersection
+    serializes each whole occurrence rather than splitting it by participant.
+  - A `GridRegionExpr` MUST be represented as one structured timeline node. Its
+    body is solved once: `stride_ns` is that body's local makespan and the t-th
+    execution of a body occurrence with first interval `[start_ns, end_ns)` is
+    `[start_ns + t*stride_ns, end_ns + t*stride_ns)`, for `0 <= t < trips`.
+    The loop spans `trips * stride_ns`; a consumer of its yield MUST wait for
+    that full span. Loop-invariant values remain single occurrences outside it.
+  - Equal-makespan schedules MUST use inline occurrence order as a deterministic
+    tie-break, not as an execution dependency. On a `Function`, the summary's
+    `local_makespan_ns` MUST span the whole local plan from the origin to its
+    solved makespan.
+  - `parallel_units` is compiler policy over hardware facts. It MUST NOT enter
+    one-unit rates or the CTA-local interval solver, and is not a program rewrite.
   - Timeline is a modeled plan and MUST NOT be read as a guarantee about
     lowering, physical occupancy, or runtime performance.
 
@@ -828,13 +950,20 @@ def check_program(
     function: "Function",
     *,
     level: str | None = None,
-) -> None: ...
+    budget: int = _INLINE_NODES,
+) -> "Function": ...
+
+
+class OccurrenceProvenance(IRMetadata):
+    source_call: int
+    call_path: tuple[str, ...]
 ```
 
 - constraints:
   - The operation MUST infer types over the full reachable Function graph and
     validate its caller/callee execution context, and MUST NOT run an analysis
-    or schedule algorithm or attach derived Metadata.
+    or schedule algorithm or attach derived Metadata to the authored IR.
+    `OccurrenceProvenance` belongs only to the returned analysis view.
   - The reachable Function and Mesh geometry and every effective Module
     topology extent MUST be concrete before this operation runs. Public Analyze
     and Schedule calls with `dims` MUST resolve all three through one binding
@@ -847,14 +976,34 @@ def check_program(
   - A non-`None` `level` MUST name exactly one effective Module topology.
   - Analyze and Schedule MUST call this operation before any consuming
     algorithm.
+  - The returned Function MUST inline every reachable HIR Function call at its
+    call site while retaining each `GridRegionExpr` as one loop. Its induction
+    variable, carried values, and yields MUST NOT be replaced with iterations.
+    The authored Module and Function MUST remain unchanged.
+  - The returned Function parameters MUST be the authored entry parameters
+    followed by the `ConstTensor` declarations needed by reachable Module
+    readings. A promoted declaration MUST be named by the clean dot-joined
+    Module path and weight name used by runtime checkpoint keys. Declarations
+    MUST follow the Module tree's owner-before-children order, and within one
+    Module are unioned by name in Function/parameter order. Separate attachment
+    paths MUST remain separate resources. Unequal types for one `(module path,
+    weight name)` MUST fail. No constant value enters the IR.
+  - Every primitive Call in the returned view MUST have a deterministic unique
+    binding and `OccurrenceProvenance(source_call, call_path)`. `source_call`
+    identifies its source Call and `call_path` identifies its Function-call
+    occurrence; loops do not add coordinates to the path.
+  - `budget` MUST be a non-negative integer limiting the number of unique body
+    expression nodes after inlining. An oversized view MUST fail with both its
+    size and the limit and MUST NOT return a partial Function.
   - Authored-analysis readiness is not a program-level check. Analyze MUST
     separately reject schedule constraints and unresolved local layouts before
     running an analyzer; Schedule MAY consume or diagnose those inputs under
     its own algorithm contract.
 
 `tilefoundry.analysis.api.analyze` is the dependency-composed measurement
-operation. One call selects one root analysis by name; the operation resolves
-what that root transitively needs, runs each member once, and reports what ran.
+operation. One call selects one or more root analyses by name; the operation
+resolves their union dependency closure, runs each member once, and reports what
+ran.
 Its subject is one `Module` and one HIR `Function` that Module owns. Reachable
 HIR callees are part of that selected invocation and do not become separate
 launches because of Module ownership; the invocation rule is owned by
@@ -879,7 +1028,7 @@ class AnalysisResult:
     Attributes:
         module: attribute; Source Module.
         function: attribute; Function that received records.
-        analysis: attribute; Requested root analysis.
+        analyses: attribute; Requested root analyses in first-occurrence order.
         level: attribute; Topology level whose unit the per-unit quantities describe, or None.
         executed: attribute; Analyses executed in dependency order.
         metadata_types: attribute; Metadata classes actually written.
@@ -887,7 +1036,7 @@ class AnalysisResult:
 
     module: "Module"
     function: "Function"
-    analysis: str
+    analyses: tuple[str, ...]
     level: str | None
     executed: tuple[str, ...]
     metadata_types: tuple[type[IRMetadata], ...]
@@ -897,7 +1046,7 @@ def analyze(
     module: "Module",
     function: "Function",
     *,
-    analysis: str,
+    analysis: str | Iterable[str],
     level: str | None = None,
     options: object | None = None,
     dims: "Mapping[str, int] | None" = None,
@@ -905,8 +1054,9 @@ def analyze(
 ```
 
 - constraints:
-  - One call MUST select exactly one root analysis. A caller wanting several
-    roots MUST call the operation once per root.
+  - One call MUST select one or more root analyses. It MUST preserve their
+    first-occurrence order, resolve their union dependency closure, and execute
+    every member once.
   - `level` MUST name one effective Module topology. When omitted, it MUST
     default to the coarsest effective topology; when the Module declares none,
     it MUST remain `None` and no per-unit projection divides. `AnalysisResult.level`
@@ -922,8 +1072,8 @@ def analyze(
     range in any of those positions, so the program MUST be analysed at a chosen
     size rather than as authored.
   - `dims=None` MUST behave as a call that states no size: the Function is
-    analysed as authored, and `AnalysisResult.function` MUST be the object the
-    caller supplied.
+    analysed as authored before the shared program check builds the inlined
+    view, and `AnalysisResult.function` MUST be that record-bearing view.
   - When `dims` is stated it MUST be non-empty; every key MUST name a dimension
     reached through the Function graph, its Mesh geometry, or the effective
     Module topology expressions; every value MUST be an integer inside that
@@ -937,12 +1087,11 @@ def analyze(
     geometry, and effective topology extents MUST use the same resolved binding.
     Exactly one variant MUST cover the stated size; none and more than one MUST
     both fail.
-  - When `dims` is stated, `AnalysisResult.function` MUST be the concrete Function
-    the records were written onto, derived from the Function the caller supplied,
-    and MUST record both that Function as the one it was specialised from and the
-    extents it was specialised at. `AnalysisResult.module` MUST remain the Module
-    the caller supplied. A reader given the symbolic input would find no records
-    on it.
+  - When `dims` is stated, `AnalysisResult.function` MUST be the inlined view of
+    the concrete Function the records were written onto and MUST retain the
+    specialised Function's origin and extents. `AnalysisResult.module` MUST
+    remain the Module the caller supplied. A reader given the symbolic input
+    would find no records on it.
   - The recorded extents MUST be what identifies which size a derived Function is
     at. They MUST NOT be inferred from its signature: a dimension occurring only
     in a loop bound, a body operation's attribute, or a nested callee leaves the
@@ -960,6 +1109,10 @@ def analyze(
   - Type inference and validation MUST each run once per call, before any
     analysis. No analysis MAY run once either has rejected the IR, because an
     analysis reads inferred types and assumes a verified function.
+  - Family-specific readiness MUST be checked on that inferred inlined view and
+    MUST complete before the first analysis in the dependency closure runs. In
+    particular, a timeline request that lacks result placement MUST fail before
+    dependency Metadata is written.
   - Re-running MUST recompute the closure and refresh the Metadata that closure
     owns. There MUST be no cross-call cache. Metadata owned by nothing in the
     closure MUST be left untouched.

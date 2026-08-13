@@ -344,12 +344,16 @@ in what it lowers to:
 ### 1.7 `for i in tile(...)` / `for i in range(...)` (HIR-only)
 
 ```
-for-loop    ::= 'for' identifier 'in' ('tile' | 'range') '(' loop-args ')' ':' suite
-loop-args   ::= extent-Expr                        # tile: extent / range: stop
-              | extent-Expr ',' step-Expr          # tile(extent, step)
-              | start-Expr ',' stop-Expr           # range(start, stop)
-              | start-Expr ',' stop-Expr ',' step-Expr   # range(start, stop, step)
+for-loop    ::= 'for' identifier 'in' 'tile' '(' tile-args ')' ':' suite
+              | 'for' identifier 'in' 'range' '(' range-args ')' ':' suite
+tile-args   ::= extent-Expr ',' step-Expr
+range-args  ::= stop-Expr
+              | start-Expr ',' stop-Expr
+              | start-Expr ',' stop-Expr ',' step-Expr
 ```
+
+Loop arguments are positional-only at the IR authoring surface; keyword
+arguments are rejected.
 
 `tile(...)` and `range(...)` share **one** loop domain `(start, extent,
 step)` and lower to the **same** `GridRegionExpr` ([hir §1.2](./hir.md#12-gridregionexpr)) —
@@ -360,14 +364,14 @@ only difference is the loop-variable binding:
   `x[i]` or write the window manually (`i : i + step`). Args follow Python
   `range`: `range(stop)` (start `0`, step `1`), `range(start, stop)` (step
   `1`), `range(start, stop, step)`.
-- `tile(extent)` also binds a scalar `i: i64` (start `0`, step `1`).
 - `tile(extent, step)` binds `i` to the standard Python
   `slice(iv, iv + step, 1)` so `x[:, i]` lifts to a `Slice` over
   the current window. The grid domain already advances `iv` by `step`; the
   binding MUST NOT multiply it again. In any other Expr position, including an
   `insert_slice` offset tuple, `i` resolves to the scalar `slice.start`. The
   Python `slice` is parser-only and does not reach IR; the grid-domain `start`
-  is `0`.
+  is `0`. A single-argument `tile(extent)` is rejected; use `range(extent)` for
+  scalar iteration.
 
 `start-Expr` / `extent-Expr` (the **stop** endpoint, not a length — the
 domain is half-open `[start, extent)`) / `step-Expr` MAY be any `ShapeDim`
@@ -824,7 +828,7 @@ additive: it never shadows the function's own globals / freevars.
 `LexicalEnv` is a frame stack used by both body visitors for
 parser-time bindings (Mesh axes, the Python `slice` from two-argument `tile`, SSA
 aliasing). Frame push / pop matches the Python-source scope
-(`with Mesh(...)`, `for i in tile(...)`).
+(`with Mesh(...)`, HIR grid loops).
 
 `dispatch.resolve_callable(name, token)` performs strict
 per-dialect Op resolution against `op_registry`; both body visitors'
@@ -1041,12 +1045,19 @@ Python statements that the parser folds into a single `Expr` tree.
 | `x = expr` | `define(x, expr_node)`; no IR node. Subsequent `x` reuses the same `Expr` (SSA-as-DAG). |
 | `x + y` | `Call(Binary(kind=ADD), (x, y))`; the parser maps Python AST `BinOp` / `Compare` / `BoolOp` directly to a `Binary` instance with the matching `BinaryKind`. `UnaryOp` USub / Not maps similarly to `Unary(kind=NEG)` / `Unary(kind=NOT)`. AST `@` (matmul) routes to `MatMul` (a real Op, not kinded). |
 | `foo(a, b)` | `Call(target_op, args)` where `target_op` is constructed by the resolved schema's `builder` ([§4.2](#42-closure-then-registry-callee-resolution) / [§4.3](#43-opschema-and-overload-resolution)). For surface aliases (e.g. `add` / `cmp_eq` / `neg`), the alias's builder returns the kinded target Op (`Binary(kind=...)` / `Unary(kind=...)`); for real Ops, the default builder is the Op class itself. |
-| `for i in tile(...)` | `GridRegionExpr` (see [§1.7](#17-for-i-in-tile--for-i-in-range-hir-only) and below). |
+| `for i in tile(...)` / `for i in range(...)` | `GridRegionExpr` (see [§1.7](#17-for-i-in-tile--for-i-in-range-hir-only) and below). |
 | `with Mesh(...) as m` | Push `m` onto the parser-lexical stack; pop on exit. No IR node. |
 | `return expr` | Sets `Function.body`. A `return` without a value is rejected. |
 | `return (a, b)` / `return a, b` | A literal tuple return (both spellings are the same AST) folds to a core `Tuple` body ([core-ir §2.2](./core-ir.md#22-var--constant--tuple)); `Function.return_type` is the `TupleType` of the element types. Callers destructure via the existing tuple-unpack rule (`o, s = f(...)`). |
 | `pass` | Accepted only as the **entire** body: sets `Function.body = None`, declaring a dispatch prototype whose implementations are registered via `.specialize`
 ([hir §1.1](./hir.md#11-function)). A `pass` mixed with any other statement is rejected. |
+
+An assignment whose RHS computes a new expression records the LHS as that
+expression's binding. A bare-name RHS computes nothing: rebinding an existing
+value under either a new or existing name (for example `acc = x` to initialize
+a loop carry, or the final `m = m_new` carry update) MUST reuse the same `Expr`
+object without replacing its binding metadata. A new name updates the parser's
+symbol table; it does not add or rename an IR node.
 
 `for` / `if` / `while` over arbitrary ranges, conditionals, and other
 Stmt forms are TIR-only. They are rejected by the HIR parser.
@@ -1064,7 +1075,7 @@ variant directly.
 
 ### 5.1 GridRegionExpr carry-out lifting
 
-Inside a `for i in tile(...)` body, an `ast.Assign` whose single
+Inside an HIR grid-loop body, an `ast.Assign` whose single
 `Name` target is already bound in *outer* scope is a loop-carried
 rebinding. The parser:
 
@@ -1084,7 +1095,11 @@ nested loop is carried across both loops.
 ### 5.2 Constraint attachment
 
 The HIR parser attaches one `ScheduleConstraintMetadata` record to one
-concrete tensor `Expr`. Tensor parameters, tensor-valued intermediate SSA
+existing tensor `Expr`. Attachment MUST update that node in place: it MUST NOT
+rebuild the annotated value or any consumer in its SSA DAG. An annotation with
+a value still follows the assignment rule above, so it may annotate a newly
+computed RHS or bind another name to an existing value without copying it.
+Tensor parameters, tensor-valued intermediate SSA
 values, and bound tensor-valued `TupleGetItem` values are valid subjects.
 Whole tuples, shape scalars, unit values, direct subscripts, and unresolved
 names are rejected. Inline and standalone annotations for the same Expr are

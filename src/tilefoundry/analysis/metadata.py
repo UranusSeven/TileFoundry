@@ -15,24 +15,41 @@ from tilefoundry.visitor_registry.contexts import TrafficBytes
 
 
 @dataclass(frozen=True)
-class ComputeCostMetadata(IRMetadata):
-    """Record one call's logical work as authored.
+class OccurrenceProvenance(IRMetadata):
+    """Identify the authored call and Function-call path of one occurrence."""
 
-    ``flops`` groups global work by dtype; ``flops_per_unit`` applies shard
-    projection at the requested topology level. Global traffic is counted once.
-    ``operands`` is positional against ``(*call.args, call)`` and exists only
-    for direct primitive calls, not aggregate calls into another function.
+    source_call: int
+    call_path: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ComputeCostMetadata(IRMetadata):
+    """Record one occurrence's work or one Function's total work.
+
+    ``flops`` and ``traffic`` state global work; their ``*_per_unit`` partners
+    apply shard projection at the requested topology level. On a Call, all
+    quantities state one occurrence and ``operands`` is positional against
+    ``(*call.args, call)``. On a Function, loops contribute their trip count and
+    ``operands`` is empty.
     """
 
     flops: tuple[tuple[str, int], ...] = ()
     flops_per_unit: tuple[tuple[str, int], ...] = ()
     traffic: tuple[tuple[str, TrafficBytes], ...] = ()
+    traffic_per_unit: tuple[tuple[str, TrafficBytes], ...] = ()
     operands: tuple[TrafficBytes, ...] = ()
 
     def traffic_at(self, level: str) -> TrafficBytes:
         """Traffic at *level*, zero when the call does not touch it."""
         return next(
             (value for name, value in self.traffic if name == level), TrafficBytes()
+        )
+
+    def traffic_per_unit_at(self, level: str) -> TrafficBytes:
+        """One unit's traffic at *level*, zero when it does not touch it."""
+        return next(
+            (value for name, value in self.traffic_per_unit if name == level),
+            TrafficBytes(),
         )
 
     def format_comment(self) -> str:
@@ -48,6 +65,13 @@ class ComputeCostMetadata(IRMetadata):
             )
             or "0"
         )
+        local_traffic_text = (
+            ",".join(
+                f"{level}:r{value.read}/w{value.write}"
+                for level, value in self.traffic_per_unit
+            )
+            or "0"
+        )
         operand_text = ",".join(
             f"{'result' if index == len(self.operands) - 1 else index}:"
             f"r{value.read}/w{value.write}"
@@ -56,7 +80,7 @@ class ComputeCostMetadata(IRMetadata):
         operands = f" operands={operand_text}" if operand_text else ""
         return (
             f"compute-cost flops={flop_text} per-unit={local_text} "
-            f"bytes={traffic_text}{operands}"
+            f"bytes={traffic_text} per-unit-bytes={local_traffic_text}{operands}"
         )
 
 
@@ -158,27 +182,40 @@ class RooflineMetadata(IRMetadata):
 
 @dataclass(frozen=True)
 class TimelineMetadata(IRMetadata):
-    """A modeled placement on the nominal timeline.
+    """One occurrence's CTA-local interval on the nominal timeline.
 
-    On a Call this is the placement of the execution unit that call belongs to.
-    Every call fused into one unit carries the same record: the placement was
-    decided for the unit, and a distinct one per call would suggest a resolution
-    the model does not have.
-
-    On a Function it is the whole function's span, so it starts at the origin
-    and ends at the makespan the scheduling model solved for. ``grid_units`` is
-    then the widest unit extent and ``waves`` the waves issued in total.
+    A repeated loop-body occurrence states its first interval plus the trip
+    count and stride needed to derive every later interval.
     """
 
-    grid_units: int = 1
-    waves: int = 1
     start_ns: int = 0
     end_ns: int = 0
+    trips: int = 1
+    stride_ns: int = 0
+
+    def format_comment(self) -> str:
+        if self.trips > 1:
+            span_end = self.start_ns + self.trips * self.stride_ns
+            return (
+                f"timeline [{self.start_ns}+{self.stride_ns}t, "
+                f"{self.end_ns}+{self.stride_ns}t) trips={self.trips} "
+                f"span=[{self.start_ns},{span_end})"
+            )
+        return f"timeline start={self.start_ns}ns end={self.end_ns}ns"
+
+
+@dataclass(frozen=True)
+class TimelineSummaryMetadata(IRMetadata):
+    """One Function's local schedule and physical-wave estimate."""
+
+    local_makespan_ns: int = 0
+    waves: int = 1
+    estimated_kernel_ns: int = 0
 
     def format_comment(self) -> str:
         return (
-            f"timeline units={self.grid_units} waves={self.waves} "
-            f"start={self.start_ns}ns end={self.end_ns}ns"
+            f"timeline local-makespan={self.local_makespan_ns}ns "
+            f"waves={self.waves} estimated-kernel={self.estimated_kernel_ns}ns"
         )
 
 
@@ -186,8 +223,10 @@ __all__ = [
     "ComputeCostMetadata",
     "LevelFootprint",
     "MemoryMetadata",
+    "OccurrenceProvenance",
     "RooflineMetadata",
     "TimelineMetadata",
+    "TimelineSummaryMetadata",
     "TrafficBytes",
     "ValueLifetime",
 ]

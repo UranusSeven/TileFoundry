@@ -345,7 +345,7 @@ class GridRegionExpr(Expr):
 **Iteration domain.** Both DSL loop surfaces — `for i in tile(...)` and
 `for i in range(...)` — lower to this one node; they share the domain
 `(start, extent, step)` and differ only in the loop-variable binding (`tile`
-2-arg binds a parser-side Python `slice`, everything else binds a scalar; see
+binds a parser-side Python `slice`, while `range` binds a scalar; see
 [parser §1.7](./parser.md#17-for-i-in-tile--for-i-in-range-hir-only)). `range` is not unrolled. `induction_var` ranges
 over `range(start, extent, step)`: `start` and `extent` are the **half-open**
 `[start, extent)` Python-range endpoints (so `extent` is the **stop** value,
@@ -372,8 +372,8 @@ already a coordinate in `range(0, extent, step)`, not an ordinal to multiply by
   call time against concrete argument shapes; its trip count is not
   statically recoverable from the node alone.
 
-**Carry-out semantics.** The parser populates the carry chain when a
-`for i in tile(...)` body contains an `ast.Assign` whose single
+**Carry-out semantics.** The parser populates the carry chain when an HIR
+grid-loop body contains an `ast.Assign` whose single
 `Name` target binds an outer-scope name:
 
 - the carried name becomes a phi `Var` in `carried_args`,
@@ -402,7 +402,7 @@ Parser-side rules: see
 ```python
 # example
 acc = zeros((M,), f32, storage="rmem")
-for i in tile(K, step=BLOCK):
+for i in tile(K, BLOCK):
     acc = acc + load_tile(x, i)
 # After the loop, `acc` resolves to the GridRegionExpr value.
 ```
@@ -1517,6 +1517,14 @@ dispatches on `(layout, storage)`:
   `shard_layout_local_shape(layout)` with size-1 → 0 (per-instance form).
 - `layout=Layout(strides=tuple)` (verbose) → dest strides are taken verbatim;
   typeinfer MUST NOT rewrite them (e.g. SM80 MMA fragment layouts).
+
+**Cost classification.** A Reshard whose source and destination storage are
+the same is a zero-copy view and reports zero traffic, including the
+`layout=None` no-op. A Reshard that changes storage is a copy and reports one
+full source read plus one full destination write. Layout changes alone do not
+turn a same-storage view into traffic. This follows the same boundary as
+`Slice`, whose consumers account for the data they move, and `Arange`, whose
+coordinates remain synthesized metadata until a consumer materializes them.
 
 **Cross-CTA fence.** The grid fence for a cross-CTA reshard is owned by the
 reshard lowering, not by a separately authored sync. When a reshard reads a

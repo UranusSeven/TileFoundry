@@ -13,10 +13,9 @@ from tilefoundry.analysis.walk import reachable_functions
 from tilefoundry.cli.source import load_authored_ir, suggested_extents
 from tilefoundry.inspection import PythonPrintOptions, as_script
 from tilefoundry.inspection.analysis_report import (
+    render_analysis,
     render_json,
     render_text,
-    report,
-    selected_types,
 )
 from tilefoundry.ir.hir.specialize import SpecializationError
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
@@ -25,7 +24,7 @@ EVIDENCE: dict[str, str] = {
     "compute-cost": "the logical work and traffic of every value: flops by dtype, bytes moved",
     "memory": "where that traffic lands, and the footprint it holds live against the capacity",
     "roofline": "which of compute or memory limits each value, and the limit in time",
-    "timeline": "when each value runs under those limits, and over how many units",
+    "timeline": "when each value runs, and the root's physical-wave estimate",
 }
 
 
@@ -63,8 +62,8 @@ def guidance() -> str:
 
         family         what --topology changes                 pass it when
         ------------   --------------------------------------  ---------------------
-        compute-cost   flops_per_unit. flops and traffic are   the program shards
-                       the device's and do not move
+        compute-cost   flops_per_unit and traffic_per_unit.    the program shards
+                       flops and traffic stay global
         memory         nothing. Footprint follows its owner    never
                        for each storage level
         roofline       nothing. The bound is the machine's     never
@@ -73,7 +72,7 @@ def guidance() -> str:
                        plan is issued against
 
         Two assumptions the reported numbers rest on:
-          traffic is the device's and counted once, so units reading one operand
+          global traffic is the device's and counted once, so units reading one operand
             in common are assumed to read it from memory once. Whether they can is
             a residency question, reported as an advisory.
           a reported peak footprint holds under the order this walk took. Which
@@ -99,9 +98,9 @@ def run_authored_analysis(
 ) -> int:
     """Analyse one authored HIR selection and print what was found.
 
-    One public call per requested root, because the operation takes one root at
-    a time. The renderings are composed from those results afterwards, so
-    requesting two analyses cannot change what either of them reports.
+    One public call resolves the requested roots' union closure. Each member
+    runs once on one view, and Metadata ownership keeps one family from changing
+    another's records.
     """
     module = load_authored_ir(source)
     function = module.entry_function()
@@ -128,30 +127,22 @@ def run_authored_analysis(
             )
         except SpecializationError as error:
             raise ValueError(f"analyze: {error}") from None
-        check_program(checked_module, checked)
+        expanded = check_program(checked_module, checked)
         validate_authored(reachable_functions(checked))
-        annotated = as_script(module, options=PythonPrintOptions(show_types=True))
+        annotated = as_script(expanded, options=PythonPrintOptions(show_types=True))
         sys.stdout.write(annotated)
         return 0
 
-    results = [
-        analyze(module, function, analysis=name, level=topology, dims=dims)
-        for name in analyses
-    ]
-    data = report(results)
+    result = analyze(module, function, analysis=analyses, level=topology, dims=dims)
+    rendered = render_analysis(result)
+    data = rendered.data
     if as_json:
         sys.stdout.write(f"{render_json(data)}\n")
         return 0
 
 
 
-    annotated = as_script(
-        module,
-        options=PythonPrintOptions(
-            show_types=True, comment_metadata_types=selected_types(results)
-        ),
-    )
-    sys.stdout.write(f"{render_text(data)}\n\n{annotated}")
+    sys.stdout.write(f"{render_text(data)}\n\n{rendered.annotated}")
     return 0
 
 

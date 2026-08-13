@@ -11,29 +11,48 @@ disagree with itself.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
+import tilefoundry.analysis.compute_cost as compute_cost
+from tests.fixtures.placed.moe_mega_kernel import MoEMegaKernel
+from tests.fixtures.placed.square_cuda import Model as SquareCuda
 from tilefoundry import func, module
 from tilefoundry.analysis import (
     ComputeCostMetadata,
     MemoryHierarchyFacts,
     MemoryMetadata,
     MemoryRelationKind,
+    ParallelCapacityFacts,
     RooflineMetadata,
     ThroughputFacts,
     TimelineMetadata,
+    TimelineSummaryMetadata,
 )
 from tilefoundry.analysis.api import analyze
+from tilefoundry.analysis.check import _mesh_image, _result_placement, _timeline_placements
 from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.walk import postorder
-from tilefoundry.dsl import ConstTensor, Mesh, Tensor, Topology, tf
+from tilefoundry.dsl import ConstTensor, DimVar, Mesh, Tensor, Topology, tf
 from tilefoundry.inspection.analysis_report import render_json, render_text, report
 from tilefoundry.ir.core import Call, Constant, Tuple, Var, get_metadata
+from tilefoundry.ir.hir import Function
 from tilefoundry.ir.hir.math.binary import Binary
-from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.tensor.slice import Slice
-from tilefoundry.ir.types import DType, TupleType, make_tensor_type, numel
+from tilefoundry.ir.types import DType, TensorType, TupleType, make_tensor_type, numel
+from tilefoundry.ir.types.shard import (
+    Broadcast,
+    ComposedLayout,
+    Layout,
+    ShardLayout,
+)
+from tilefoundry.ir.types.shard import (
+    Mesh as IrMesh,
+)
+from tilefoundry.ir.types.shard import (
+    Topology as IrTopology,
+)
 from tilefoundry.target import AmxTarget, CudaTarget
 from tilefoundry.visitor_registry import cost_evaluator_registry
 from tilefoundry.visitor_registry.contexts import Cost, CostContext, TrafficBytes
@@ -61,6 +80,52 @@ class _MixedPrecision:
         scaled = tf.mul(source, source)
         half = tf.cast(scaled, "f16")
         return tf.add(half, half)
+
+
+_ROUNDING_M = 14_593
+_ROUNDING_N = 11_489
+_ROUNDING_K = 298_224_413
+_H200 = CudaTarget("nvidia.h200_sxm")
+_LARGE_H200 = CudaTarget(
+    replace(_H200.device, hbm_capacity_bytes=300_000_000_000_000_000),
+    architecture=_H200.architecture,
+)
+
+
+class _ConstrainedCudaTarget(CudaTarget):
+    name = "test.constrained_cuda"
+
+    def get_facts(self, facts_type: type, query: object | None = None):
+        facts = super().get_facts(facts_type, query)
+        if facts_type is ParallelCapacityFacts:
+            return replace(facts, parallel_units=64)
+        return facts
+
+
+_GRID = DimVar("grid", 1, 397)
+
+
+@module(
+    entry="main",
+    target=_H200,
+    topologies=(Topology("cta", _GRID),),
+)
+class _ScalableGrid:
+    @func
+    def main(source: Tensor[(64,), "f32"]):
+        with Mesh(("cta",), layout=(_GRID,), names=("tile",)) as _cta:
+            local = tf.reshard(source, (64,), "gmem")
+            return tf.relu(local)
+
+
+@module(entry="main", target=_LARGE_H200, topologies=(Topology("cta", 1),))
+class _LargeRooflineRounding:
+    @func
+    def main(
+        lhs: Tensor[(_ROUNDING_M, _ROUNDING_K), "f32"],
+        rhs: ConstTensor[(_ROUNDING_K, _ROUNDING_N), "f32"],
+    ):
+        return tf.matmul(lhs, rhs)
 
 
 @module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
@@ -184,12 +249,37 @@ def _wide_grid(source: Tensor[(1024,), "f32"]):
     return tf.add(source, source)
 
 
-@func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("thread", 1),))
+@func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 168),))
+def _placed_wide_grid(source: Tensor[(1024,), "f32"]):
+    with Mesh(("cta",), layout=(168,), names=("tile",)) as _cta:
+        placed = tf.reshard(source, (1024,), "gmem")
+        return tf.add(placed, placed)
+
+
+@func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
 def _reshard_boundary(source: Tensor[(1,), "f32"]):
-    with Mesh(("thread",), layout=(1,), names=("lane",)) as thread:
-        local = tf.reshard(source, (1 @ thread.lane,), "rmem")
-        moved = tf.reshard(local, (1 @ thread.lane,), "rmem")
+    with Mesh(("cta",), layout=(1,), names=("tile",)) as cta:
+        local = tf.reshard(source, (1 @ cta.tile,), "rmem")
+        moved = tf.reshard(local, (1 @ cta.tile,), "rmem")
         return tf.add(moved, moved)
+
+
+@func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+def _zero_cost_view(source: Tensor[(1,), "f32"]):
+    with Mesh(("cta",), layout=(1,), names=("tile",)) as cta:
+        local = tf.reshard(source, (1 @ cta.tile,), "gmem")
+        parts = tf.split(local, axis=0, num_splits=1)
+        return parts[0]
+
+
+@func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+def _no_op_reshard(source: Tensor[(1,), "f32"]):
+    return tf.reshard(source)
+
+
+@func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+def _unplaced_structural(source: Tensor[(), "i64", None, "rmem"]):
+    return tf.stack(source, axis=0)
 
 
 @func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 2), Topology("thread", 4)))
@@ -242,9 +332,10 @@ def _entry(owner):
 
 
 def _run(owner, analysis: str):
-    """Analyse *owner*'s entry function and hand back that function."""
+    """Analyse *owner*'s entry function and hand back the record-bearing view."""
     entry = _entry(owner)
-    return analyze(owner, entry, analysis=analysis), entry
+    result = analyze(owner, entry, analysis=analysis)
+    return result, result.function
 
 
 def _calls(function) -> tuple[Call, ...]:
@@ -261,7 +352,7 @@ def test_compute_cost_stops_at_the_selected_topology_level() -> None:
     entry = _entry(_thread_sharded)
     cta_result = analyze(_thread_sharded, entry, analysis="compute-cost")
 
-    record = get_metadata(_calls(entry)[-1], ComputeCostMetadata)
+    record = get_metadata(_calls(cta_result.function)[-1], ComputeCostMetadata)
     assert record is not None
     assert cta_result.level == "cta"
     assert record.flops == (("f32", 8),)
@@ -269,7 +360,7 @@ def test_compute_cost_stops_at_the_selected_topology_level() -> None:
     traffic = record.traffic
 
     thread_result = analyze(_thread_sharded, entry, analysis="compute-cost", level="thread")
-    record = get_metadata(_calls(entry)[-1], ComputeCostMetadata)
+    record = get_metadata(_calls(thread_result.function)[-1], ComputeCostMetadata)
     assert record is not None
     assert thread_result.level == "thread"
     assert record.flops == (("f32", 8),)
@@ -281,23 +372,23 @@ def test_an_unsharded_call_reports_the_same_global_and_per_unit_work() -> None:
     cuda_entry = _CudaAdd.entry_function()
     amx_entry = _AmxAdd.entry_function()
 
-    analyze(_CudaAdd, cuda_entry, analysis="compute-cost")
-    analyze(_AmxAdd, amx_entry, analysis="compute-cost")
+    cuda = analyze(_CudaAdd, cuda_entry, analysis="compute-cost")
+    amx = analyze(_AmxAdd, amx_entry, analysis="compute-cost")
 
-    call = _calls(cuda_entry)[-1]
+    call = _calls(cuda.function)[-1]
     record = get_metadata(call, ComputeCostMetadata)
     assert record is not None
     assert record.flops == (("f32", numel(call.type)),)
     assert record.flops_per_unit == record.flops
-    assert _cost_of(cuda_entry) == _cost_of(amx_entry)
+    assert _cost_of(cuda.function) == _cost_of(amx.function)
 
 
 def test_matmul_layout_changes_only_the_per_unit_work() -> None:
     records = []
     functions = {function.name: function for function in _MatmulLayouts.functions}
     for function in (functions["plain"], functions["split"], functions["broadcast"]):
-        analyze(_MatmulLayouts, function, analysis="roofline")
-        call = _calls(function)[-1]
+        result = analyze(_MatmulLayouts, function, analysis="roofline")
+        call = _calls(result.function)[-1]
         cost = get_metadata(call, ComputeCostMetadata)
         bound = get_metadata(call, RooflineMetadata)
         assert cost is not None and bound is not None
@@ -326,9 +417,9 @@ def test_matmul_layout_changes_only_the_per_unit_work() -> None:
 
 def test_function_call_carries_the_callee_per_unit_work() -> None:
     entry = _NestedSplitAdd.entry_function()
-    analyze(_NestedSplitAdd, entry, analysis="compute-cost")
+    result = analyze(_NestedSplitAdd, entry, analysis="compute-cost")
 
-    record = get_metadata(_calls(entry)[-1], ComputeCostMetadata)
+    record = get_metadata(_calls(result.function)[-1], ComputeCostMetadata)
     assert record is not None
     assert record.flops == (("f32", 256),)
     assert record.flops_per_unit == (("f32", 64),)
@@ -353,9 +444,13 @@ def test_the_two_operations_a_decoder_stops_on_cost_what_they_do() -> None:
     as nothing at all, reads differently.
     """
     rotated = _Rotated.entry_function()
-    analyze(_Rotated, rotated, analysis="compute-cost")
+    rotated_result = analyze(_Rotated, rotated, analysis="compute-cost")
     rotation = get_metadata(
-        next(call for call in _calls(rotated) if type(call.target).__name__ == "RoPE"),
+        next(
+            call
+            for call in _calls(rotated_result.function)
+            if type(call.target).__name__ == "RoPE"
+        ),
         ComputeCostMetadata,
     )
     assert rotation is not None
@@ -363,9 +458,13 @@ def test_the_two_operations_a_decoder_stops_on_cost_what_they_do() -> None:
     assert rotation.flops == (("f32", 3 * 2 * 64),)
 
     allocated = _Allocated.entry_function()
-    analyze(_Allocated, allocated, analysis="compute-cost")
+    allocated_result = analyze(_Allocated, allocated, analysis="compute-cost")
     zeros = get_metadata(
-        next(call for call in _calls(allocated) if type(call.target).__name__ == "Zeros"),
+        next(
+            call
+            for call in _calls(allocated_result.function)
+            if type(call.target).__name__ == "Zeros"
+        ),
         ComputeCostMetadata,
     )
     assert zeros is not None
@@ -376,16 +475,16 @@ def test_the_two_operations_a_decoder_stops_on_cost_what_they_do() -> None:
 
 
 def test_index_select_reads_the_rows_it_names_and_not_the_table() -> None:
-    result, entry = _run(_IndexSelected, "compute-cost")
+    result, function = _run(_IndexSelected, "compute-cost")
 
-    record = get_metadata(_calls(entry)[-1], ComputeCostMetadata)
+    record = get_metadata(_calls(function)[-1], ComputeCostMetadata)
     assert record is not None
     traffic = record.traffic_at("gmem")
     rows = 4 * 64 * 4
     assert traffic.read == rows + 4 * 4
     assert traffic.write == rows
 
-    payload = json.loads(render_json(report([result])))
+    payload = json.loads(render_json(report(result)))
     table, indices, produced = payload["calls"][-1]["compute-cost"]["operands"]
     assert table == {
         "arg": 0,
@@ -410,9 +509,9 @@ def test_an_evaluator_that_misses_an_operand_is_refused(monkeypatch) -> None:
 def test_memory_holds_parameters_resident_past_their_last_reader() -> None:
     """A function cannot reclaim storage its caller handed to it."""
     entry = _WeightedAdd.entry_function()
-    analyze(_WeightedAdd, entry, analysis="memory")
+    result = analyze(_WeightedAdd, entry, analysis="memory")
 
-    record = get_metadata(entry, MemoryMetadata)
+    record = get_metadata(result.function, MemoryMetadata)
     assert record is not None
     held = [item for item in record.lifetimes if item.persistent]
     ordinary = [item for item in record.lifetimes if not item.persistent]
@@ -428,18 +527,18 @@ def test_movement_costs_follow_each_operations_materialization() -> None:
 
     for name in ("row", "column"):
         function = functions[name]
-        analyze(_MovementCosts, function, analysis="memory")
-        (move,) = _calls(function)
+        result = analyze(_MovementCosts, function, analysis="memory")
+        (move,) = _calls(result.function)
         record = get_metadata(move, ComputeCostMetadata)
         assert record is not None
         assert record.traffic_at("gmem").total_bytes == 0
-        footprint = get_metadata(function, MemoryMetadata)
+        footprint = get_metadata(result.function, MemoryMetadata)
         assert footprint is not None
         assert all(item.persistent for item in footprint.lifetimes)
 
     materialized = functions["materialized"]
-    analyze(_MovementCosts, materialized, analysis="memory")
-    transpose, reshape = _calls(materialized)
+    result = analyze(_MovementCosts, materialized, analysis="memory")
+    transpose, reshape = _calls(result.function)
     transpose_cost = get_metadata(transpose, ComputeCostMetadata)
     reshape_cost = get_metadata(reshape, ComputeCostMetadata)
     assert transpose_cost is not None
@@ -447,13 +546,13 @@ def test_movement_costs_follow_each_operations_materialization() -> None:
     assert transpose_cost.traffic_at("gmem") == TrafficBytes(read=moved, write=moved)
     assert reshape_cost is not None
     assert reshape_cost.traffic_at("gmem").total_bytes == 0
-    footprint = get_metadata(materialized, MemoryMetadata)
+    footprint = get_metadata(result.function, MemoryMetadata)
     assert footprint is not None
     assert any(not item.persistent and item.bytes == moved for item in footprint.lifetimes)
 
     copied = functions["copied"]
-    analyze(_MovementCosts, copied, analysis="compute-cost")
-    selected, concat = _calls(copied)
+    result = analyze(_MovementCosts, copied, analysis="compute-cost")
+    selected, concat = _calls(result.function)
     selected_cost = get_metadata(selected, ComputeCostMetadata)
     concat_cost = get_metadata(concat, ComputeCostMetadata)
     assert selected_cost is not None
@@ -463,6 +562,29 @@ def test_movement_costs_follow_each_operations_materialization() -> None:
     assert concat_cost.traffic_at("gmem") == TrafficBytes(
         read=2 * selected_bytes,
         write=2 * selected_bytes,
+    )
+
+
+def test_reshard_costs_no_op_and_cross_storage_copy() -> None:
+    no_op, no_op_function = _run(_no_op_reshard, "compute-cost")
+    assert no_op.executed == ("compute-cost",)
+    no_op_cost = get_metadata(_calls(no_op_function)[0], ComputeCostMetadata)
+    assert no_op_cost is not None
+    assert no_op_cost.traffic == ()
+    assert no_op_cost.operands == (TrafficBytes(), TrafficBytes())
+
+    copied = analyze(SquareCuda, SquareCuda.entry_function(), analysis="compute-cost")
+    copied_in = _calls(copied.function)[0]
+    copied_cost = get_metadata(copied_in, ComputeCostMetadata)
+    assert copied_cost is not None
+    moved = 168 * 4
+    assert copied_cost.traffic == (
+        ("gmem", TrafficBytes(read=moved)),
+        ("rmem", TrafficBytes(write=moved)),
+    )
+    assert copied_cost.operands == (
+        TrafficBytes(read=moved),
+        TrafficBytes(write=moved),
     )
 
 
@@ -491,20 +613,23 @@ def test_slice_costs_no_traffic_for_the_view_or_its_coordinates() -> None:
 
 def test_non_divisible_window_cost_is_a_full_tile_upper_bound() -> None:
     function = _WindowCost.entry_function()
-    analyze(_WindowCost, function, analysis="compute-cost")
-    adds = [call for call in _calls(function) if isinstance(call.target, Binary)]
+    result = analyze(_WindowCost, function, analysis="compute-cost")
+    adds = [call for call in _calls(result.function) if isinstance(call.target, Binary)]
     loop_cost = get_metadata(adds[-1], ComputeCostMetadata)
+    root_cost = get_metadata(result.function, ComputeCostMetadata)
 
     assert loop_cost is not None
-    assert loop_cost.flops == (("f32", 3 * 4 * 4),)
+    assert loop_cost.flops == (("f32", 4 * 4),)
+    assert root_cost is not None
+    assert root_cost.flops == (("f32", 4 * 4 + 3 * 4 * 4),)
 
 
 def test_a_sharded_shared_tile_fits_once_and_advises_on_its_peak() -> None:
     functions = {function.name: function for function in _SharedTile.functions}
     split = functions["split"]
-    analyze(_SharedTile, split, analysis="memory")
+    result = analyze(_SharedTile, split, analysis="memory")
 
-    record = get_metadata(split, MemoryMetadata)
+    record = get_metadata(result.function, MemoryMetadata)
     assert record is not None
     smem = next(item for item in record.footprint if item.level == "smem")
     assert smem.capacity_bytes == 232_448
@@ -521,47 +646,47 @@ def test_a_sharded_shared_tile_fits_once_and_advises_on_its_peak() -> None:
 
 def test_memory_footprints_follow_the_owner_recorded_by_the_target() -> None:
     matmul = next(fn for fn in _MatmulLayouts.functions if fn.name == "split")
-    analyze(_MatmulLayouts, matmul, analysis="memory")
-    gmem = get_metadata(matmul, MemoryMetadata)
+    result = analyze(_MatmulLayouts, matmul, analysis="memory")
+    gmem = get_metadata(result.function, MemoryMetadata)
     assert gmem is not None
     gmem_lifetimes = {item.binding: item.bytes for item in gmem.lifetimes if item.level == "gmem"}
-    assert gmem_lifetimes["local_lhs"] == gmem_lifetimes["lhs"] == 4_325_376
+    assert gmem_lifetimes["v0"] == gmem_lifetimes["lhs"] == 4_325_376
 
     shared = next(fn for fn in _SharedTile.functions if fn.name == "split")
-    analyze(_SharedTile, shared, analysis="memory")
-    cta_owned = get_metadata(shared, MemoryMetadata)
+    result = analyze(_SharedTile, shared, analysis="memory")
+    cta_owned = get_metadata(result.function, MemoryMetadata)
     assert cta_owned is not None
     assert (
         next(
             item.bytes
             for item in cta_owned.lifetimes
-            if item.binding == "local" and item.level == "smem"
+            if item.binding == "v0" and item.level == "smem"
         )
         == 211_200
     )
 
     thread_shared = _entry(_modest_shared)
-    analyze(_modest_shared, thread_shared, analysis="memory")
-    still_cta_owned = get_metadata(thread_shared, MemoryMetadata)
+    result = analyze(_modest_shared, thread_shared, analysis="memory")
+    still_cta_owned = get_metadata(result.function, MemoryMetadata)
     assert still_cta_owned is not None
     assert (
         next(
             item.bytes
             for item in still_cta_owned.lifetimes
-            if item.binding == "local" and item.level == "smem"
+            if item.binding == "v0" and item.level == "smem"
         )
         == 4_096
     )
 
     registers = _entry(_thread_sharded)
-    analyze(_thread_sharded, registers, analysis="memory")
-    thread_owned = get_metadata(registers, MemoryMetadata)
+    result = analyze(_thread_sharded, registers, analysis="memory")
+    thread_owned = get_metadata(result.function, MemoryMetadata)
     assert thread_owned is not None
     assert (
         next(
             item.bytes
             for item in thread_owned.lifetimes
-            if item.binding == "local" and item.level == "rmem"
+            if item.binding == "v0" and item.level == "rmem"
         )
         == 8
     )
@@ -617,7 +742,7 @@ def test_roofline_reads_the_recorded_work_and_aggregates_before_dividing() -> No
     result = analyze(_CudaAdd, entry, analysis="roofline")
 
     assert result.executed == ("compute-cost", "memory", "roofline")
-    call = _calls(entry)[-1]
+    call = _calls(result.function)[-1]
     cost = get_metadata(call, ComputeCostMetadata)
     bound = get_metadata(call, RooflineMetadata)
     assert cost is not None and bound is not None
@@ -629,12 +754,12 @@ def test_roofline_reads_the_recorded_work_and_aggregates_before_dividing() -> No
     assert bound.compute_ns == expected
 
     mixed = _MixedPrecision.entry_function()
-    analyze(_MixedPrecision, mixed, analysis="roofline")
-    whole = get_metadata(mixed, RooflineMetadata)
+    mixed_result = analyze(_MixedPrecision, mixed, analysis="roofline")
+    whole = get_metadata(mixed_result.function, RooflineMetadata)
     assert whole is not None
     per_call = [
         record
-        for call in _calls(mixed)
+        for call in _calls(mixed_result.function)
         if (record := get_metadata(call, RooflineMetadata)) is not None
     ]
     assert len(per_call) > 1
@@ -642,37 +767,344 @@ def test_roofline_reads_the_recorded_work_and_aggregates_before_dividing() -> No
     assert whole.ideal_ns == max(whole.compute_ns, whole.memory_ns)
 
 
-def test_timeline_credits_an_unplaced_call_with_one_position() -> None:
-    """A declared launch hierarchy does not place a value by itself."""
-    _, entry = _run(_wide_grid, "timeline")
+def test_roofline_uses_exact_integer_ceiling_above_float_precision() -> None:
+    result = analyze(
+        _LargeRooflineRounding,
+        _LargeRooflineRounding.entry_function(),
+        analysis="roofline",
+    )
+    bound = get_metadata(result.function, RooflineMetadata)
 
-    record = get_metadata(_calls(entry)[-1], TimelineMetadata)
-    assert record is not None
-    assert record.grid_units == 1
-    assert record.waves == 1
+    assert bound is not None
+    assert bound.compute_ns == 1_492_537_313_434
+    assert bound.ideal_ns == 1_492_537_313_434
 
-    whole = get_metadata(entry, TimelineMetadata)
-    assert whole is not None
-    assert whole.start_ns == 0
-    ends = [
-        record.end_ns
-        for call in _calls(entry)
-        if (record := get_metadata(call, TimelineMetadata)) is not None
+
+def test_timeline_refuses_unplaced_results_before_dependencies_run(monkeypatch) -> None:
+    """A topology declaration does not place a value or admit dependency writes."""
+    compute = analyze(_wide_grid, _entry(_wide_grid), analysis="compute-cost")
+    roofline = analyze(_wide_grid, _entry(_wide_grid), analysis="roofline")
+    assert get_metadata(compute.function, ComputeCostMetadata) is not None
+    assert get_metadata(roofline.function, RooflineMetadata) is not None
+
+    placed, function = _run(_placed_wide_grid, "timeline")
+    assert placed.executed == ("compute-cost", "timeline")
+    assert all(get_metadata(call, TimelineMetadata) is not None for call in _calls(function))
+
+    ran = False
+
+    def unexpected(*_args, **_kwargs):
+        nonlocal ran
+        ran = True
+
+    monkeypatch.setattr(compute_cost, "analyze_compute_cost", unexpected)
+    with pytest.raises(
+        AnalysisError,
+        match=r"test_analysis_families.py:.*has no cta placement",
+    ):
+        _run(_wide_grid, "timeline")
+    assert not ran
+
+
+def test_mega_kernel_preserves_placement_costs_and_timeline_order() -> None:
+    """The expanded placed program keeps its slices, costs, and dependency order."""
+    result = analyze(
+        MoEMegaKernel,
+        MoEMegaKernel.entry_function(),
+        analysis=("compute-cost", "memory", "roofline", "timeline"),
+    )
+    calls = _calls(result.function)
+    assert len(calls) == 7
+    assert all(not isinstance(call.target, Function) for call in calls)
+
+    for index, shape, offset in (
+        (0, (120,), 0),
+        (1, (120,), 0),
+        (3, (12,), 120),
+        (4, (12,), 120),
+    ):
+        call_type = calls[index].type
+        assert isinstance(call_type, TensorType)
+        assert isinstance(call_type.layout, ShardLayout)
+        layout = call_type.layout.mesh.layout
+        assert isinstance(layout, ComposedLayout)
+        assert layout.outer is not None
+        assert (layout.outer.shape, layout.offset) == (shape, offset)
+
+    placements = _timeline_placements(
+        MoEMegaKernel,
+        result.function,
+        "cta",
+        MoEMegaKernel.resolve_target().get_facts(ThroughputFacts),
+    )
+    prepared = set(placements.values())
+
+    assert frozenset(range(120)) in prepared
+    assert frozenset(range(120, 132)) in prepared
+    assert frozenset(range(132)) in prepared
+
+    views = [call for call in calls if type(call.target).__name__ == "Reshard"]
+    assert len(views) == 4
+    for view in views:
+        view_cost = get_metadata(view, ComputeCostMetadata)
+        assert view_cost is not None
+        assert view_cost.traffic == ()
+        assert view_cost.traffic_per_unit == ()
+        assert view_cost.operands == (TrafficBytes(), TrafficBytes())
+
+    call_costs = [get_metadata(call, ComputeCostMetadata) for call in calls]
+    assert all(call_cost is not None for call_cost in call_costs)
+    summed = TrafficBytes(
+        read=sum(call_cost.traffic_at("gmem").read for call_cost in call_costs),
+        write=sum(call_cost.traffic_at("gmem").write for call_cost in call_costs),
+    )
+    root_cost = get_metadata(result.function, ComputeCostMetadata)
+    memory = get_metadata(result.function, MemoryMetadata)
+    roofline = get_metadata(result.function, RooflineMetadata)
+    assert root_cost is not None
+    assert memory is not None
+    assert roofline is not None
+    assert dict(root_cost.flops) == {"f32": 23_040}
+    assert dict(root_cost.flops) == {
+        "f32": sum(dict(call_cost.flops).get("f32", 0) for call_cost in call_costs)
+    }
+    assert root_cost.traffic_at("gmem") == summed == TrafficBytes(
+        read=122_880,
+        write=92_160,
+    )
+    assert memory.traffic == (("gmem", summed),)
+    assert (roofline.memory_ns, roofline.ideal_ns, roofline.bound_by) == (
+        45,
+        45,
+        "memory",
+    )
+
+    positive_per_unit = [
+        dict(call_cost.flops_per_unit)["f32"]
+        for call_cost in call_costs
+        if call_cost.flops_per_unit
     ]
-    assert whole.end_ns == max(ends)
+    assert positive_per_unit == [64, 640, 7_680]
+    relu = next(call for call in calls if type(call.target).__name__ == "ReLU")
+    cost = get_metadata(relu, ComputeCostMetadata)
+    assert cost is not None
+    assert cost.traffic == (("gmem", TrafficBytes(read=30_720, write=30_720)),)
+    assert cost.traffic_per_unit == (("gmem", TrafficBytes(read=256, write=256)),)
+    assert cost.traffic_per_unit_at("gmem") == TrafficBytes(read=256, write=256)
+    assert (
+        "bytes=gmem:r30720/w30720 per-unit-bytes=gmem:r256/w256 operands="
+        in cost.format_comment()
+    )
 
-
-def test_a_reshard_ends_the_execution_unit_on_both_sides() -> None:
-    """A reshard exists to move data, so no unit may span one."""
-    _, entry = _run(_reshard_boundary, "timeline")
-
-    local, moved, consumer = _calls(entry)[:3]
-    assert isinstance(local.target, Reshard)
-    assert isinstance(moved.target, Reshard)
-    records = [get_metadata(call, TimelineMetadata) for call in (local, moved, consumer)]
+    records = tuple(get_metadata(call, TimelineMetadata) for call in calls)
     assert all(record is not None for record in records)
-    assert records[0].end_ns <= records[1].start_ns
-    assert records[1].end_ns <= records[2].start_ns
+
+    routed_in, routed, routed_out, shared_in, shared, shared_out, join = records
+    assert routed_in is not None and routed is not None and routed_out is not None
+    assert shared_in is not None and shared is not None and shared_out is not None
+    assert join is not None
+
+    assert [
+        (record.start_ns, record.end_ns)
+        for record in (
+            routed_in,
+            routed,
+            routed_out,
+            shared_in,
+            shared,
+            shared_out,
+            join,
+        )
+    ] == [(0, 0), (0, 15), (15, 15), (0, 0), (0, 141), (141, 141), (141, 2_676)]
+    assert (routed.end_ns - routed.start_ns, shared.end_ns - shared.start_ns) == (
+        15,
+        141,
+    )
+    assert routed_in.start_ns == shared_in.start_ns == 0
+
+    routed_positions = placements[id(calls[1])]
+    shared_positions = placements[id(calls[4])]
+    assert routed_positions.isdisjoint(shared_positions)
+    assert routed.start_ns < shared.end_ns and shared.start_ns < routed.end_ns
+
+    whole_positions = placements[id(calls[2])]
+    assert whole_positions == placements[id(calls[5])] == frozenset(range(132))
+    assert (
+        routed_out.end_ns <= shared_out.start_ns
+        or shared_out.end_ns <= routed_out.start_ns
+    )
+    assert whole_positions != shared_positions
+    assert whole_positions & shared_positions
+    assert join.start_ns >= max(routed_out.end_ns, shared_out.end_ns)
+
+    summary = get_metadata(result.function, TimelineSummaryMetadata)
+    assert summary == TimelineSummaryMetadata(
+        local_makespan_ns=2_676,
+        waves=1,
+        estimated_kernel_ns=2_676,
+    )
+
+
+def test_timeline_scales_one_local_schedule_by_root_capacity() -> None:
+    """Root geometry and capacity scale waves, never occurrence intervals."""
+    results = [
+        analyze(
+            _ScalableGrid,
+            _ScalableGrid.entry_function(),
+            analysis="timeline",
+            dims={"grid": extent},
+        )
+        for extent in (132, 265)
+    ]
+    constrained = replace(
+        _ScalableGrid,
+        target=_ConstrainedCudaTarget("nvidia.h200_sxm"),
+    )
+    results.append(
+        analyze(
+            constrained,
+            constrained.entry_function(),
+            analysis="timeline",
+            dims={"grid": 265},
+        )
+    )
+
+    intervals = [
+        tuple(get_metadata(call, TimelineMetadata) for call in _calls(result.function))
+        for result in results
+    ]
+    summaries = [
+        get_metadata(result.function, TimelineSummaryMetadata) for result in results
+    ]
+    assert intervals[0] == intervals[1] == intervals[2]
+    assert all(summary is not None for summary in summaries)
+    first, wider, constrained_summary = summaries
+    assert first is not None and wider is not None and constrained_summary is not None
+    assert {
+        first.local_makespan_ns,
+        wider.local_makespan_ns,
+        constrained_summary.local_makespan_ns,
+    } == {15}
+    assert (first.waves, wider.waves, constrained_summary.waves) == (1, 3, 5)
+    assert (
+        first.estimated_kernel_ns,
+        wider.estimated_kernel_ns,
+        constrained_summary.estimated_kernel_ns,
+    ) == (15, 45, 75)
+
+    data = report(results[1])
+    assert set(data["function_records"]["timeline"]) == {
+        "local_makespan_ns",
+        "waves",
+        "estimated_kernel_ns",
+    }
+    assert all(
+        set(row["timeline"]) == {"start_ns", "end_ns", "trips", "stride_ns"}
+        for row in data["calls"]
+    )
+
+
+def test_placement_projection_rejects_the_wrong_level_and_invalid_images() -> None:
+    with pytest.raises(
+        AnalysisError,
+        match=r"selected topology level 'cta'.*placed at level.s. 'thread'",
+    ):
+        analyze(_thread_sharded, _entry(_thread_sharded), analysis="timeline")
+
+    cta = IrTopology("cta", 8)
+    outside = IrMesh(
+        (cta,),
+        ComposedLayout(None, 7, Layout((2,), (1,))),
+    )
+    with pytest.raises(AnalysisError, match=r"positions \[8\].*outside.*\[0, 8\)"):
+        _mesh_image(outside, cta)
+
+    dynamic = replace(
+        outside,
+        layout=ComposedLayout(None, 0, Layout((DimVar("mesh_n", 1, 9),), (1,))),
+    )
+    with pytest.raises(AnalysisError, match="not projectable"):
+        _mesh_image(dynamic, cta)
+
+    strict_plain = IrMesh((cta,), Layout((4,), (1,)))
+    with pytest.raises(AnalysisError, match="must describe the full selected domain"):
+        _mesh_image(strict_plain, cta)
+
+    left = IrMesh((cta,), ComposedLayout(None, 0, Layout((4,), (1,))))
+    right = IrMesh((cta,), ComposedLayout(None, 4, Layout((4,), (1,))))
+    tuple_type = TupleType(
+        (
+            make_tensor_type((8,), layout=ShardLayout(Layout((8,), (1,)), (Broadcast(),), left)),
+            make_tensor_type((8,), layout=ShardLayout(Layout((8,), (1,)), (Broadcast(),), right)),
+        )
+    )
+    with pytest.raises(AnalysisError, match="tuple result leaves carry different"):
+        _result_placement(tuple_type, cta)
+
+
+def test_nested_levels_project_independently_and_broadcast_counts_as_placed() -> None:
+    cta = IrTopology("cta", 2)
+    thread = IrTopology("thread", 4)
+    thread_layout = ShardLayout(
+        Layout((8,), (1,)),
+        (Broadcast(),),
+        IrMesh((thread,), Layout((4,), (1,))),
+    )
+    nested = ShardLayout(
+        thread_layout,
+        (Broadcast(),),
+        IrMesh((cta,), Layout((2,), (1,))),
+    )
+    type_ = TensorType((8,), DType.f32, nested, storage="rmem")
+
+    assert _result_placement(type_, cta) == frozenset((0, 1))
+    assert _result_placement(type_, thread) == frozenset(range(4))
+
+
+def test_timeline_refuses_traffic_only_at_an_unmodelled_storage_level() -> None:
+    with pytest.raises(
+        AnalysisError,
+        match=r"traffic is only at unmodelled storage level.*'rmem'.*'gmem'",
+    ):
+        _run(_reshard_boundary, "timeline")
+
+
+def test_a_zero_cost_structural_occurrence_has_an_empty_timeline_interval() -> None:
+    result, entry = _run(_zero_cost_view, "timeline")
+
+    view = next(
+        call for call in _calls(entry) if type(call.target).__name__ == "TupleGetItem"
+    )
+    record = get_metadata(view, TimelineMetadata)
+    assert record is not None
+    assert record.start_ns == record.end_ns
+    timelines = [
+        row["timeline"] for row in report(result)["calls"] if "timeline" in row
+    ]
+    assert all(
+        set(item)
+        == {"start_ns", "end_ns", "trips", "stride_ns"}
+        for item in timelines
+    )
+    assert any(
+        item["start_ns"] == item["end_ns"]
+        and item["trips"] == 1
+        and item["stride_ns"] == 0
+        for item in timelines
+    )
+
+
+def test_an_unplaced_structural_occurrence_ignores_unmodelled_traffic() -> None:
+    _result, entry = _run(_unplaced_structural, "timeline")
+
+    (view,) = _calls(entry)
+    cost = get_metadata(view, ComputeCostMetadata)
+    timeline = get_metadata(view, TimelineMetadata)
+    assert cost is not None and timeline is not None
+    assert cost.flops_per_unit == ()
+    assert cost.traffic_per_unit_at("gmem").total_bytes == 0
+    assert cost.traffic_per_unit_at("rmem") == TrafficBytes(read=8, write=8)
+    assert (timeline.start_ns, timeline.end_ns) == (0, 0)
 
 
 def test_the_gpu_memory_graph_is_not_a_tree() -> None:
@@ -716,7 +1148,7 @@ def test_a_report_shows_the_requested_analyses_and_reads_the_same_either_way() -
     entry = _entry(_CudaAdd)
     result = analyze(_CudaAdd, entry, analysis="roofline")
 
-    data = report([result])
+    data = report(result)
 
     assert data["requested"] == ["roofline"]
     assert data["executed"] == ["compute-cost", "memory", "roofline"]
@@ -726,8 +1158,8 @@ def test_a_report_shows_the_requested_analyses_and_reads_the_same_either_way() -
     assert all(set(item) == {"level", "peak_bytes"} for item in memory["footprint"])
     assert data["totals"]["flops"] == {"f32": 256}
     assert all(set(call) == {"value", "roofline"} for call in data["calls"])
-    assert get_metadata(entry, MemoryMetadata) is not None
-    cost = get_metadata(_calls(entry)[-1], ComputeCostMetadata)
+    assert get_metadata(result.function, MemoryMetadata) is not None
+    cost = get_metadata(_calls(result.function)[-1], ComputeCostMetadata)
     assert cost is not None
     assert " operands=0:r" in cost.format_comment()
     assert ",result:r" in cost.format_comment()

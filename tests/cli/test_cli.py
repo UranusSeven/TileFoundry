@@ -119,7 +119,8 @@ def test_analyze_help_explains_topology_effects_and_assumptions(capsys) -> None:
     for family in ("compute-cost", "memory", "roofline", "timeline"):
         assert family in help_text
     assert "flops_per_unit" in help_text
-    assert "traffic is the device's and counted once" in help_text
+    assert "traffic_per_unit" in help_text
+    assert "global traffic is the device's and counted once" in help_text
     assert "is an observation, not a bound" in help_text
 
 
@@ -381,11 +382,19 @@ def test_persisted_targets_drive_every_command_without_touching_the_default_regi
         "--compute-cost",
         "--memory",
         "--roofline",
-        "--timeline",
         "--json",
     )
     assert analyzed_npu.returncode == 0, analyzed_npu.stderr
     assert json.loads(analyzed_npu.stdout)["target"] == "vendor.npu"
+    unplaced_npu = _run_cli(
+        registry,
+        tmp_path,
+        "analyze",
+        f"{npu_model}:model",
+        "--timeline",
+    )
+    assert unplaced_npu.returncode == 1
+    assert "has no core placement" in unplaced_npu.stderr
     scheduled_npu = _run_cli(
         registry,
         tmp_path,
@@ -610,4 +619,76 @@ def test_analyze_binds_an_extent_on_a_root_that_reaches_a_child(tmp_path, capsys
     source.write_text(_COMPOSED_SOURCE, encoding="utf-8")
 
     assert cli.main(["analyze", f"{source}:Composed.root", "--dim", "n_cli=4"]) == 0
-    assert "def root(" in capsys.readouterr().out
+    expanded = capsys.readouterr().out
+    assert "def root(" in expanded
+    assert "leaf_w: ConstTensor" in expanded
+    assert "leaf(" not in expanded
+
+
+def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> None:
+    source = Path(__file__).parents[1] / "fixtures" / "placed" / "moe_mega_kernel.py"
+    selector = f"{source}:MoEMegaKernel"
+    flags = ["--compute-cost", "--memory", "--roofline", "--timeline"]
+
+    assert cli.main(["analyze", selector, *flags, "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert cli.main(["analyze", selector, *flags]) == 0
+    first = capsys.readouterr().out
+    assert cli.main(["analyze", selector, *flags]) == 0
+    second = capsys.readouterr().out
+    assert first == second
+
+    header, annotated = first.split("\n\n", 1)
+    lines = annotated.splitlines()
+    assert payload["requested"] == payload["executed"] == [
+        "compute-cost",
+        "memory",
+        "roofline",
+        "timeline",
+    ]
+    assert set(payload["function_records"]) == {
+        "compute-cost",
+        "memory",
+        "roofline",
+        "timeline",
+    }
+    assert "routed_expert(" not in annotated
+    assert "shared_expert(" not in annotated
+    assert annotated.count("reshard(tokens") == 2
+    assert "v0 = reshard(tokens" in annotated
+    assert "v3 = reshard(tokens" in annotated
+    assert "offset=0" in annotated
+    assert "offset=120" in annotated
+
+    summary = payload["function_records"]["timeline"]
+    assert (
+        "# timeline root=MoEMegaKernel::experts "
+        f"local-makespan={summary['local_makespan_ns']}ns "
+        f"waves={summary['waves']} "
+        f"estimated-kernel={summary['estimated_kernel_ns']}ns"
+    ) in header.splitlines()
+
+    rows = payload["calls"]
+    assert len(rows) == 7
+    assert all(
+        set(row) == {"value", "compute-cost", "roofline", "timeline"}
+        for row in rows
+    )
+    starts = []
+    for row in rows:
+        value, line_text = row["value"].rsplit(":", 1)
+        line = int(line_text)
+        starts.append(line)
+        assert lines[line - 1].lstrip().startswith(f"{value} = ")
+
+    for index, (row, start) in enumerate(zip(rows, starts)):
+        stop = starts[index + 1] - 1 if index + 1 < len(starts) else len(lines)
+        statement = "\n".join(lines[start - 1 : stop])
+        timeline = row["timeline"]
+        assert (
+            f"timeline start={timeline['start_ns']}ns end={timeline['end_ns']}ns"
+            in statement
+        )
+    assert len([line for line in lines if "; timeline " in line]) == len(rows)
+    assert len({row["value"] for row in rows}) == len(rows)
+    assert "units=" not in annotated

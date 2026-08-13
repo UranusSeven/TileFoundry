@@ -165,6 +165,24 @@ def test_the_decode_step_and_the_cache_entry_it_hands_back(
     assert entry_k.shape[1] == 1 and want_k.shape[1] == ctx_len + 1
 
 
+def test_the_placed_mlp_matches_the_reference(tf, shipped_source, tmp_path) -> None:
+    """The timeline witness keeps the shipped MLP's numerical boundary."""
+    drawn = reference.decode_step_inputs(ctx_len=0, device="cpu")
+    want = reference.mlp_reference(drawn.layer, drawn.hidden_new)
+
+    contract.compared(
+        tf,
+        tmp_path,
+        shipped_source(MODEL),
+        CASES[0],
+        "placed_mlp",
+        activations=(drawn.hidden_new,),
+        weights=drawn.loaded.constants,
+        expected=(want,),
+        held=(contract.one_rounding(want),),
+    )
+
+
 CONFIG = published()
 
 
@@ -232,10 +250,15 @@ def _holds(reported: int, derived: int, label: str) -> None:
 
 
 def test_the_mlp_costs_its_three_matrices(tf, shipped_source) -> None:
-    """75,497,472 flops of matmul: 3 x 2 x 2048 x 6144."""
-    data = _reported(tf, shipped_source(MODEL), "mlp", None)
+    """Both MLP views include 75,497,472 flops of three matmuls."""
+    source = shipped_source(MODEL)
+    authored = _reported(tf, source, "mlp", None)
+    placed = _reported(tf, source, "placed_mlp", None)
+    authored_flops = authored["totals"]["flops"][DT]
+    placed_flops = placed["totals"]["flops"][DT]
 
-    _holds(data["totals"]["flops"][DT], _mlp_matmul_flops(), "mlp")
+    assert placed_flops == authored_flops
+    _holds(authored_flops, _mlp_matmul_flops(), "mlp")
 
 
 def test_the_attention_costs_its_projections_and_its_context(tf, shipped_source) -> None:

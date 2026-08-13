@@ -263,10 +263,11 @@ selected Module's resolved Target determines the hardware specification for an
 explicit analysis; there is no ordinary `--target` option.
 
 - constraints:
-  - `analyze` MUST invoke the public operation once per requested root, because
-    that operation takes one root per call
-    ([analysis §3](./analysis.md#3-composed-analysis)). Requesting two analyses
-    MUST NOT change what either reports.
+  - `analyze` MUST invoke the public operation once with every requested root,
+    so their union dependency closure runs on one inlined Function view
+    ([analysis §3](./analysis.md#3-composed-analysis)). Each closure member MUST
+    run once, and requesting another root MUST NOT let one analyzer change
+    Metadata owned by another.
   - A selection MUST resolve to a Module. A bare Function MUST be rejected
     naming the reason: it declares neither the Target its numbers are measured
     against nor the topology hierarchy they divide over.
@@ -279,7 +280,9 @@ explicit analysis; there is no ordinary `--target` option.
     operation's `level`, and name the unit for per-unit figures. Its help MUST
     state the default and, for every family, which figure changes with the level
     and when to pass it, together with the global-traffic and observed-peak
-    assumptions.
+    assumptions. Compute cost MUST name both `flops_per_unit` and
+    `traffic_per_unit` as projected figures while keeping `flops` and `traffic`
+    explicitly global.
     With no analysis flag it MUST be accepted and inert.
   - `--dim NAME=EXTENT` MUST bind one dimension the selection leaves open, and
     MUST be repeatable to bind several. One dimension MUST receive one extent;
