@@ -650,10 +650,12 @@ their input when it states one. An input with `layout=None` produces a view with
 - `Rank` produces a rank-0 `i64`; `ShapeOf` produces a rank-1 `i64` vector with
   one entry per input axis.
 - Both results are host shape metadata with `layout=EMPTY_LAYOUT` and
-  `storage=None`, not device-resident tensors.
+  `storage=umat`, not device-resident tensors.
 - Evaluation MUST read the concrete runtime tensor rank and extents. A symbolic
   input `TensorType.shape` is the result bound, not the value returned at
   runtime.
+- A compile-time integer subscript, `tf.shape_of(x)[k]`, reads one dimension and
+  produces the canonical rank-0 `i64` `umat` scalar for that dimension.
 
 ##### Arange
 
@@ -1428,46 +1430,6 @@ class Wgmma_SM90_64x128x16(Mma):
     come only from the selected operand/result Types.
   - `HirToTirPass` MUST reject both concrete HIR MMA Ops by name before
     emitting TIR; see [passes §7.1](./passes.md#71-hirtotirpass).
-
-#### `ir/hir/shape/`
-
-Shape-level Ops on whole shape values (per-axis dim Ops are
-[types §3](./types.md#3-dtype)).
-
-Shape values are host metadata: their tensor types use `EMPTY_LAYOUT` and
-`storage=None`, and their evaluators move no device bytes.
-
-##### ShapeExtract
-```python
-class ShapeExtract(Op):
-    """Extract one axis from a shape value; produces a Dim.
-
-    Attributes:
-        shape: input; input shape value.
-        index: attribute; extracted axis.
-    """
-
-    shape: Tensor
-    index: int
-```
-- constraints:
-  - The result is the dimension at `index`.
-
-##### ShapeCompose
-```python
-class ShapeCompose(Op):
-    """Assemble per-axis dims into a shape value; produces a Shape.
-
-    Attributes:
-        dims: input; per-axis dimensions.
-        is_variadic: attribute; Whether the input parameter consumes all args.
-    """
-
-    dims: Tensor
-    is_variadic: ClassVar[bool] = True
-```
-- constraints:
-  - The result is a shape value assembled in input order.
 
 #### `ir/hir/sharding/`
 

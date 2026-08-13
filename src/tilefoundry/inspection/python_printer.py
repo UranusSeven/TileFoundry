@@ -483,7 +483,7 @@ def _tensor_annotation(
         else:
             sl_str = _shard_layout_str(sl, indent=indent + "    ")
             base += f",\n{indent}    {sl_str}"
-    if ty.storage is not None and ty.storage != StorageKind.GMEM:
+    if ty.storage is not StorageKind.GMEM:
         base += f', "{ty.storage.name.lower()}"'
     base += "]"
     return base

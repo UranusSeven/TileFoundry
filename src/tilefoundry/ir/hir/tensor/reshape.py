@@ -36,13 +36,18 @@ class Reshape(Op):
 register_access_relation(Reshape)(identity_relations(1))
 
 
-def is_register_scalar_singleton_reshape(expr) -> bool:
-    """Whether ``expr`` only presents one register scalar as a 1-D tensor."""
+def is_induction_var_singleton_reshape(expr) -> bool:
+    """Whether ``expr`` has the singleton view form for a loop index.
+
+    HIR induction variables use ``UMAT`` storage; the exact induction-variable
+    identity is checked by affine extraction, while this predicate keeps the
+    preflight and partition gates aligned with that representation.
+    """
     return (
         isinstance(expr, Call)
         and isinstance(expr.target, Reshape)
         and expr.args[0].type.shape == ()
-        and expr.args[0].type.storage is StorageKind.RMEM
+        and expr.args[0].type.storage is StorageKind.UMAT
         and expr.type.shape == (1,)
     )
 
@@ -151,6 +156,12 @@ def _carry_sharded_reshape(layout: ShardLayout, new_shape: tuple):
 def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     x_ty = ctx.type_of(call.args[0])
     new_shape = tuple(call.target.new_shape)
+
+    genuine_sharding = isinstance(x_ty.layout, ShardLayout) and any(
+        not isinstance(attr, Broadcast) for attr in x_ty.layout.attrs
+    )
+    if x_ty.storage is StorageKind.UMAT and new_shape == () and not genuine_sharding:
+        return TensorType.umat_scalar(x_ty.dtype)
 
     new_layout = None
     if isinstance(x_ty.layout, ShardLayout):

@@ -182,8 +182,8 @@ dim            ::= integer-literal | dim-Expr        ; dim-Expr per types §4
 dtype          ::= '"f32"' | '"f16"' | '"bf16"' | …  ; see types §3
 layout         ::= layout-sugar                      ; see §1.5
                 | 'ShardLayout(' … ')'              ; verbose, see shard §7
-storage        ::= '"host"' | '"gmem"' | '"smem"' | '"rmem"' | '"tmem"'
-                | 'host' | 'gmem' | 'smem' | 'rmem' | 'tmem'
+storage        ::= '"host"' | '"gmem"' | '"smem"' | '"rmem"' | '"tmem"' | '"umat"'
+                | 'host' | 'gmem' | 'smem' | 'rmem' | 'tmem' | 'umat'
 ```
 
 `Tensor[...]` and `ConstTensor[...]` resolve to the same ordinary `TensorType`;
@@ -208,7 +208,7 @@ Tensor[(), "bf16"]                                    # scalar
     descriptor before constructing `TensorType`.
   - An unknown dtype string MUST be rejected; it MUST NOT fall back to another
     descriptor.
-  - Bare storage names MUST resolve to the five constants exported by
+  - Bare storage names MUST resolve to the six constants exported by
     `tilefoundry.dsl.storage`; they are equivalent to the quoted spellings.
 
 ### 1.5 Layout sugar
@@ -328,7 +328,12 @@ in what it lowers to:
 
 - **HIR** treats it as an **active mesh context** — a parser-lexical
   alias for the constructed `Mesh`, so layout sugar ([§1.5](#15-layout-sugar)) may bind axes
-  with `… @ m.axis` and tensors authored under it reuse the one `Mesh`.
+  with `… @ m.axis` and tensors authored under it reuse the one `Mesh`. In a layout
+  position, `m.axis` names the static mesh axis used by `dim @ m.axis`. In an HIR
+  Expr position, the same name is the current rank-0 coordinate along that axis; the
+  parser synthesizes the invariant index vector and its local view. Such a coordinate
+  may index an unplaced tensor in a runtime slice; indexing an already placed tensor
+  is rejected because its data-dependent mesh ownership is unresolved.
   It is not a tensor-binding scope and emits **no IR node**. Ordinary
   values assigned inside `suite` follow normal function-body visibility
   (not confined); `return` inside `suite` returns from the enclosing
@@ -457,6 +462,12 @@ compile-time-list ::= '[' expr (',' expr)* ']'
 A tensor subscript resolves per axis: an `ast.Slice` keeps the axis, a
 compile-time integer **drops** it (as in torch), and a negative integer counts
 back from the axis extent, which MUST therefore be static.
+
+For a tensor slice, a run-time rank-0 integer is permitted as an endpoint only
+when the resulting window size is a compile-time dimension. The canonical
+spelling is `start:start + K`; the parser MUST reject an unrelated stop
+endpoint because `Slice.sizes` is a static attribute. The slice stride remains
+compile-time.
 
 ## 2. DSL namespace surface
 

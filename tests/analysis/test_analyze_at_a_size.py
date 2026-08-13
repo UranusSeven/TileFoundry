@@ -16,6 +16,7 @@ from dataclasses import replace
 
 import pytest
 
+from tests.fixtures.placed.flash_split_k_decode import BLOCK, HEADS, WORKERS, FlashSplitKDecode
 from tests.fixtures.placed.gqa_decode import MAX_CTX, GqaOnline
 from tests.fixtures.placed.prefill_decode_attention import PrefillDecodeAttention
 from tests.models.qwen3_1_7b.case import CASE as QWEN3_1_7B
@@ -28,20 +29,35 @@ from tilefoundry.analysis import (
     analyze,
 )
 from tilefoundry.analysis.errors import AnalysisError
-from tilefoundry.analysis.walk import enclosing_trips, postorder
+from tilefoundry.analysis.walk import enclosing_trips, postorder, tensor_types
 from tilefoundry.inspection.analysis_report import render_analysis
-from tilefoundry.ir.core import Call, get_metadata
+from tilefoundry.ir.core import Call, Constant, get_metadata
+from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.hir.grid_region import GridRegionExpr
+from tilefoundry.ir.hir.math.binary import Binary
+from tilefoundry.ir.hir.sharding.local import Local
+from tilefoundry.ir.hir.sharding.reshard import Reshard
 from tilefoundry.ir.hir.specialize import (
     display_name,
     origin_of,
     residual_dims,
     variant_for,
 )
+from tilefoundry.ir.hir.tensor.arange import Arange
 from tilefoundry.ir.hir.tensor.cast import Cast
 from tilefoundry.ir.hir.tensor.index_select import IndexSelect
 from tilefoundry.ir.hir.tensor.reshape import Reshape
-from tilefoundry.ir.types.shard import Topology
+from tilefoundry.ir.hir.tensor.slice import Slice
+from tilefoundry.ir.types import tensor_bytes
+from tilefoundry.ir.types.shard import (
+    Broadcast,
+    Partial,
+    ShardLayout,
+    Split,
+    Topology,
+    shard_layout_of,
+)
+from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.schedule import ScheduleError, ScheduleOptions, schedule
 from tilefoundry.schedule.partition import build_partition_program
 from tilefoundry.target import CudaTarget
@@ -78,45 +94,149 @@ def test_every_analysis_runs_at_a_stated_size(family: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("dims", "variant", "bound_by", "ideal_ns", "f32_flops"),
+    ("small_dims", "large_dims", "variant", "bound_by", "min_scale", "max_scale"),
     [
-        ({"ctx": 1024, "seq": 1}, "decode", "memory", 3_496, 6_378_112),
         (
+            {"ctx": 512, "seq": 1},
+            {"ctx": 1024, "seq": 1},
+            "decode",
+            "memory",
+            1.9,
+            2.1,
+        ),
+        (
+            {"ctx": 1, "seq": 512},
             {"ctx": 1, "seq": 1024},
             "prefill",
             "compute",
-            65_447,
-            4_384_751_616,
+            3.8,
+            4.2,
         ),
     ],
     ids=["decode-open-context", "prefill-open-sequence"],
 )
 def test_block_attention_selects_and_analyzes_each_placed_regime(
-    dims: dict[str, int],
+    small_dims: dict[str, int],
+    large_dims: dict[str, int],
     variant: str,
     bound_by: str,
-    ideal_ns: int,
-    f32_flops: int,
+    min_scale: float,
+    max_scale: float,
 ) -> None:
+    records = []
+    for dims in (small_dims, large_dims):
+        result = analyze(
+            PrefillDecodeAttention,
+            PrefillDecodeAttention.entry_function(),
+            analysis="roofline",
+            dims=dims,
+        )
+        concrete = origin_of(result.function)
+        assert concrete is not None
+        selected = origin_of(concrete)
+        assert selected is not None
+        assert display_name(selected) == variant
+        record = get_metadata(result.function, RooflineMetadata)
+        assert record is not None
+        assert record.bound_by == bound_by
+        records.append(record)
+
+    ideal_scale = records[1].ideal_ns / records[0].ideal_ns
+    assert min_scale < ideal_scale < max_scale
+
+
+def test_split_k_decode_analyzes_each_offset_window_at_ctx_4096() -> None:
     result = analyze(
-        PrefillDecodeAttention,
-        PrefillDecodeAttention.entry_function(),
+        FlashSplitKDecode,
+        FlashSplitKDecode.entry_function(),
         analysis="roofline",
-        dims=dims,
+        dims={"ctx": 4096},
     )
 
-    concrete = origin_of(result.function)
-    assert concrete is not None
-    selected = origin_of(concrete)
-    assert selected is not None
-    assert display_name(selected) == variant
-    record = get_metadata(result.function, RooflineMetadata)
-    assert record is not None
-    assert record.ideal_ns == ideal_ns
-    assert record.bound_by == bound_by
-    cost = get_metadata(result.function, ComputeCostMetadata)
-    assert cost is not None
-    assert dict(cost.flops)["f32"] == f32_flops
+    assert result.function is not FlashSplitKDecode.entry_function()
+    loops = [
+        expr for expr in postorder(result.function.body) if isinstance(expr, GridRegionExpr)
+    ]
+    assert len(loops) == 1
+    (loop,) = loops
+    assert loop.step == BLOCK * WORKERS
+
+    loop_exprs = postorder(loop)
+    assert not any(
+        isinstance(attr, Partial)
+        for expr in loop_exprs
+        if isinstance(expr, Call)
+        for tensor in tensor_types(expr.type)
+        for layout in (shard_layout_of(tensor.layout),)
+        if isinstance(layout, ShardLayout)
+        for attr in layout.attrs
+    )
+
+    slices = [
+        expr
+        for expr in loop_exprs
+        if isinstance(expr, Call) and isinstance(expr.target, Slice)
+    ]
+    assert len(slices) == 2
+    for window in slices:
+        starts = window.args[1].elements
+        base = starts[1]
+        assert isinstance(base, Call)
+        assert base.args[0] is loop.induction_var
+        assert isinstance(base.target, Binary) and base.target.kind is BinaryKind.ADD
+        offset = base.args[1]
+        assert isinstance(offset, Call)
+        assert isinstance(offset.target, Binary) and offset.target.kind is BinaryKind.MUL
+        assert isinstance(offset.args[1], Constant) and offset.args[1].value == BLOCK
+
+        worker_index = offset.args[0]
+        assert isinstance(worker_index, Call)
+        assert isinstance(worker_index.target, Reshape)
+        local_index = worker_index.args[0]
+        assert isinstance(local_index, Call)
+        assert isinstance(local_index.target, Local)
+        worker_shard = local_index.args[0]
+        assert isinstance(worker_shard, Call)
+        assert isinstance(worker_shard.target, Reshard)
+        worker_source = worker_shard.args[0]
+        assert isinstance(worker_source, Call)
+        assert isinstance(worker_source.target, Arange)
+        assert worker_source.target.end == WORKERS
+        assert worker_source.target.start == 0
+        assert worker_shard.target.storage is StorageKind.RMEM
+        worker_layout = worker_shard.target.layout
+        assert isinstance(worker_layout, ShardLayout)
+        assert worker_layout.mesh.layout.shape == (HEADS, WORKERS)
+        assert worker_layout.attrs == (Broadcast(), Split(axis=0))
+        assert window.target.sizes[1] == BLOCK
+        record = get_metadata(window, ComputeCostMetadata)
+        assert record is not None
+        assert record.traffic_at("rmem").read > 0
+
+    first_offset = slices[0].args[1].elements[1].args[1]
+    second_offset = slices[1].args[1].elements[1].args[1]
+    first_worker_index = first_offset.args[0]
+    second_worker_index = second_offset.args[0]
+    assert first_worker_index is second_worker_index
+
+    cache_bytes = tensor_bytes(result.function.params[1].type)
+    kv_windows = [
+        expr
+        for expr in loop_exprs
+        if isinstance(expr, Call)
+        and isinstance(expr.target, Reshard)
+        and expr.args
+        and isinstance(expr.args[0], Call)
+        and isinstance(expr.args[0].target, Slice)
+    ]
+    assert len(kv_windows) == 2
+    trips = enclosing_trips(result.function.body)
+    assert all(
+        trips.get(id(window), 1)
+        * get_metadata(window, ComputeCostMetadata).traffic_at("gmem").read
+        == cache_bytes // WORKERS
+        for window in kv_windows
+    )
 
 
 @pytest.mark.parametrize("family", FAMILIES)
@@ -176,23 +296,6 @@ def test_without_a_size_the_result_names_the_record_bearing_view() -> None:
     assert origin_of(result.function) is function
     assert get_metadata(result.function, ComputeCostMetadata) is not None
     assert get_metadata(function, ComputeCostMetadata) is None
-
-
-@pytest.mark.parametrize(
-    "ctx_len",
-    (1, 1024),
-)
-def test_qwen_decoder_unplaced_calls_are_refused_at_each_sequence_length(
-    ctx_len: int,
-) -> None:
-    module = QWEN3_1_7B.build()
-    function = module.lookup("decoder_layer")
-
-    with pytest.raises(
-        AnalysisError,
-        match=r"model.py:\d+:.*has no cta placement",
-    ):
-        analyze(module, function, analysis="timeline", dims={"ctx_len": ctx_len})
 
 
 def test_gqa_loop_occurrences_are_costed_once_and_parameterized_over_trips() -> None:
@@ -352,6 +455,18 @@ def test_gqa_loop_occurrences_are_costed_once_and_parameterized_over_trips() -> 
     assert "timeline [652+920t, 652+920t) trips=8 span=[652,8012)" in lines[58]
     assert lines[82].strip() == "m = v16"
     assert "timeline" not in lines[82]
+@pytest.mark.parametrize("ctx_len", (1, 1024))
+def test_qwen_decoder_unplaced_calls_are_refused_at_each_sequence_length(
+    ctx_len: int,
+) -> None:
+    module = QWEN3_1_7B.build()
+    function = module.lookup("decoder_layer")
+
+    with pytest.raises(
+        AnalysisError,
+        match=r"model.py:\d+:.*has no cta placement",
+    ):
+        analyze(module, function, analysis="timeline", dims={"ctx_len": ctx_len})
 
 
 def test_qwen_decoder_keeps_rotary_and_kv_cache_parameters_resident() -> None:

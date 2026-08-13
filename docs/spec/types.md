@@ -43,21 +43,23 @@ class TensorType:
         shape: attribute; Logical shape, invariant under sharding, storage, and layout.
         dtype: attribute; Element dtype.
         layout: attribute; Layout-family member, or no assigned layout.
-        storage: attribute; Abstract result residency, unmaterialized residency, or None.
+        storage: attribute; Abstract result residency or unmaterialized residency.
     """
 
     shape: tuple[ShapeDim, ...]
     dtype: DType
     layout: LayoutBase | None
-    storage: StorageKind | None
+    storage: StorageKind
 
     def scalar(
         dtype: DType,
         layout: LayoutBase | None = None,
-        storage: StorageKind | None = StorageKind.RMEM,
+        storage: StorageKind = StorageKind.UMAT,
     ) -> "TensorType": ...
 
-    def meta_scalar(dtype: DType = DType.i64) -> "TensorType": ...
+    def umat_scalar(dtype: DType = DType.i64) -> "TensorType": ...
+
+    def umat_tensor(shape: tuple, dtype: DType = DType.i64) -> "TensorType": ...
 ```
 
 - constraints:
@@ -66,15 +68,15 @@ class TensorType:
   - `layout` is either `None` or one member of the `LayoutBase` hierarchy
     defined by [shard §2](./shard.md#2-layout-hierarchy).
   - `storage` is a `StorageKind` (`gmem` / `smem` / `rmem` / `host` / `tmem` /
-    `umat`) or `None`. A concrete level (`gmem` / `smem` / `rmem` / `host` /
+    `umat`). A concrete level (`gmem` / `smem` / `rmem` / `host` /
     `tmem`) is the value's **abstract result residency** — where the result tensor
     logically lives — not the transient register/ALU staging any individual step
     happens to use. `umat` marks an **unmaterialized** (placement-polymorphic)
     value: one present in the abstract IR that has not yet been committed to a
     concrete residency. A source value literal carries `storage=umat`. An
     unmaterialized value MUST be resolved to a concrete residency (or otherwise
-    materialized) before codegen consumes it. `None` is unchanged — a tensor with
-    no memory space (a shape-element scalar), distinct from `umat`.
+    materialized) before codegen consumes it. Shape elements use `umat`, not a
+    second no-memory storage marker.
   - For plain `Layout` / `ComposedLayout`, `layout.shape` MUST have the same rank
     and logical extents as `shape`; the layout describes the value whose type
     carries it. Consumers use this common contract rather than inspecting a
@@ -87,9 +89,9 @@ class TensorType:
   - `Layout` / `ComposedLayout` MUST describe an injective mapping
     ([shard §2](./shard.md#2-layout-hierarchy)). Padding-style non-injective layouts are
     not supported.
-  - A rank-0 tensor is well-formed. A rank-0 tensor with `storage=None` is the
-    shape-element form; a rank-0 tensor with a memory `StorageKind` is an
-    ordinary scalar holding one element.
+  - A rank-0 tensor is well-formed. A rank-0 tensor with `storage=umat` is the
+    unmaterialized shape-element form; a rank-0 tensor with a concrete memory
+    `StorageKind` is an ordinary scalar holding one element.
 
 Enforcement is owned by [tir §1.3](./tir.md#13-primfunction) / [hir §1.3](./hir.md#13-op);
 dispatch is described in
@@ -203,9 +205,8 @@ def resolve_storage(value: "str | StorageKind | None") -> "StorageKind | None":
     `TMEM=5` / `tmem`, and `UMAT=6` / `umat`.
   - `resolve_storage` MUST pass through `None` and a `StorageKind` instance.
     It MUST accept exactly the canonical strings `host`, `gmem`, `smem`,
-    `rmem`, and `tmem`, and MUST reject other strings and non-storage values.
-  - `UMAT` is an IR-internal unmaterialized value and MUST NOT be accepted as
-    a surface string.
+    `rmem`, `tmem`, and `umat`, and MUST reject other strings and non-storage
+    values. Matching is case-sensitive.
   - The storage vocabulary is closed at the IR type boundary. It MUST NOT
     provide target-specific registration or capability validation.
 
@@ -299,9 +300,9 @@ The canonical descriptors are:
   bounded dynamic dims; and
 - a `core_ir.dim.*` `Expr` (e.g. `DimAdd` / `DimMul`) for derived
   dim expressions, returning a rank-0 integer `Expr` of dtype
-  `i64` and `storage=None`. This rank-0 meta-scalar type
-  (`shape=()`, `layout=EMPTY_LAYOUT`, `storage=None`) has exactly one
-  constructor, `TensorType.meta_scalar(dtype)`.
+  `i64` and `storage=umat`. This rank-0 unmaterialized scalar type
+  (`shape=()`, `layout=EMPTY_LAYOUT`, `storage=umat`) has exactly one
+  constructor, `TensorType.umat_scalar(dtype)`.
 
 ```python
 ShapeDim = int | DimVar | Expr
@@ -480,9 +481,9 @@ def ceildiv(a, b) -> Expr:
 ```
 
 - constraints:
-  - Rank-0 shape-element tensors MUST use `storage=None` and carry no runtime
-    memory.
-  - Construction sites MUST use `TensorType.meta_scalar(dtype)` instead of
+  - Rank-0 shape-element tensors MUST use `storage=umat` and carry no committed
+    residency.
+  - Construction sites MUST use `TensorType.umat_scalar(dtype)` instead of
     restating its field tuple, so structural type equality holds across layers.
   - `DimVar` MUST use a non-empty `name` and plain integer `lo` and `hi` bounds
     satisfying `lo < hi`. Its envelope is half-open, `[lo, hi)`; `[k, k+1)` is
@@ -578,7 +579,7 @@ class CallableType:
 def make_tensor_type(
     shape: tuple,
     dtype: DType = DType.f32,
-    storage: str | StorageKind | None = "gmem",
+    storage: str | StorageKind = "gmem",
     layout: object = None,
 ) -> TensorType:
     """Build a plain tensor type.
@@ -598,7 +599,7 @@ def make_tensor_type(
 def make_shard_tensor_type(
     shape: tuple,
     dtype: DType = DType.f32,
-    storage: str | StorageKind | None = "gmem",
+    storage: str | StorageKind = "gmem",
     mesh: Mesh | None = None,
     attrs: tuple = (),
 ) -> TensorType:
@@ -656,3 +657,34 @@ def callable_type_for_prim_function(fn) -> CallableType:
   - `callable_type_for` MUST preserve parameter order and project only each
     parameter's `.type`; parameter names are not part of `CallableType`.
   - `callable_type_for_prim_function` MUST use `UnitType` as the return type.
+
+---
+
+## 10. Unmaterialized values
+
+`UMAT` states that a value's residency is not decided. It is not a claim that
+the value is known at compile time, and not a claim that it will never live in
+memory: it is the absence of a residency decision. A shape element read from a
+symbolic dimension is unmaterialized and unknown; a literal `2` is
+unmaterialized and known. Neither occupies memory until something places it.
+
+Two canonical forms, and no third spelling of either:
+
+```python
+TensorType.umat_scalar(dtype)          # rank-0: a shape element, a dim result
+TensorType.umat_tensor(shape, dtype)   # ranked: a shape vector
+```
+
+- constraints:
+  - `TensorType.storage` MUST be a `StorageKind`. There is no unset residency;
+    an undecided one is `UMAT`.
+  - A value whose residency no one has decided MUST carry `UMAT`, whether or
+    not its value is known at compile time.
+  - Shape elements and `dim.*` results MUST use `umat_scalar`; shape-vector
+    construction sites MUST use `umat_tensor`. A statically indexed rank-0
+    result from a shape vector MUST use `umat_scalar`; other ranked `Slice`
+    views retain their derived layouts and are not required to be structurally
+    equal to `umat_tensor`.
+  - An operand carrying `UMAT` MUST NOT be charged to a memory level by the
+    residency of its own type alone; what charges it is where it is consumed
+    ([analysis §2.2.1](./analysis.md#221-compute-cost)).

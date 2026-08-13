@@ -16,7 +16,9 @@ from dataclasses import replace
 import pytest
 
 import tilefoundry.analysis.compute_cost as compute_cost
+from tests.fixtures.placed.flash_split_k_decode import FlashSplitKDecode
 from tests.fixtures.placed.moe_mega_kernel import MoEMegaKernel
+from tests.fixtures.placed.prefill_decode_attention import PrefillDecodeAttention
 from tests.fixtures.placed.square_cuda import Model as SquareCuda
 from tilefoundry import func, module
 from tilefoundry.analysis import (
@@ -32,6 +34,7 @@ from tilefoundry.analysis import (
 )
 from tilefoundry.analysis.api import analyze
 from tilefoundry.analysis.check import _mesh_image, _result_placement, _timeline_placements
+from tilefoundry.analysis.compute_cost import _call_movement
 from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.walk import postorder
 from tilefoundry.dsl import ConstTensor, DimVar, Mesh, Tensor, Topology, tf
@@ -40,7 +43,7 @@ from tilefoundry.ir.core import Call, Constant, Tuple, Var, get_metadata
 from tilefoundry.ir.hir import Function
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.tensor.slice import Slice
-from tilefoundry.ir.types import DType, TensorType, TupleType, make_tensor_type, numel
+from tilefoundry.ir.types import DType, TensorType, TupleType, make_tensor_type, numel, tensor_bytes
 from tilefoundry.ir.types.shard import (
     Broadcast,
     ComposedLayout,
@@ -53,6 +56,7 @@ from tilefoundry.ir.types.shard import (
 from tilefoundry.ir.types.shard import (
     Topology as IrTopology,
 )
+from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.target import AmxTarget, CudaTarget
 from tilefoundry.visitor_registry import cost_evaluator_registry
 from tilefoundry.visitor_registry.contexts import Cost, CostContext, TrafficBytes
@@ -179,6 +183,30 @@ class _MovementCosts:
     def copied(source: Tensor[(1024, 2048), "f32"]):
         selected = source[0:256, :]
         return tf.concat(selected, selected, axis=0)
+
+
+@module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+class _UnmaterializedValueCosts:
+    @func
+    def main(source: Tensor[(8, 4), "f32"]):
+        shape_value = tf.shape_of(source)[1]
+        return tf.zeros(shape=(shape_value,), dtype="i64", storage="umat")
+
+
+@module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+class _RuntimeCoordinateCosts:
+    @func
+    def main(source: Tensor[(8, 4), "f32"], start: Tensor[(), "i64"]):
+        return source[start : start + 4, :]
+
+
+@module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+class _UnmaterializedIndexTensorCosts:
+    @func
+    def main():
+        row_positions = tf.reshape(tf.arange(128), new_shape=(1, 128))
+        column_positions = tf.reshape(tf.arange(128), new_shape=(128, 1))
+        return row_positions <= column_positions
 
 
 @module(entry="main", target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
@@ -402,17 +430,16 @@ def test_matmul_layout_changes_only_the_per_unit_work() -> None:
             broadcast_bound,
         ),
     ) = records
-    assert [record.flops for record, _bound in records] == [
-        (("bf16", 28_547_481_600),),
-    ] * 3
-    assert [record.flops_per_unit for record, _bound in records] == [
-        (("bf16", 28_547_481_600),),
-        (("bf16", 216_268_800),),
-        (("bf16", 28_547_481_600),),
-    ]
+    total_flops = plain_cost.flops[0]
+    assert split_cost.flops == broadcast_cost.flops == (total_flops,)
+    assert broadcast_cost.flops_per_unit == plain_cost.flops
+    split_per_unit = split_cost.flops_per_unit[0]
+    assert (split_per_unit[0], split_per_unit[1] * _MatmulLayouts.topologies[0].size) == (
+        total_flops[0],
+        total_flops[1],
+    )
     assert split_cost.traffic == plain_cost.traffic == broadcast_cost.traffic
     assert split_bound == plain_bound == broadcast_bound
-    assert plain_bound.ideal_ns == 28_851
 
 
 def test_function_call_carries_the_callee_per_unit_work() -> None:
@@ -588,7 +615,7 @@ def test_reshard_costs_no_op_and_cross_storage_copy() -> None:
     )
 
 
-def test_slice_costs_no_traffic_for_the_view_or_its_coordinates() -> None:
+def test_slice_costs_coordinates_but_not_the_view() -> None:
     source = Var(type=make_tensor_type((1024, 2048)), name="source")
     scalar = make_tensor_type((), DType.i64)
     starts = Tuple(
@@ -606,8 +633,56 @@ def test_slice_costs_no_traffic_for_the_view_or_its_coordinates() -> None:
 
     assert cost.traffic == (
         TrafficBytes(),
+        TrafficBytes(read=tensor_bytes(starts.type)),
         TrafficBytes(),
-        TrafficBytes(),
+    )
+
+
+def test_unmaterialized_shape_values_are_not_charged_as_attributes() -> None:
+    function = _UnmaterializedValueCosts.entry_function()
+    zeros = _calls(function)[-1]
+    shape_value = zeros.target.shape[0]
+    assert shape_value.type.storage is StorageKind.UMAT
+    assert shape_value not in zeros.args
+    assert zeros.type.storage is StorageKind.UMAT
+    traffic, operands = _call_movement(zeros, Cost({}, (TrafficBytes(write=16),)))
+    assert operands == (TrafficBytes(write=16),)
+    assert traffic == ()
+
+
+def test_mixed_runtime_coordinates_are_charged_per_leaf() -> None:
+    function = _RuntimeCoordinateCosts.entry_function()
+    result = analyze(_RuntimeCoordinateCosts, function, analysis="compute-cost")
+
+    (slice_call,) = _calls(result.function)
+    starts = slice_call.args[1]
+    assert tuple(str(field.storage) for field in starts.type.fields) == (
+        "gmem",
+        "umat",
+    )
+    record = get_metadata(slice_call, ComputeCostMetadata)
+    assert record is not None
+    assert record.traffic == (
+        ("gmem", TrafficBytes(read=8)),
+        ("rmem", TrafficBytes(read=8)),
+    )
+    assert record.operands[1] == TrafficBytes(read=16)
+
+
+def test_non_scalar_unmaterialized_operands_are_charged_at_rmem() -> None:
+    function = _UnmaterializedIndexTensorCosts.entry_function()
+    result = analyze(_UnmaterializedIndexTensorCosts, function, analysis="compute-cost")
+
+    (binary,) = [call for call in _calls(result.function) if isinstance(call.target, Binary)]
+    assert tuple(arg.type.shape for arg in binary.args) == ((1, 128), (128, 1))
+    assert all(arg.type.storage is StorageKind.UMAT for arg in binary.args)
+    record = get_metadata(binary, ComputeCostMetadata)
+    assert record is not None
+    assert record.traffic == (("rmem", TrafficBytes(read=2_048)),)
+    assert record.operands == (
+        TrafficBytes(read=1_024),
+        TrafficBytes(read=1_024),
+        TrafficBytes(write=2_048),
     )
 
 
@@ -625,6 +700,7 @@ def test_non_divisible_window_cost_is_a_full_tile_upper_bound() -> None:
 
 
 def test_a_sharded_shared_tile_fits_once_and_advises_on_its_peak() -> None:
+    """The H200 capacity is an input fact; the peak is two live tile lifetimes."""
     functions = {function.name: function for function in _SharedTile.functions}
     split = functions["split"]
     result = analyze(_SharedTile, split, analysis="memory")
@@ -633,10 +709,12 @@ def test_a_sharded_shared_tile_fits_once_and_advises_on_its_peak() -> None:
     assert record is not None
     smem = next(item for item in record.footprint if item.level == "smem")
     assert smem.capacity_bytes == 232_448
-    assert smem.peak_bytes == 422_400
-    assert max(item.bytes for item in record.lifetimes if item.level == "smem") == 211_200
+    largest_tile = max(item.bytes for item in record.lifetimes if item.level == "smem")
+    assert smem.peak_bytes == 2 * largest_tile
     assert any(
-        "smem peak is 422400 B" in note and "order-dependent" in note and "not a bound" in note
+        f"smem peak is {smem.peak_bytes} B" in note
+        and "order-dependent" in note
+        and "not a bound" in note
         for note in record.advisories
     )
 
@@ -650,20 +728,18 @@ def test_memory_footprints_follow_the_owner_recorded_by_the_target() -> None:
     gmem = get_metadata(result.function, MemoryMetadata)
     assert gmem is not None
     gmem_lifetimes = {item.binding: item.bytes for item in gmem.lifetimes if item.level == "gmem"}
-    assert gmem_lifetimes["v0"] == gmem_lifetimes["lhs"] == 4_325_376
+    assert gmem_lifetimes["v0"] == gmem_lifetimes["lhs"]
 
     shared = next(fn for fn in _SharedTile.functions if fn.name == "split")
     result = analyze(_SharedTile, shared, analysis="memory")
     cta_owned = get_metadata(result.function, MemoryMetadata)
     assert cta_owned is not None
-    assert (
-        next(
-            item.bytes
-            for item in cta_owned.lifetimes
-            if item.binding == "v0" and item.level == "smem"
-        )
-        == 211_200
+    local_bytes = next(
+        item.bytes
+        for item in cta_owned.lifetimes
+        if item.binding == "v0" and item.level == "smem"
     )
+    assert local_bytes == tensor_bytes(shared.params[0].type) // _SharedTile.topologies[0].size
 
     thread_shared = _entry(_modest_shared)
     result = analyze(_modest_shared, thread_shared, analysis="memory")
@@ -675,7 +751,7 @@ def test_memory_footprints_follow_the_owner_recorded_by_the_target() -> None:
             for item in still_cta_owned.lifetimes
             if item.binding == "v0" and item.level == "smem"
         )
-        == 4_096
+        == tensor_bytes(thread_shared.params[0].type)
     )
 
     registers = _entry(_thread_sharded)
@@ -690,6 +766,129 @@ def test_memory_footprints_follow_the_owner_recorded_by_the_target() -> None:
         )
         == 8
     )
+
+
+def test_analysis_snapshot_drift_sentinel() -> None:
+    """Intentional current-output snapshot; change it only with model review."""
+    functions = {function.name: function for function in _MatmulLayouts.functions}
+    matmul_records = []
+    split_result = None
+    for function in (functions["plain"], functions["split"], functions["broadcast"]):
+        result = analyze(_MatmulLayouts, function, analysis="roofline")
+        if function is functions["split"]:
+            split_result = result
+        call = _calls(result.function)[-1]
+        matmul_records.append(
+            (
+                get_metadata(call, ComputeCostMetadata),
+                get_metadata(call, RooflineMetadata),
+            )
+        )
+    plain_cost, plain_bound = matmul_records[0]
+    split_cost, _split_bound = matmul_records[1]
+
+    shared = next(function for function in _SharedTile.functions if function.name == "split")
+    shared_result = analyze(_SharedTile, shared, analysis="memory")
+    shared_record = get_metadata(shared_result.function, MemoryMetadata)
+    assert shared_record is not None
+    shared_smem = shared_record.level("smem")
+    assert shared_smem is not None
+
+    assert split_result is not None
+    gmem = get_metadata(split_result.function, MemoryMetadata)
+    assert gmem is not None
+    gmem_lifetimes = {
+        item.binding: item.bytes for item in gmem.lifetimes if item.level == "gmem"
+    }
+
+    modest = _entry(_modest_shared)
+    modest_result = analyze(_modest_shared, modest, analysis="memory")
+    modest_record = get_metadata(modest_result.function, MemoryMetadata)
+    assert modest_record is not None
+    modest_local = next(
+        item.bytes
+        for item in modest_record.lifetimes
+        if item.binding == "v0" and item.level == "smem"
+    )
+
+    placed = []
+    placed_traffic = []
+    for dims in ({"ctx": 1024, "seq": 1}, {"ctx": 1, "seq": 1024}):
+        result = analyze(
+            PrefillDecodeAttention,
+            PrefillDecodeAttention.entry_function(),
+            analysis="roofline",
+            dims=dims,
+        )
+        record = get_metadata(result.function, RooflineMetadata)
+        assert record is not None
+        placed.append(record.ideal_ns)
+        placed_traffic.append(report(result)["totals"]["traffic"])
+
+    flash = analyze(
+        FlashSplitKDecode,
+        FlashSplitKDecode.entry_function(),
+        analysis="roofline",
+        dims={"ctx": 4096},
+    )
+    flash_slices = tuple(
+        get_metadata(expr, ComputeCostMetadata).traffic
+        for expr in postorder(flash.function.body)
+        if isinstance(expr, Call) and isinstance(expr.target, Slice)
+    )
+
+    snapshot = {
+        "matmul_flops": plain_cost.flops,
+        "matmul_split_flops_per_unit": split_cost.flops_per_unit,
+        "matmul_ideal_ns": plain_bound.ideal_ns,
+        "shared_peak_bytes": shared_smem.peak_bytes,
+        "shared_largest_tile_bytes": max(
+            item.bytes for item in shared_record.lifetimes if item.level == "smem"
+        ),
+        "gmem_lhs_bytes": gmem_lifetimes["lhs"],
+        "modest_shared_bytes": modest_local,
+        "placed_ideal_ns": tuple(placed),
+        "placed_traffic": tuple(placed_traffic),
+        "flash_split_traffic": report(flash)["totals"]["traffic"],
+        "flash_split_offset_slice_traffic": flash_slices,
+    }
+    assert snapshot == {
+        "matmul_flops": (("bf16", 28_547_481_600),),
+        "matmul_split_flops_per_unit": (("bf16", 216_268_800),),
+        "matmul_ideal_ns": 28_851,
+        "shared_peak_bytes": 422_400,
+        "shared_largest_tile_bytes": 211_200,
+        "gmem_lhs_bytes": 4_325_376,
+        "modest_shared_bytes": 4_096,
+        "placed_ideal_ns": (3_496, 65_447),
+        "placed_traffic": (
+            {
+                "gmem": {"read": 8_390_656, "write": 8_388_608},
+                "rmem": {"read": 17_256, "write": 0},
+                    "smem": {"read": 21_669_568, "write": 21_432_000},
+            },
+            {
+                "gmem": {"read": 4_194_304, "write": 8_388_608},
+                "rmem": {"read": 279_488, "write": 0},
+                    "smem": {"read": 794_492_928, "write": 484_114_432},
+            },
+        ),
+        "flash_split_traffic": {
+            "gmem": {"read": 2_132_480, "write": 35_328},
+            "rmem": {"read": 400, "write": 104},
+            "smem": {"read": 11_899_776, "write": 11_578_752},
+        },
+        "flash_split_offset_slice_traffic": (
+            (
+                ("gmem", TrafficBytes(read=0, write=0)),
+                    ("rmem", TrafficBytes(read=32, write=0)),
+            ),
+            (
+                ("gmem", TrafficBytes(read=0, write=0)),
+                    ("rmem", TrafficBytes(read=32, write=0)),
+            ),
+        ),
+    }
 
 
 def test_a_cache_too_small_is_advisory_and_only_where_the_scopes_agree() -> None:
