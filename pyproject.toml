@@ -17,7 +17,7 @@ dependencies = [
     "apache-tvm-ffi",
     "torch>=2.7",  # DType.f8e8m0 -> torch.float8_e8m0fnu, added in torch 2.7
     "graphviz>=0.20",
-    "transformers>=5.13",
+    "transformers>=5.13,<5.15",
     "ortools>=9.15",
 ]
 classifiers = [
@@ -35,8 +35,15 @@ Repository = "https://github.com/tile-ai/TileFoundry"
 tilefoundry = "tilefoundry.cli:main"
 
 [project.optional-dependencies]
-test = ["pytest>=8", "pytest-xdist>=3"]
-dev = ["pre-commit>=3", "ruff>=0.14", "setuptools>=68", "setuptools-scm>=8"]
+test = ["pytest>=8", "pytest-xdist>=3", "pytest-cov>=7"]
+dev = ["pre-commit>=3", "ruff>=0.14", "clang-format==18.1.8", "setuptools>=68", "setuptools-scm>=8"]
+
+[tool.coverage.run]
+branch = true
+source = ["tilefoundry"]
+
+[tool.coverage.report]
+skip_empty = true
 
 [tool.setuptools_scm]
 

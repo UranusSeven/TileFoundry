@@ -13,6 +13,7 @@ concurrency:
 
 permissions:
   contents: read
+  id-token: write
 
 defaults:
   run:
@@ -22,38 +23,102 @@ jobs:
   ci:
     runs-on: [self-hosted, tilefoundry]
     container: tilefoundry-ci-runner:local
+    env:
+      UV_CACHE_DIR: /__w/uv-cache
+      UV_NO_PROGRESS: "1"
     steps:
       - uses: actions/checkout@v4
       - name: Prepare the project environment
         run: |
-          python -m venv --system-site-packages .venv
-          .venv/bin/python -m pip install \
+          mkdir -p test_results
+          uv venv --clear --no-project --python /usr/local/bin/python3.12 .venv
+          uv pip compile --quiet --all-extras --generate-hashes \
+            --python .venv/bin/python pyproject.toml \
+            -o test_results/requirements.txt
+          uv pip compile --quiet --generate-hashes \
+            --python .venv/bin/python pyproject.toml \
+            -o test_results/requirements-runtime.txt
+          uv pip sync --python .venv/bin/python \
+            --require-hashes test_results/requirements.txt
+          uv pip install --python .venv/bin/python \
             --no-deps --no-build-isolation --editable .
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "LD_LIBRARY_PATH=$PWD/.venv/lib:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
       - name: Run pre-commit
-        run: .venv/bin/python -m pre_commit run --all-files
+        run: pre-commit run --all-files
       - name: Link CUTLASS headers
         run: |
           mkdir -p third_party/cutlass
           ln -sfnT /opt/cutlass/include third_party/cutlass/include
       - name: Run tests
-        run: .venv/bin/python -m pytest tests/ -n 4
-      - name: Build the wheel
+        env:
+          COVERAGE_FILE: test_results/.coverage
         run: |
-          mkdir -p "$RUNNER_TEMP/wheel"
-          .venv/bin/python -m pip wheel . --no-deps --no-build-isolation \
-            --wheel-dir "$RUNNER_TEMP/wheel"
+          pytest tests/ -n 4 \
+            --cov=tilefoundry --cov-branch --cov-context=test \
+            --cov-report=xml:test_results/coverage-source.xml --cov-report=
+      - name: Build the wheel
+        run: uv build --wheel --out-dir "$RUNNER_TEMP/wheel"
       - name: Install the wheel into a clean environment
         run: |
-          python -m venv --system-site-packages .wheel-venv
-          .wheel-venv/bin/python -m pip install --no-deps \
-            "$RUNNER_TEMP"/wheel/tilefoundry-*.whl
+          uv venv --clear --no-project --python /usr/local/bin/python3.12 .wheel-venv
+          uv pip sync --python .wheel-venv/bin/python \
+            --require-hashes test_results/requirements-runtime.txt
+          uv pip install --python .wheel-venv/bin/python \
+            --no-deps "$RUNNER_TEMP"/wheel/tilefoundry-*.whl
       - name: Verify the installed surface
         run: |
-          TF_SMOKE_VENV="$PWD/.wheel-venv" \
-            .wheel-venv/bin/python -m pytest tests/installed \
-            -o python_files='smoke_*.py' -q -n 8
+          export LD_LIBRARY_PATH="$PWD/.wheel-venv/lib:$LD_LIBRARY_PATH"
+          uv pip install --python .wheel-venv/bin/python --no-deps \
+            --constraint test_results/requirements.txt coverage pytest-cov
+          cat > test_results/coveragerc-installed <<EOF
+          [run]
+          branch = True
+          parallel = True
+          source = tilefoundry
+          data_file = $PWD/test_results/.coverage-installed
+
+          [paths]
+          package =
+              $PWD/src/tilefoundry
+              $PWD/.wheel-venv/lib/*/site-packages/tilefoundry
+          EOF
+          COVERAGE_PROCESS_START="$PWD/test_results/coveragerc-installed" \
+            TF_SMOKE_VENV="$PWD/.wheel-venv" \
+            pytest tests/installed -o python_files='smoke_*.py' -q -n 8
+          coverage combine --rcfile=test_results/coveragerc-installed
+          coverage xml --rcfile=test_results/coveragerc-installed \
+            -o test_results/coverage-installed.xml
       - name: Decode the published checkpoint with the shipped source
         run: |
+          export LD_LIBRARY_PATH="$PWD/.wheel-venv/lib:$LD_LIBRARY_PATH"
           .wheel-venv/bin/python tests/installed/qwen3_1_7b_l3.py \
             --venv "$PWD/.wheel-venv" \
             --work "$RUNNER_TEMP/l3"
+      - name: Publish the coverage report
+        if: always()
+        run: |
+          if [ -f test_results/.coverage ]; then
+            coverage html --show-contexts -d test_results/htmlcov \
+              --data-file=test_results/.coverage
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: test_results/
+          if-no-files-found: ignore
+      - uses: codecov/codecov-action@v5
+        if: always() && !github.event.pull_request.head.repo.fork && hashFiles('test_results/coverage-source.xml') != ''
+        with:
+          use_oidc: true
+          files: test_results/coverage-source.xml
+          flags: source
+          disable_search: true
+      - uses: codecov/codecov-action@v5
+        if: always() && !github.event.pull_request.head.repo.fork && hashFiles('test_results/coverage-installed.xml') != ''
+        with:
+          use_oidc: true
+          files: test_results/coverage-installed.xml
+          flags: installed
+          disable_search: true
