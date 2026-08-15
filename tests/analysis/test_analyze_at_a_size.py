@@ -19,6 +19,7 @@ import pytest
 from tests.fixtures.placed.flash_split_k_decode import BLOCK, HEADS, WORKERS, FlashSplitKDecode
 from tests.fixtures.placed.gqa_decode import MAX_CTX, GqaOnline
 from tests.fixtures.placed.prefill_decode_attention import PrefillDecodeAttention
+from tests.fixtures.placed.qwen3_1_7b_pd import PrefillLayer
 from tests.models.qwen3_1_7b.case import CASE as QWEN3_1_7B
 from tilefoundry.analysis import (
     ComputeCostMetadata,
@@ -65,6 +66,7 @@ from tilefoundry.target import CudaTarget
 CONTEXT = 32
 DIMS = {"ctx_len": CONTEXT}
 FAMILIES = ("compute-cost", "memory", "roofline", "timeline")
+QWEN3_PD_FAMILIES = ("compute-cost", "memory", "roofline")
 
 
 SOLVER = ScheduleOptions(timeout_seconds=60, workers=4, random_seed=0, stop_at_first_solution=True)
@@ -91,6 +93,37 @@ def test_every_analysis_runs_at_a_stated_size(family: str) -> None:
 
     assert result.metadata_types
     assert result.module is module
+
+
+@pytest.mark.parametrize(
+    ("dims", "expected_bound"),
+    (
+        ({"ctx_len": 0, "seq": 512}, "compute"),
+        ({"ctx_len": 512, "seq": 512}, "compute"),
+        ({"ctx_len": 4608, "seq": 1}, "memory"),
+    ),
+    ids=[
+        "qwen3-pd-prefill-no-context",
+        "qwen3-pd-prefill-with-context",
+        "qwen3-pd-decode-context",
+    ],
+)
+def test_qwen3_pd_fixture_runs_all_analysis_families(
+    dims: dict[str, int], expected_bound: str
+) -> None:
+    result = analyze(
+        PrefillLayer,
+        PrefillLayer.entry_function(),
+        analysis=QWEN3_PD_FAMILIES,
+        dims=dims,
+    )
+
+    assert ComputeCostMetadata in result.metadata_types
+    assert MemoryMetadata in result.metadata_types
+    assert RooflineMetadata in result.metadata_types
+    assert result.module is PrefillLayer
+    roofline = get_metadata(result.function, RooflineMetadata)
+    assert roofline is not None and roofline.bound_by == expected_bound
 
 
 @pytest.mark.parametrize(
