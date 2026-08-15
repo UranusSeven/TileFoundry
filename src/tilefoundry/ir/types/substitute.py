@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from tilefoundry.ir.core.expr import Call, Constant
 
 from .dim import _DIM_OP_TYPES, DimVar, simplify_dim
+from .dim_isl import normalize_dim
 from .tensor_type import TensorType, TupleType, Type
 
 
@@ -132,6 +133,85 @@ def substitute_dims(value: Type, bindings: Mapping[str, int]) -> Type:
     return value
 
 
+def canonicalize_dims(value: Type) -> Type:
+    """Return *value* with every symbolic dimension in isl normal form."""
+    if not has_symbolic_dims(value):
+        return value
+    if isinstance(value, TensorType):
+        shape = tuple(normalize_dim(entry) for entry in value.shape)
+        layout = _canonicalize_layout_dims(value.layout)
+        if shape == value.shape and layout is value.layout:
+            return value
+        return TensorType(
+            shape=shape,
+            dtype=value.dtype,
+            layout=layout,
+            storage=value.storage,
+        )
+    if isinstance(value, TupleType):
+        fields = tuple(canonicalize_dims(field) for field in value.fields)
+        if fields == value.fields:
+            return value
+        return TupleType(fields=fields)
+    return value
+
+
+def _canonicalize_layout_dims(layout: object) -> object:
+    if layout is None:
+        return layout
+    Layout, ComposedLayout, ShardLayout, _, _ = _shard_types()
+    if isinstance(layout, ShardLayout):
+        inner = _canonicalize_layout_dims(layout.layout)
+        mesh = _canonicalize_mesh_dims(layout.mesh)
+        if inner is layout.layout and mesh is layout.mesh:
+            return layout
+        return ShardLayout(layout=inner, attrs=layout.attrs, mesh=mesh)
+    if isinstance(layout, ComposedLayout):
+        outer = _canonicalize_layout_dims(layout.outer)
+        inner = _canonicalize_layout_dims(layout.inner)
+        offset = normalize_dim(layout.offset)
+        if outer is layout.outer and inner is layout.inner and offset == layout.offset:
+            return layout
+        return ComposedLayout(inner=inner, offset=offset, outer=outer)
+    if isinstance(layout, Layout):
+        shape = _canonicalize_nested(layout.shape)
+        strides = None if layout.strides is None else _canonicalize_nested(layout.strides)
+        if shape == layout.shape and strides == layout.strides:
+            return layout
+        return Layout(shape=shape, strides=strides)
+    return layout
+
+
+def canonicalize_topology_dims(topology: object) -> object:
+    _, _, _, _, Topology = _shard_types()
+    if not isinstance(topology, Topology):
+        return topology
+    size = normalize_dim(topology.size)
+    if size == topology.size:
+        return topology
+    return Topology(topology.name, size)
+
+
+def _canonicalize_mesh_dims(mesh: object) -> object:
+    _, _, _, Mesh, _ = _shard_types()
+    if not isinstance(mesh, Mesh):
+        return mesh
+    topologies = tuple(canonicalize_topology_dims(item) for item in mesh.topologies)
+    layout = _canonicalize_layout_dims(mesh.layout)
+    if topologies == mesh.topologies and layout is mesh.layout:
+        return mesh
+    return Mesh(topologies=topologies, layout=layout, names=mesh.names)
+
+
+def _canonicalize_nested(entries: tuple) -> tuple:
+    return tuple(
+        _canonicalize_nested(entry)
+        if isinstance(entry, tuple)
+        else (None if entry is None else normalize_dim(entry))
+        for entry in entries
+    )
+
+
 def substitute_layout_dims(layout: object, bindings: Mapping[str, int]) -> object:
     """*layout* with its bound dimensions replaced.
 
@@ -224,7 +304,7 @@ def substitute_shape_dim(entry: object, bindings: Mapping[str, int]) -> object:
         args = tuple(substitute_shape_dim(arg, bindings) for arg in entry.args)
         if args == tuple(entry.args):
             return entry
-        folded = simplify_dim(type(entry.target), args)
+        folded = normalize_dim(simplify_dim(type(entry.target), args))
 
         if isinstance(folded, Constant) and isinstance(folded.value, int):
             return int(folded.value)
@@ -281,6 +361,8 @@ def has_symbolic_dims(value: object) -> bool:
 
 __all__ = [
     "DimSubstitutionError",
+    "canonicalize_dims",
+    "canonicalize_topology_dims",
     "dim_vars_by_name",
     "dim_vars_in",
     "has_symbolic_dims",

@@ -619,11 +619,12 @@ their input when it states one. An input with `layout=None` produces a view with
   the registered relation.
 - `Slice` is normalized as `Slice(x, starts, sizes=..., strides=...)`.
   `starts` is a tuple of rank-0 integer operands; `sizes` and `strides` are
-  `ShapeDim` attributes. Its result shape is exactly `sizes` and MUST NOT contain
-  an induction `Var`. A start MAY be dim arithmetic over an induction `Var` — a
-  window moved off that loop's window by a compile-time offset. That start is an
-  address computed where it is read, not a value some op produces, so a walk over
-  compute ops MUST leave it alone.
+  `ShapeDim` attributes stored in the same IR normal form as every other dim.
+  Its result shape is exactly the normalized `sizes` and MUST NOT contain an
+  induction `Var`. A start MAY be dim arithmetic over an induction `Var` — a window moved off that
+  loop's window by a compile-time offset. That start is an address computed where
+  it is read, not a value some op produces, so a walk over compute ops MUST leave
+  it alone.
 - A plain-layout `Slice` with static starts MUST produce a `ComposedLayout`: its
   offset is the source offset plus the starts multiplied by the source strides,
   and its outer layout carries the sliced shape and retained strides (multiplied
@@ -892,8 +893,16 @@ class Reshape(Op):
   - A plain C-order input reshapes to a C-order `Layout` over `new_shape`. An
     input with no assigned layout, or a non-contiguous plain input whose regroup
     cannot be expressed, has a `None` result layout.
-  - A fully-`Broadcast` `ShardLayout` input (every attr `Broadcast`, no genuine
-    sharding) reshapes to a plain (unsharded) output.
+  - A bare, fully-`Broadcast` `ShardLayout` input (every attr `Broadcast`, no
+    genuine sharding) carries that `ShardLayout` through `Reshape` when the
+    input layout positions can express `new_shape` by the view rules below.
+    When they cannot (including while either layout shape is symbolic), the
+    result layout is `None` and no error is raised because no genuine ownership
+    is discarded. This rule does not extend to a `ComposedLayout` whose outer
+    layout is a `ShardLayout`; that input follows the generic composed-layout
+    rule and may produce a `None` layout.
+  - A non-genuinely-sharded `UMAT` input reshaped to `()` remains the early
+    scalar case and produces a plain `UMAT` scalar.
   - A genuine `ShardLayout` input (at least one non-`Broadcast` attr) carries
     through `Reshape` when the reshape is expressible as a view over the
     input's layout positions (`layout.layout.shape`, [shard §7.1.1](./shard.md#711-layoutshape)):
@@ -913,8 +922,9 @@ class Reshape(Op):
     block spans a boundary deeper than one divide, or two or more
     `Split`-bound positions interacting across the same regroup — is not yet
     supported and MUST fail closed.
-  - A reshape not expressible by the above MUST fail closed rather than
-    fabricate a layout.
+  - A reshape of a genuine `ShardLayout` not expressible by the above MUST fail
+    closed rather than fabricate or discard a layout. An unexpressible bare,
+    fully-`Broadcast` `ShardLayout` instead follows the `None`-layout rule above.
 
 ##### Cast
 ```python

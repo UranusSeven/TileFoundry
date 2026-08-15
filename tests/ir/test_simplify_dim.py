@@ -1,21 +1,19 @@
-"""Construction-time folding for dim arithmetic Calls.
-
-Folding is what makes a static shape one canonical value, so the boundaries are
-where it must *not* fold (a symbolic operand, a division by zero, a bool) and
-where the folded result must arrive as a plain ``int`` rather than a ``Constant``
-or a nested ``Call`` — two shapes that print and compare differently and produced
-a real broadcast failure.
-"""
+"""Construction and IR-boundary normalization for dimension arithmetic."""
 
 from __future__ import annotations
 
 import copy
 
+import pytest
+
+import tilefoundry.ir.types.dim_isl as dim_isl
+import tilefoundry.ir.types.substitute as dim_substitute
 from tilefoundry.ir.core import Tuple, TypeInferContext
 from tilefoundry.ir.core.expr import Call, Constant, Var
 from tilefoundry.ir.core.kinds import UnaryKind
 from tilefoundry.ir.hir._helpers import broadcast_shapes
 from tilefoundry.ir.hir.math.unary import Unary
+from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.types import DType, TensorType, TupleType
 from tilefoundry.ir.types.dim import (
@@ -29,6 +27,9 @@ from tilefoundry.ir.types.dim import (
     DimVar,
     simplify_dim,
 )
+from tilefoundry.ir.types.shard import ComposedLayout, Layout, Mesh, ShardLayout, Topology
+from tilefoundry.ir.types.shard.shard_layout import Broadcast
+from tilefoundry.visitor_registry.visitors import TypeInferVisitor
 
 
 def _i64(v: int) -> Constant:
@@ -48,43 +49,26 @@ def _sym(name: str) -> Call:
     )
 
 
-def test_simplify_dim_folds_all_constant_args() -> None:
-    """Test simplify dim folds all constant args.
-
-    When both args are int Constants, simplify_dim returns a folded
-    Constant with the canonical i64 dim type. Floor division follows Python
-    ``//`` (floor), not C truncation, which is the convention every tiling
-    expression is written against.
-    """
+def test_simplify_dim_only_constructs_constant_arithmetic() -> None:
     table = [
-        (DimAdd, 3, 4, 7),
-        (DimSub, 10, 4, 6),
-        (DimMul, 3, 4, 12),
-        (DimFloorDiv, 17, 4, 4),
-        (DimMod, 17, 5, 2),
-        (DimMin, 7, 3, 3),
-        (DimMax, 7, 3, 7),
-        (DimFloorDiv, -7, 2, -4),
+        (DimAdd, 3, 4),
+        (DimSub, 10, 4),
+        (DimMul, 3, 4),
+        (DimFloorDiv, 17, 4),
+        (DimMod, 17, 5),
+        (DimMin, 7, 3),
+        (DimMax, 7, 3),
+        (DimFloorDiv, -7, 2),
     ]
-    for op_cls, a, b, expected in table:
+    for op_cls, a, b in table:
         result = simplify_dim(op_cls, (_i64(a), _i64(b)))
-        assert isinstance(result, Constant), (
-            f"{op_cls.__name__}: expected Constant, got {type(result).__name__}"
-        )
-        assert result.value == expected
+        assert isinstance(result, Call)
+        assert isinstance(result.target, op_cls)
+        assert result.args == (_i64(a), _i64(b))
         assert result.type == TensorType.umat_scalar()
 
 
-def test_simplify_dim_refuses_to_fold_outside_all_int_constants() -> None:
-    """Three non-foldable inputs, in either operand position.
-
-    Three non-foldable inputs, in either operand position:
-    - a non-Constant arg (a symbolic DimVar Call): the Call survives with no
-      algebraic identity applied, so ``x + 0`` stays a Call;
-    - division by zero: folding to ``Constant(0)`` would mask a real bug, so the
-      Call survives for a later verify pass to flag;
-    - ``Constant(True)``: a bool is not an int dim value.
-    """
+def test_simplify_dim_constructs_symbolic_and_invalid_arithmetic() -> None:
     sym = _sym("M")
     for op_cls in (DimAdd, DimFloorDiv):
         for args in ((sym, _i64(0)), (_i64(0), sym)):
@@ -102,6 +86,116 @@ def test_simplify_dim_refuses_to_fold_outside_all_int_constants() -> None:
     bool_arg = simplify_dim(DimAdd, (b_true, _i64(1)))
     assert isinstance(bool_arg, Call)
     assert isinstance(bool_arg.target, DimAdd)
+
+
+def test_dim_call_arithmetic_is_pure_construction_in_both_directions() -> None:
+    seq = DimVar("S_chain", 1, 1024)
+    base = seq - 1
+
+    expressions = (
+        base + 8,
+        8 + base,
+        base - 8,
+        8 - base,
+        base * 8,
+        8 * base,
+        base // 8,
+        8 // base,
+        base % 8,
+        8 % base,
+    )
+
+    assert all(isinstance(expr, Call) for expr in expressions)
+    assert [type(expr.target) for expr in expressions] == [
+        DimAdd,
+        DimAdd,
+        DimSub,
+        DimSub,
+        DimMul,
+        DimMul,
+        DimFloorDiv,
+        DimFloorDiv,
+        DimMod,
+        DimMod,
+    ]
+
+
+def test_non_dim_calls_do_not_gain_dimension_arithmetic() -> None:
+    tensor = TensorType.umat_tensor((8,), DType.f32)
+    value = Var(type=tensor, name="value")
+    ordinary = Call(
+        type=tensor,
+        target=Unary(kind=UnaryKind.NEG),
+        args=(value,),
+    )
+    operations = (
+        lambda: ordinary + 1,
+        lambda: 1 + ordinary,
+        lambda: ordinary - 1,
+        lambda: 1 - ordinary,
+        lambda: ordinary * 1,
+        lambda: 1 * ordinary,
+        lambda: ordinary // 1,
+        lambda: 1 // ordinary,
+        lambda: ordinary % 1,
+        lambda: 1 % ordinary,
+    )
+
+    for operation in operations:
+        with pytest.raises(TypeError):
+            operation()
+
+
+def test_typeinfer_canonicalizes_equivalent_symbolic_shapes() -> None:
+    seq = DimVar("S_canonical", 1, 8193)
+    verbose = simplify_dim(
+        DimFloorDiv,
+        (
+            simplify_dim(
+                DimAdd,
+                (simplify_dim(DimSub, (simplify_dim(DimAdd, (seq, 0)), 0)), 0),
+            ),
+            1,
+        ),
+    )
+    def layout(dim):
+        return ComposedLayout(
+            inner=Layout(shape=(dim,), strides=(dim,)),
+            offset=dim,
+            outer=ShardLayout(
+                layout=Layout(shape=(dim,), strides=(dim,)),
+                attrs=(Broadcast(),),
+                mesh=Mesh(
+                    topologies=(Topology("cta", dim),),
+                    layout=Layout(shape=(dim,), strides=(1,)),
+                ),
+            ),
+        )
+
+    verbose_type = TensorType(
+        shape=(verbose, 128), dtype=DType.f32, layout=layout(verbose), storage="gmem"
+    )
+    direct_type = TensorType(
+        shape=(seq, 128), dtype=DType.f32, layout=layout(seq), storage="gmem"
+    )
+
+    inferred = TypeInferVisitor(TypeInferContext()).visit(Var(type=verbose_type, name="verbose"))
+
+    assert inferred == direct_type
+    assert inferred.shape[0] is seq
+
+
+def test_static_typeinfer_does_not_enter_dim_canonicalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    static = TensorType(shape=(8, 128), dtype=DType.f32, layout=None, storage="gmem")
+
+    def fail_if_called(_):
+        raise AssertionError("static types must not enter isl canonicalization")
+
+    monkeypatch.setattr(dim_substitute, "normalize_dim", fail_if_called)
+
+    assert TypeInferVisitor(TypeInferContext()).visit(Var(type=static, name="static")) is static
 
 
 def test_a_fully_static_dim_has_one_canonical_int_representation() -> None:
@@ -148,6 +242,26 @@ def test_a_fully_static_dim_has_one_canonical_int_representation() -> None:
         )
     assert sliced.shape == param.shape == (1, 4, 32, 128)
     assert broadcast_shapes(sliced.shape, param.shape) == (1, 4, 32, 128)
+
+
+def test_constant_dim_arithmetic_normalizes_when_stored_as_an_op_attribute() -> None:
+    constructed = simplify_dim(DimMul, (4, 2))
+    assert isinstance(constructed, Call)
+
+    reshape = Reshape(new_shape=(constructed, 16))
+
+    assert reshape.new_shape == (8, 16)
+
+
+def test_static_op_attributes_do_not_enter_dim_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(_):
+        raise AssertionError("static attributes must not enter isl normalization")
+
+    monkeypatch.setattr(dim_isl, "normalize_dim", fail_if_called)
+
+    assert Reshape(new_shape=(8, 16)).new_shape == (8, 16)
 
 
 def test_unary_propagates_dim_var_in_shape() -> None:

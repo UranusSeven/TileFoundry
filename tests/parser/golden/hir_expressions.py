@@ -17,8 +17,8 @@ class HirExpressions:
     @func
     def dim_from_a_static_call(
         x: Tensor[(CTX_LEN,), "bf16"]
-    ) -> Tensor[(ceildiv(CTX_LEN, 128) * 128,), "bf16"]:
-        v0 = zeros(shape=(ceildiv(CTX_LEN, 128) * 128,), dtype="bf16", storage=gmem)
+    ) -> Tensor[((128 * ((CTX_LEN - 1) // 128)) + 128,), "bf16"]:
+        v0 = zeros(shape=((128 * ((CTX_LEN - 1) // 128)) + 128,), dtype="bf16", storage=gmem)
         return v0
 
     @func
@@ -141,6 +141,15 @@ class HirExpressions:
         v2 = 1
         v4 = x[:, :, 1:10:3]
         return v4
+
+    @func
+    def slice_to_symbolic_extents(
+        x: Tensor[(CTX_LEN, 128), "f32"]
+    ) -> Tensor[(CTX_LEN, 128), "f32"]:
+        v0 = 0
+        v1 = 0
+        v3 = x[:, :]
+        return v3
 
     @func
     def full_tile_window(

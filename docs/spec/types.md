@@ -491,10 +491,22 @@ def ceildiv(a, b) -> Expr:
   - `DimVar` identity MUST be canonical per `(name, lo, hi)`. Same-name
     dimensions in one function signature MUST agree on bounds.
   - Producers of arithmetic dimension calls MUST route construction through
-    `simplify_dim`.
-  - `simplify_dim` MUST fold two integer-valued constant operands, except
-    division or modulo by zero; otherwise it MUST retain the canonical call.
-    It MUST NOT perform algebraic identity folding.
+    `simplify_dim`. A `DimVar` and the `Call` produced by dimension arithmetic
+    both support continued `+`, `-`, `*`, `//`, and `%` construction, including
+    the reflected forms. Other `Call` values do not support this arithmetic.
+  - `simplify_dim` MUST only construct dimension arithmetic: it wraps raw integer
+    operands as integer `Constant` values and rejects boolean operands, but MUST
+    NOT fold constants or apply algebraic identities.
+  - Every dimension stored in an IR type or op attribute MUST use the one
+    `normalize_dim` isl affine normal form. This covers function signatures,
+    inferred types, layouts, topology and mesh entries, and op attributes; it
+    does not cover dimension expressions used as `Expr` operands, such as a
+    `Slice` start address. All-constant expressions normalize to plain Python
+    integers. Runtime scalar `Var` leaves MUST be represented by object identity,
+    not name, so repeated uses of one value can cancel without conflating
+    distinct same-named values. Normalization MUST NOT apply `DimVar` envelope
+    bounds. Expressions outside the affine subset or not decodable as one
+    `ShapeDim` MUST remain unchanged.
   - `is_dim_expr` MUST accept non-boolean integers, `DimVar`, integer-valued
     `Constant`, and recursively valid calls to the seven dimension arithmetic
     operations, and MUST reject other values.
