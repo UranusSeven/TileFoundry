@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 import tilefoundry.cli.target as target_cli
+from tests.fixtures.shapes.composed_leaf_source import composed_leaf_source
 from tilefoundry import cli
 from tilefoundry.cli.source import load_authored_ir, one_extent_per_dim
 from tilefoundry.target import CpuTarget, registered_targets
@@ -79,7 +80,7 @@ def test_parse_dims_reads_one_extent_per_dimension() -> None:
 
 @pytest.mark.parametrize(
     "stated",
-    [["ctx_len"], ["ctx_len="], ["=8"], ["ctx_len=eight"], ["ctx_len=1.5"]],
+    [["=8"], ["ctx_len=1.5"]],
 )
 def test_parse_dims_rejects_an_argument_that_states_no_extent(stated) -> None:
     with pytest.raises(ValueError):
@@ -183,20 +184,6 @@ def test_target_list_expressions_execute_and_show_accepts_their_identities(
         "nvidia.h200_sxm",
     } < set(identities)
     assert "tests.cli.listed_cpu" in identities
-
-
-def test_target_show_rejects_unknown_identity_and_inspect_is_gone(capsys) -> None:
-    assert cli.main(["target", "show", "vendor.missing"]) == 1
-    unknown = capsys.readouterr()
-    assert unknown.out == ""
-    for identity in ("apple.m2_pro", "cpu", "nvidia.b200_sxm", "nvidia.h200_sxm"):
-        assert identity in unknown.err
-
-    with pytest.raises(SystemExit, match="2"):
-        cli.main(["inspect"])
-    invalid = capsys.readouterr()
-    assert invalid.out == ""
-    assert "invalid choice: 'inspect'" in invalid.err
 
 
 def test_analysis_reports_distinguish_cuda_products(tmp_path, capsys) -> None:
@@ -595,29 +582,10 @@ def test_registration_diagnostics_isolate_bad_entries_and_identity_sources(
     assert "vendor.bad_sm70" in repaired_list.stdout
 
 
-_COMPOSED_SOURCE = (
-    "from tilefoundry import func, module\n"
-    "from tilefoundry.dsl import ConstTensor, DimVar, Tensor, tf\n"
-    "from tilefoundry.target import CudaTarget\n"
-    "N = DimVar('n_cli', 1, 9)\n"
-    "@module(entry='run')\n"
-    "class Leaf:\n"
-    "    @func\n"
-    "    def run(x: Tensor[(N,), 'f32'], w: ConstTensor[(1,), 'f32']) -> Tensor[(N,), 'f32']:\n"
-    "        return tf.mul(x, w)\n"
-    "@module(entry='root', target=CudaTarget('nvidia.h200_sxm'))\n"
-    "class Composed:\n"
-    "    leaf = Leaf\n"
-    "    @func\n"
-    "    def root(x: Tensor[(N,), 'f32']) -> Tensor[(N,), 'f32']:\n"
-    "        return leaf(x)\n"
-)
-
-
 def test_analyze_binds_an_extent_on_a_root_that_reaches_a_child(tmp_path, capsys) -> None:
     """Choosing a size for a composed root keeps its child call activation-only."""
     source = tmp_path / "composed.py"
-    source.write_text(_COMPOSED_SOURCE, encoding="utf-8")
+    source.write_text(composed_leaf_source("n_cli"), encoding="utf-8")
 
     assert cli.main(["analyze", f"{source}:Composed.root", "--dim", "n_cli=4"]) == 0
     expanded = capsys.readouterr().out

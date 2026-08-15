@@ -14,53 +14,25 @@ from __future__ import annotations
 
 import pytest
 
-from tilefoundry import func
-from tilefoundry.dsl import Tensor
+from tests.fixtures.shapes.matmul_programs import (
+    cuda_bf16_gemm as bf16_gemm,
+)
+from tests.fixtures.shapes.matmul_programs import (
+    cuda_f32_gemm as f32_gemm,
+)
+from tests.fixtures.shapes.matmul_programs import (
+    cuda_odd_m_bf16_gemm as odd_shape_bf16_gemm,
+)
+from tests.fixtures.shapes.matmul_programs import (
+    gemm_rms_norm,
+)
 from tilefoundry.dsl.tf import *  # noqa: F401,F403 -- matmul/rms_norm resolved dynamically
 from tilefoundry.ir.tir.cuda.nn.mma import SM80_16x8x16_F32BF16BF16F32_TN
 from tilefoundry.ir.tir.cuda.nn.mma_atom import MmaAtom
 from tilefoundry.ir.types import DType
 from tilefoundry.schedule.facts import AtomFact
-from tilefoundry.target import CpuTarget, CudaTarget
+from tilefoundry.target import CpuTarget
 from tilefoundry.target.cuda.atoms import candidate_atoms
-
-
-@func(target=CudaTarget("nvidia.h200_sxm"))
-def bf16_gemm(
-    x: Tensor[(64, 128), "bf16"],
-    w: Tensor[(128, 64), "bf16"],
-) -> Tensor[(64, 64), "bf16"]:
-    h = matmul(x, w)
-    return h
-
-
-@func(target=CudaTarget("nvidia.h200_sxm"))
-def f32_gemm(
-    x: Tensor[(64, 128), "f32"],
-    w: Tensor[(128, 64), "f32"],
-) -> Tensor[(64, 64), "f32"]:
-    h = matmul(x, w)
-    return h
-
-
-@func(target=CudaTarget("nvidia.h200_sxm"))
-def odd_shape_bf16_gemm(
-    x: Tensor[(15, 128), "bf16"],
-    w: Tensor[(128, 64), "bf16"],
-) -> Tensor[(15, 64), "bf16"]:
-    h = matmul(x, w)
-    return h
-
-
-@func
-def gemm_rmsnorm(
-    x: Tensor[(64, 128), "f32"],
-    w: Tensor[(128, 64), "f32"],
-    weight: Tensor[(64,), "f32"],
-) -> Tensor[(64, 64), "f32"]:
-    h = matmul(x, w)
-    y = rms_norm(h, weight)
-    return y
 
 
 def test_bf16_gemm_lists_the_sm80_atom_with_real_numbers():
@@ -119,11 +91,11 @@ def test_non_matmul_op_raises():
     """V1 supports a MatMul Call only.
 
     V1 supports a MatMul Call only; any other op (here RMSNorm, from
-    ``gemm_rmsnorm``'s body) raises a clear ``NotImplementedError`` rather
+    ``gemm_rms_norm``'s body) raises a clear ``NotImplementedError`` rather
     than silently returning ``[]``.
     """
     with pytest.raises(NotImplementedError):
-        candidate_atoms(gemm_rmsnorm.body)
+        candidate_atoms(gemm_rms_norm.body)
 
 
 def test_non_cuda_target_raises():

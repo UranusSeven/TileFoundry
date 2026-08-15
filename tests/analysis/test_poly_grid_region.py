@@ -12,15 +12,21 @@ from __future__ import annotations
 import isl
 import pytest
 
+from tests.fixtures.shapes.window_programs import (
+    WINDOW_SEQ as SEQ,
+)
+from tests.fixtures.shapes.window_programs import (
+    dynamic_tile_window_add,
+    moved_tile_window_add,
+    tile_window_add,
+    unspecialized_tile_window_add,
+)
 from tilefoundry import func
 from tilefoundry.analysis import extract
 from tilefoundry.analysis.poly import ExtractError
-from tilefoundry.dsl import DimVar, Tensor
+from tilefoundry.dsl import Tensor
 from tilefoundry.dsl.tf import *  # noqa: F401,F403 -- op names resolved dynamically
 from tilefoundry.schedule.kernel_schedule import build_schedule_tree
-
-SEQ = DimVar("seq", 4, 64)
-TILE = DimVar("tile_size", 2, 8)
 
 
 @func
@@ -58,46 +64,6 @@ def data_index_select(
     for i in range(8):
         selected = index_select(x, reshape(idx, new_shape=(1,)), dim=0)
         o = add(o, reshape(selected, new_shape=(4,)))
-    return o
-
-
-@func
-def full_windows(
-    x: Tensor[(10, 4), "f32"], seed: Tensor[(4, 4), "f32"]
-) -> Tensor[(4, 4), "f32"]:
-    o = add(seed, seed)
-    for i in tile(10, 4):
-        o = add(x[i, :], seed)
-    return o
-
-
-@func
-def dynamic_full_windows(
-    x: Tensor[(SEQ, 4), "f32"], seed: Tensor[(4, 4), "f32"]
-) -> Tensor[(4, 4), "f32"]:
-    o = add(seed, seed)
-    for i in tile(SEQ, 4):
-        o = add(x[i, :], seed)
-    return o
-
-
-@func
-def moved_windows(
-    x: Tensor[(12, 4), "f32"], seed: Tensor[(3, 4), "f32"]
-) -> Tensor[(3, 4), "f32"]:
-    o = add(seed, seed)
-    for i in tile(6, 3):
-        o = add(x[i + 6, :], seed)
-    return o
-
-
-@func
-def unspecialized_window_step(
-    x: Tensor[(10, 4), "f32"], seed: Tensor[(TILE, 4), "f32"]
-) -> Tensor[(TILE, 4), "f32"]:
-    o = add(seed, seed)
-    for i in tile(10, TILE):
-        o = add(x[i, :], seed)
     return o
 
 
@@ -227,7 +193,7 @@ def test_dynamic_extent_becomes_an_isl_parameter():
 
 
 def test_windowed_loop_analyzes_only_full_tiles_and_offsets_its_read():
-    tg = extract(full_windows)
+    tg = extract(tile_window_add)
     domain = _domains(tg)["Binary1"]
 
     assert domain.is_equal(
@@ -252,7 +218,7 @@ def test_a_moved_window_carries_its_offset_into_the_access_map():
     by that offset, so the offset belongs in the access map rather than in a
     separate statement -- the move is an address, not a computation.
     """
-    tg = extract(moved_windows)
+    tg = extract(moved_tile_window_add)
     domain = _domains(tg)["Binary1"]
 
     assert domain.is_equal(
@@ -271,7 +237,7 @@ def test_a_moved_window_carries_its_offset_into_the_access_map():
 
 
 def test_symbolic_extent_keeps_only_parameterized_full_windows():
-    domain = _domains(extract(dynamic_full_windows))["Binary1"]
+    domain = _domains(extract(dynamic_tile_window_add))["Binary1"]
 
     assert domain.is_equal(
         isl.set(
@@ -283,7 +249,7 @@ def test_symbolic_extent_keeps_only_parameterized_full_windows():
 
 def test_unspecialized_window_step_fails_closed():
     with pytest.raises(ExtractError, match="loop step.*not a static int"):
-        extract(unspecialized_window_step)
+        extract(unspecialized_tile_window_add)
 
 
 def test_data_dependent_index_select_fails_closed():
