@@ -1,10 +1,10 @@
 """How much work the authored program asks for.
 
-This family reads the program and nothing else. Flops come from each op's
-registered cost evaluator and bytes from the logical types its operands and
-result carry, so the record it leaves is the same on every backend. What that
-work costs in time is a separate question, asked by the roofline family against
-a target's rates.
+This family reads the program and nothing else. Flops and typed service come
+from each op's registered cost evaluator, so the record it leaves is the same on
+every backend. What that work moves is the memory family's half of the same
+declaration, and what it costs in time is a separate question again, asked
+against a target's rates.
 """
 
 from __future__ import annotations
@@ -12,54 +12,75 @@ from __future__ import annotations
 from tilefoundry.ir.core import Call, VerifyError
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
-from tilefoundry.ir.types import DType, Type
-from tilefoundry.ir.types.storage import StorageKind
+from tilefoundry.ir.types import DType
 from tilefoundry.target import Target
-from tilefoundry.visitor_registry.contexts import Cost, CostContext, FunctionScope
+from tilefoundry.visitor_registry.contexts import CostContext, FunctionScope
 from tilefoundry.visitor_registry.visitors import CostEvaluator
 
 from .errors import AnalysisError
-from .facts import ThroughputFacts
-from .metadata import ComputeCostMetadata, TrafficBytes
+from .facts import PerformanceServiceFacts, ThroughputFacts
+from .metadata import ComputeCostMetadata
 from .walk import (
     attach,
-    bytes_by_storage,
-    describe,
     enclosing_trips,
     postorder,
     reachable_functions,
-    tensor_types,
 )
 
 SELECTOR = "compute-cost"
-_UMAT_CONSUMPTION_LEVEL = str(StorageKind.RMEM)
 
 
 def _is_structural_occurrence(
     cost: ComputeCostMetadata,
-    facts: ThroughputFacts,
+    moved: "TrafficMetadata | None" = None,
+    *,
+    bandwidth_level: str | None = None,
 ) -> bool:
-    """Whether an occurrence has no work priced by the target's local rates."""
-    return all(not value for _name, value in cost.flops_per_unit) and not (
-        cost.traffic_per_unit_at(facts.bandwidth_level).total_bytes
+    """Whether an occurrence asks for nothing this model puts on a clock.
+
+    Only what could take time is counted: the flops, the typed service, and the
+    bytes at the one level a bandwidth is published for. Movement at any other
+    level is still movement and still recorded -- what it is not is work this
+    model can lay on a timeline, so it neither earns a duration nor asks for a
+    placement to be laid at. Having moved bytes and having timed work are
+    different questions, and this is the second one.
+    """
+    return (
+        all(not value for _name, value in cost.flops_per_unit)
+        and all(not value for _kind, value in cost.service_per_unit)
+        and not (
+            moved.per_unit_at(bandwidth_level).total_bytes
+            if moved is not None and bandwidth_level is not None
+            else 0
+        )
     )
 
 
 def _local_duration_ns(
     cost: ComputeCostMetadata,
     facts: ThroughputFacts,
+    services: PerformanceServiceFacts,
     *,
+    moved: "TrafficMetadata | None" = None,
     level: str,
     scale: int = 1,
 ) -> int:
-    """Price one occurrence's projected work against one unit's rates."""
-    if facts.rate_unit != level:
+    """Price one occurrence's projected work against one unit's throughputs.
+
+    Compute and movement overlap within one occurrence, so its duration is
+    whichever side takes longer. Work with no stated throughput is refused
+    rather than priced at nothing: a number with a hole in it reads as a program
+    that does less than it does. Movement at a level the target publishes no
+    bandwidth for is a different case -- it is stated and left untimed, because
+    a rate nobody published is not one this may invent.
+    """
+    if services.unit != level:
         raise AnalysisError(
-            f"timeline: selected topology level {level!r}, but the target's "
-            f"per-unit rates are stated for {facts.rate_unit!r}"
+            f"performance: selected topology level {level!r}, but the target's "
+            f"one-unit throughputs are stated for {services.unit!r}"
         )
 
-    if _is_structural_occurrence(cost, facts):
+    if _is_structural_occurrence(cost, moved, bandwidth_level=facts.bandwidth_level):
         return 0
 
     compute_ns = 0
@@ -68,137 +89,71 @@ def _local_duration_ns(
             continue
         dtype = getattr(DType, name, None)
         if dtype is None:
-            raise AnalysisError(f"timeline: unknown compute dtype {name!r}")
-        rate = facts.peak_per_unit_for(dtype)
-        if rate is None or rate <= 0:
+            raise AnalysisError(f"performance: unknown compute dtype {name!r}")
+        throughput = services.flops(dtype)
+        if throughput is None or throughput <= 0:
             raise AnalysisError(
-                f"timeline: target publishes no per-unit compute rate for "
+                f"performance: target states no one-unit throughput for "
                 f"dtype {name!r} at {level!r}"
             )
-        compute_ns += -(-(value * scale * 1_000_000_000) // rate)
+        compute_ns += -(-(value * scale * 1_000_000_000) // throughput)
 
-    traffic = cost.traffic_per_unit_at(facts.bandwidth_level)
-    moved = traffic.total_bytes * scale
-    if not moved:
-        unmodelled = tuple(
-            name
-            for name, value in cost.traffic_per_unit
-            if name != facts.bandwidth_level and value.total_bytes
-        )
-        if unmodelled:
-            names = ", ".join(repr(name) for name in unmodelled)
+    for kind, value in cost.service_per_unit:
+        if not value:
+            continue
+        throughput = services.ops(kind)
+        if throughput is None or throughput <= 0:
             raise AnalysisError(
-                f"timeline: occurrence traffic is only at unmodelled storage "
-                f"level(s) {names}; target bandwidth is stated for "
-                f"{facts.bandwidth_level!r}"
+                f"performance: target states no one-unit throughput for "
+                f"{kind!r} work at {level!r}"
             )
+        compute_ns += -(-(value * scale * 1_000_000_000) // throughput)
 
+    crossed = (
+        moved.per_unit_at(facts.bandwidth_level).total_bytes * scale
+        if moved is not None
+        else 0
+    )
     memory_ns = 0
-    if moved:
-        rate = facts.memory_bandwidth_bytes_per_second_per_unit
-        if rate is None or rate <= 0:
+    if crossed:
+        throughput = services.bandwidth(facts.bandwidth_level)
+        if throughput is None or throughput <= 0:
             raise AnalysisError(
-                f"timeline: target publishes no per-unit bandwidth for level "
+                f"performance: target states no one-unit throughput for level "
                 f"{facts.bandwidth_level!r} at {level!r}"
             )
-        memory_ns = -(-(moved * 1_000_000_000) // rate)
+        memory_ns = -(-(crossed * 1_000_000_000) // throughput)
     return max(compute_ns, memory_ns)
-
-
-def _call_movement(
-    call: Call,
-    cost: Cost,
-    operand_types: tuple[Type, ...] | None = None,
-) -> tuple[tuple[tuple[str, TrafficBytes], ...], tuple[TrafficBytes, ...]]:
-    """What each operand of *call* moves, and where those bytes are charged.
-
-    How much moves is the op's answer; which level it moves at is a function of
-    that operand's Type. *operand_types* supplies the projected types for the
-    per-unit reading.
-    Concrete leaves use their declared levels; a UMAT leaf gets the level at
-    which this call consumes it. The result is deliberately not a consuming
-    argument, even when it is UMAT.
-    """
-    operands = (*call.args, call)
-    types = operand_types or tuple(operand.type for operand in operands)
-    if len(cost.traffic) != len(operands):
-        raise AnalysisError(
-            f"{describe(call)}: cost reports {len(cost.traffic)} operands, "
-            f"the call has {len(operands)}"
-        )
-    reads: dict[str, int] = {}
-    writes: dict[str, int] = {}
-    charged: list[TrafficBytes] = []
-    if len(types) != len(operands):  # pragma: no cover - internal caller contract
-        raise AnalysisError("cost movement needs one projected type per operand")
-    for index, (type_, moved) in enumerate(zip(types, cost.traffic)):
-        is_call_arg = index < len(call.args)
-        has_umat = any(
-            tensor.storage is StorageKind.UMAT for tensor in tensor_types(type_)
-        )
-        by_level = bytes_by_storage(
-            type_,
-            umat_level=_UMAT_CONSUMPTION_LEVEL if is_call_arg else None,
-        )
-        charged.append(moved)
-        if len(by_level) == 1 and not has_umat:
-            (level,) = by_level
-            reads[level] = reads.get(level, 0) + moved.read
-            writes[level] = writes.get(level, 0) + moved.write
-            continue
-
-
-        for level, value in by_level.items():
-            if moved.read:
-                reads[level] = reads.get(level, 0) + value
-            if moved.write:
-                writes[level] = writes.get(level, 0) + value
-    levels = (
-        ()
-        if cost.bytes == 0
-        else tuple(
-            (level, TrafficBytes(reads.get(level, 0), writes.get(level, 0)))
-            for level in sorted(set(reads) | set(writes))
-        )
-    )
-    return levels, tuple(charged)
 
 
 def _flops(flops: dict) -> tuple[tuple[str, int], ...]:
     return tuple(sorted((dtype.name, value) for dtype, value in flops.items()))
 
 
-def _call_cost_record(
-    expr: Call,
-    whole: CostEvaluator,
-    local: CostEvaluator,
-) -> ComputeCostMetadata:
-    """Measure one Call without attaching the resulting record."""
+def _call_cost_record(expr: Call, whole: CostEvaluator, local: CostEvaluator) -> ComputeCostMetadata:
+    """Measure the work one Call asks for, without attaching the record.
+
+    Work only: what an occurrence moves is the memory family's answer, asked of
+    the same registered evaluator. One declaration, two readers.
+    """
     try:
         whole_cost = whole.visit(expr)
         local_cost = local.visit(expr)
     except (ValueError, VerifyError) as error:
         raise AnalysisError(str(error)) from None
-    traffic_by_level, operands = _call_movement(expr, whole_cost)
-    local_types = (
-        *(local.ctx.local_type_of(arg) for arg in expr.args),
-        local.ctx.local_output_type(expr),
-    )
-    local_traffic, _local_operands = _call_movement(expr, local_cost, local_types)
     return ComputeCostMetadata(
         flops=_flops(whole_cost.flops),
         flops_per_unit=_flops(local_cost.flops),
-        traffic=traffic_by_level,
-        traffic_per_unit=local_traffic,
-        operands=operands,
+        service=tuple(sorted(whole_cost.service.items())),
+        service_per_unit=tuple(sorted(local_cost.service.items())),
     )
 
 
 def _accumulate(
     flops: dict[str, int],
     flops_per_unit: dict[str, int],
-    traffic: dict[str, TrafficBytes],
-    traffic_per_unit: dict[str, TrafficBytes],
+    service: dict[str, int],
+    service_per_unit: dict[str, int],
     record: ComputeCostMetadata,
     trips: int,
 ) -> None:
@@ -206,18 +161,10 @@ def _accumulate(
         flops[name] = flops.get(name, 0) + value * trips
     for name, value in record.flops_per_unit:
         flops_per_unit[name] = flops_per_unit.get(name, 0) + value * trips
-    for level, value in record.traffic:
-        current = traffic.get(level, TrafficBytes())
-        traffic[level] = TrafficBytes(
-            current.read + value.read * trips,
-            current.write + value.write * trips,
-        )
-    for level, value in record.traffic_per_unit:
-        current = traffic_per_unit.get(level, TrafficBytes())
-        traffic_per_unit[level] = TrafficBytes(
-            current.read + value.read * trips,
-            current.write + value.write * trips,
-        )
+    for name, value in record.service:
+        service[name] = service.get(name, 0) + value * trips
+    for name, value in record.service_per_unit:
+        service_per_unit[name] = service_per_unit.get(name, 0) + value * trips
 
 
 def analyze_compute_cost(
@@ -237,30 +184,29 @@ def analyze_compute_cost(
         )
         flops: dict[str, int] = {}
         flops_per_unit: dict[str, int] = {}
-        traffic: dict[str, TrafficBytes] = {}
-        traffic_per_unit: dict[str, TrafficBytes] = {}
+        service: dict[str, int] = {}
+        service_per_unit: dict[str, int] = {}
         trips = enclosing_trips(fn.body)
         for expr in postorder(fn.body):
             if not isinstance(expr, Call):
                 continue
-            count = trips.get(id(expr), 1)
             record = _call_cost_record(expr, whole, local)
             attach(expr, record)
             _accumulate(
                 flops,
                 flops_per_unit,
-                traffic,
-                traffic_per_unit,
+                service,
+                service_per_unit,
                 record,
-                count,
+                trips.get(id(expr), 1),
             )
         attach(
             fn,
             ComputeCostMetadata(
                 flops=tuple(sorted(flops.items())),
                 flops_per_unit=tuple(sorted(flops_per_unit.items())),
-                traffic=tuple(sorted(traffic.items())),
-                traffic_per_unit=tuple(sorted(traffic_per_unit.items())),
+                service=tuple(sorted(service.items())),
+                service_per_unit=tuple(sorted(service_per_unit.items())),
             ),
         )
 

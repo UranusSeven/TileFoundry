@@ -20,12 +20,12 @@ from pathlib import Path
 import torch
 from safetensors.torch import save_file
 
-from tests.models.corpus import FunctionCase, ModelCase
+from tests.models.corpus import FunctionCase, ModelCase, states_execution_domain
 from tests.models.decode_oracle import one_ulp_at
 from tests.models.registry import cases_of
 
 LOGICAL_FAMILIES = ("compute-cost", "memory", "roofline")
-FAMILIES = (*LOGICAL_FAMILIES, "timeline")
+FAMILIES = (*LOGICAL_FAMILIES, "performance")
 
 
 SOLVER = ("--solver-timeout=60", "--solver-workers=4", "--first-plan")
@@ -106,9 +106,17 @@ def _compute_cost_evidence(report: dict) -> str | None:
 
 
 def _memory_evidence(report: dict) -> str | None:
-    """What `memory` must have measured: bytes moved, and per-binding lifetimes."""
+    """What `memory` must have measured: bytes moved, lifetimes, and addresses.
+
+    The bytes are the family's own record rather than a field of its footprint:
+    what a program moves and what it must hold at once are two answers, reported
+    as two.
+    """
     record = report["function_records"]["memory"]
-    gmem = record["traffic"]["gmem"]
+    placement = record.get("allocation")
+    if placement is None or placement["solver_status"] not in ("optimal", "feasible"):
+        return f"allocation is {placement!r}"
+    gmem = report["function_records"]["traffic"]["whole"]["gmem"]
     if not gmem.get("read", 0) > 0:
         return f"reported no gmem read ({gmem!r})"
     if not record["lifetimes"]:
@@ -126,16 +134,16 @@ def _roofline_evidence(report: dict) -> str | None:
     return None
 
 
-def _timeline_evidence(report: dict) -> str | None:
-    """What `timeline` must have laid out and scaled by physical capacity."""
-    record = report["function_records"]["timeline"]
-    if not record["local_makespan_ns"] > 0:
-        return f"local_makespan_ns is {record['local_makespan_ns']!r}"
+def _performance_evidence(report: dict) -> str | None:
+    """What `performance` must have laid out and scaled by physical capacity."""
+    record = report["function_records"]["performance"]
+    envelope = record["timeline"]
+    if envelope["start_ns"] != 0 or not envelope["end_ns"] > 0:
+        return f"predicted interval is {envelope!r}"
     if not record["waves"] > 0:
         return f"waves is {record['waves']!r}"
-    expected = record["local_makespan_ns"] * record["waves"]
-    if record["estimated_kernel_ns"] != expected:
-        return f"estimated_kernel_ns is {record['estimated_kernel_ns']!r}, expected {expected}"
+    if envelope["end_ns"] % record["waves"]:
+        return f"end_ns {envelope['end_ns']!r} is not {record['waves']!r} equal waves"
     return None
 
 
@@ -143,7 +151,7 @@ _EVIDENCE = {
     "compute-cost": _compute_cost_evidence,
     "memory": _memory_evidence,
     "roofline": _roofline_evidence,
-    "timeline": _timeline_evidence,
+    "performance": _performance_evidence,
 }
 
 
@@ -152,13 +160,18 @@ def analysed_every_family(
 ) -> dict:
     """Judge every family the selected function is ready to run.
 
-    ``FunctionCase.timeline`` marks an explicitly placed analysis witness. Other
-    shipped functions keep their logical three-family conclusions and must make a
-    separate timeline request fail for missing result placement.
+    Which families those are is read off the program: one that runs something
+    inside a CTA Mesh answers for all four, and one that runs nothing inside any
+    Mesh keeps its logical three and must make a separate performance request
+    fail for a missing execution domain. Asking a flag beside the case instead
+    would let a program that gained a placement keep being asked the smaller
+    question.
     """
     selected = [item for item in case.analyze if item.selector == selector]
     assert len(selected) == 1, f"{case.id}: analysis selector {selector!r} is not unique"
-    families = FAMILIES if selected[0].timeline else LOGICAL_FAMILIES
+    owner, function = case.resolve(case.build(), selector)
+    placed = states_execution_domain(owner, function, dims or selected[0].dims)
+    families = FAMILIES if placed else LOGICAL_FAMILIES
     report = reported(tf, source, case, selector, families, dims)
     assert report["executed"] == list(families), (
         f"asked for {list(families)}, the command ran {report['executed']}"
@@ -175,22 +188,22 @@ def analysed_every_family(
     return report
 
 
-def timeline_refused(
+def performance_refused(
     tf,
     source: Path,
     case: ModelCase,
     selected: FunctionCase,
 ) -> None:
-    """One unplaced shipped-model function must identify missing placement."""
+    """One unplaced shipped-model function must identify the domain it lacks."""
     rejected = tf(
         "analyze",
         static(source, case, selected.selector),
-        "--timeline",
+        "--performance",
         *dim_args(selected.dims),
     )
     assert rejected.returncode == 1, rejected.stdout + rejected.stderr
-    assert "timeline:" in rejected.stderr
-    assert "has no" in rejected.stderr and "placement" in rejected.stderr
+    assert "performance:" in rejected.stderr
+    assert "has no" in rejected.stderr and "execution domain" in rejected.stderr
 
 
 def scheduled(tf, source: Path, case: ModelCase, planned: FunctionCase, *, topology: str = ""):
@@ -221,7 +234,7 @@ def lifetimes(
 def traffic_read(tf, source: Path, case: ModelCase, selector: str, dims: Mapping[str, int]) -> int:
     """How many bytes the memory analysis says one function reads from gmem."""
     report = reported(tf, source, case, selector, ("memory",), dims)
-    return report["function_records"]["memory"]["traffic"]["gmem"]["read"]
+    return report["function_records"]["traffic"]["whole"]["gmem"]["read"]
 
 
 def one_rounding(want) -> tuple[str, dict[str, float]]:

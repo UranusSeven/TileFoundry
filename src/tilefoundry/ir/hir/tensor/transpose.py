@@ -10,17 +10,16 @@ from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.pattern import Tensor
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.types import TensorType
-from tilefoundry.ir.types.shard import ComposedLayout, Layout
+from tilefoundry.ir.types.shard import ComposedLayout, Layout, try_c_order_strides
 from tilefoundry.ir.types.shard.shard_layout import shard_layout_of
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelationResult,
-    build_relation,
-    identity_relations,
+    AffineAccess,
+    coordinates_of,
+    identity_access,
     register_access_relation,
-    register_type_relation,
+    view_relations,
 )
-from tilefoundry.visitor_registry.relation_build import build_domain, identity_map
 from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
 
 
@@ -30,26 +29,46 @@ class Transpose(Op):
     perm = ParamDef(kind="attribute", annotation=tuple)
 
 
-register_access_relation(Transpose)(identity_relations(1))
+def _strides(type_: TensorType) -> tuple | None:
+    """The per-axis strides one position addresses this Type with."""
+    layout = type_.layout
+    shard = shard_layout_of(layout)
+    if shard is not None:
+        layout = shard.layout
+    if not isinstance(layout, Layout) or len(layout.shape) != len(type_.shape):
+        return None
+    if layout.strides is not None:
+        return tuple(layout.strides)
+    return try_c_order_strides(tuple(layout.shape))
 
 
-@register_type_relation(Transpose)
-def _transpose_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Forward relation for Transpose.
 
-    Forward relation for Transpose: an identity input map and an output map
-    that permutes the iteration dims (output axis ``o`` reads domain dim
-    ``perm[o]``). The shard engine reorders the input's layout positions by their
-    owning tensor axis, preserving any factorization.
+
+def _transpose_view(call: "Call", ctx) -> tuple:
+    """Result axis k is source axis perm[k], stated in both sides' positions.
+
+    A permutation walks what it reads, so the source's own axes are the
+    coordinates and the permutation happens on the way out. Which positions those
+    axes are is the reader's question, asked of every Op the same way.
     """
-    (x,) = input_types
-    perm = call.target.perm
-    rank = len(x.shape)
-    dims = [f"d{i}" for i in range(rank)]
-    src = "[" + ", ".join(dims) + "]"
-    in_map = identity_map(rank)
-    out_map = isl.map(f"{{ {src} -> [{', '.join(dims[perm[o]] for o in range(rank))}] }}")
-    return AccessRelationResult(domain=build_domain(x.shape), maps=(in_map, out_map))
+    perm = tuple(call.target.perm)
+    source = ctx.type_of(call.args[0])
+    rank = len(source.shape)
+    writes_at = [f"d{source_axis}" for source_axis in perm]
+    domain = ", ".join(f"d{index}" for index in range(rank))
+    return (
+        identity_access(rank),
+        AffineAccess(isl.map(f"{{ [{domain}] -> [{', '.join(writes_at)}] }}")),
+    )
+
+
+register_access_relation(Transpose)(
+    view_relations(
+        0,
+        _transpose_view,
+        over=lambda call, ctx: ctx.type_of(call.args[0]).shape,
+    )
+)
 
 
 @register_typeinfer(Transpose)
@@ -63,7 +82,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     new_layout = x_ty.layout
     source_shard = shard_layout_of(x_ty.layout)
     if source_shard is not None:
-        relation = build_relation(call, (x_ty,), ctx)
+        relation = coordinates_of(call, ctx)
         derived = derive_output_shard_layout((x_ty,), relation, new_shape, fresh_strides=False)
         if derived is not None:
             new_layout = derived

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import isl
 import torch
 
 from tilefoundry.evaluator.registry import register_eval
@@ -20,17 +19,13 @@ from tilefoundry.ir.types.shard.shard_layout import (
 )
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    OPAQUE,
     AccessRelations,
+    BoundaryRelation,
+    identity_access,
+    iterating,
+    reached_at,
     register_access_relation,
 )
-
-
-def _identity(rank: int) -> "isl.multi_aff":
-    if rank == 0:
-        return isl.multi_aff("{ [] -> [] }")
-    dims = ", ".join(f"i{i}" for i in range(rank))
-    return isl.multi_aff(f"{{ [{dims}] -> [{dims}] }}")
 
 
 @register_op(name="index_select")
@@ -111,16 +106,35 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
 
 @register_access_relation(IndexSelect)
 def _index_select_access_relation(call: "Call", ctx) -> AccessRelations:
-    """GLOBAL level: IndexSelect pulls per-index slices.
+    """GLOBAL level: IndexSelect pulls one source slice per index element.
 
-    The access pattern is data-dependent on the index arg, so input data is
-    OPAQUE while the index and output relations are identities.
+    Every boundary is asked about the same coordinates, the result's own, so the
+    source is read where the result says on the axes it keeps and anywhere the
+    selected axis could legally name on the one it does not -- the deciding value
+    lives in the index, not here. The index itself is read at the coordinate the
+    result reached, one element per selected slice.
     """
-    idx_rank = len(ctx.type_of(call.args[1]).shape)
-    out_rank = len(ctx.type_of(call).shape)
-    return AccessRelations(
-        inputs=(OPAQUE, _identity(idx_rank)),
-        outputs=(_identity(out_rank),),
+    source_ty, index_ty = ctx.type_of(call.args[0]), ctx.type_of(call.args[1])
+    logical_source, logical_index = source_ty, index_ty
+    axis = _norm_dim(call.target.dim, len(source_ty.shape))
+    out_shape = (
+        *source_ty.shape[:axis],
+        index_ty.shape[0],
+        *source_ty.shape[axis + 1 :],
+    )
+    rank = len(out_shape)
+    carried = {position: f"d{position}" for position in range(rank)}
+    return iterating(
+        out_shape,
+        AccessRelations(
+            inputs=(
+                BoundaryRelation(reached_at(rank, source_ty, logical_source, carried, free=(axis,))),
+                BoundaryRelation(reached_at(rank, index_ty, logical_index, {0: carried.get(axis, "0")})),
+            ),
+            outputs=(
+                BoundaryRelation(identity_access(rank)),
+            ),
+        ),
     )
 
 

@@ -12,6 +12,16 @@ from tilefoundry.ir.hir._shard_checks import require_matching_partial_state
 from tilefoundry.ir.types import DType, TensorType
 from tilefoundry.ir.types.shape_helpers import static_dim_value
 from tilefoundry.visitor_registry import register_typeinfer
+from tilefoundry.visitor_registry.access_relation import (
+    AccessRelations,
+    BoundaryRelation,
+    control_read,
+    iterating,
+    logical_coordinates,
+    placed_window,
+    register_access_relation,
+    window_source,
+)
 
 
 @register_op(name="insert_slice")
@@ -22,6 +32,71 @@ class InsertSlice(Op):
     update = ParamDef(kind="input", pattern=Tensor)
 
     offsets = ParamDef(kind="input", pattern=Scalar)
+
+
+
+
+def _offset_axes(call: "Call", rank: int) -> tuple:
+    """Where the window starts on each axis, as a number or as the value it is.
+
+    The offsets arrive either as one tuple naming every axis or as one rank-0
+    scalar starting the window on axis zero. A literal is worth keeping as a
+    number -- an address written down is not a runtime value -- and anything else
+    is kept as the operand element it is, so a relation can name it.
+    """
+    given = call.args[2]
+    if isinstance(given, Tuple):
+        return tuple(
+            int(item.value)
+            if isinstance(item, Constant) and isinstance(item.value, int)
+            else item
+            for item in given.elements
+        )
+    start = (
+        int(given.value)
+        if isinstance(given, Constant) and isinstance(given.value, int)
+        else given
+    )
+    return (start, *(0 for _ in range(rank - 1)))
+
+
+@register_access_relation(InsertSlice)
+def _insert_slice_access(call: "Call", ctx) -> AccessRelations:
+    """The result is dst with a window replaced, so every index reads itself.
+
+    The window is exactly the update's own shape wherever it lands, so both
+    sides answer the same size question, and only the address moves with the
+    offsets. Those extents are the ones this participant holds, folded onto the
+    logical axes the offsets are stated against. The result states the window
+    rather than the container: how big it is and how much of it this occurrence
+    wrote are different numbers, and the rest was already there.
+    """
+    result = ctx.type_of(call.args[0])
+    rank = len(result.shape)
+    update = ctx.type_of(call.args[1])
+    offsets = _offset_axes(call, rank)
+    complement, written = placed_window(
+        offsets, tuple(update.shape), rank, within=tuple(result.shape)
+    )
+    read_update = window_source(
+        offsets, rank, update, update, logical_coordinates(result, result)
+    )
+    return iterating(
+        result.shape,
+    AccessRelations(
+            inputs=(
+                BoundaryRelation(complement),
+                BoundaryRelation(read_update),
+                *(
+                    BoundaryRelation(control_read(rank, ctx, arg))
+                    for arg in call.args[2:]
+                ),
+            ),
+            outputs=(
+                BoundaryRelation(written),
+            ),
+        ),
+    )
 
 
 def _check_axis(ax: int, dst_ext, upd_ext, off_expr, ctx, call) -> None:
@@ -93,6 +168,8 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
             )
         _check_axis(0, dst_ty.shape[0], upd_ty.shape[0], off_expr, ctx, call)
     return dst_ty
+
+
 
 
 @register_eval(InsertSlice)

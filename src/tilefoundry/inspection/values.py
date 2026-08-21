@@ -20,9 +20,10 @@ from tilefoundry.analysis.metadata import (
     ComputeCostMetadata,
     LoopFootprintMetadata,
     MemoryMetadata,
+    PerformanceMetadata,
+    PerformanceSummaryMetadata,
     RooflineMetadata,
-    TimelineMetadata,
-    TimelineSummaryMetadata,
+    TrafficMetadata,
 )
 from tilefoundry.analysis.report import (
     declare_record,
@@ -219,17 +220,33 @@ def _paired_flops(record: ComputeCostMetadata) -> dict[str, TotalAndPerUnit[int]
     }
 
 
-def _paired_traffic(
-    record: ComputeCostMetadata,
-) -> dict[str, TotalAndPerUnit[TrafficBytes]]:
-    """Each level's traffic, whole and per unit, as one value."""
+def _paired_service(record: ComputeCostMetadata) -> dict[str, TotalAndPerUnit[int]]:
+    """Each service kind's work, whole and per unit, as one value.
+
+    What a machine is asked for that is not floating point: comparing, selecting,
+    integer arithmetic, a reciprocal, a local move. Reported beside the flops
+    rather than folded into them, because a predicate priced as a FLOP is a
+    number about a pipe the work never went down.
+    """
+    per_unit = dict(record.service_per_unit)
     return {
-        level: TotalAndPerUnit(moved, record.traffic_per_unit_at(level))
-        for level, moved in record.traffic
+        kind: TotalAndPerUnit(total, per_unit.get(kind, 0))
+        for kind, total in record.service
     }
 
 
-def _by_operand(record: ComputeCostMetadata) -> dict[str, TrafficBytes]:
+def _paired_traffic(
+    record: TrafficMetadata,
+) -> dict[str, TotalAndPerUnit[TrafficBytes]]:
+    """Each level's traffic, whole and per unit, as one value."""
+    per_unit = dict(record.per_unit)
+    return {
+        level: TotalAndPerUnit(moved, per_unit.get(level, TrafficBytes()))
+        for level, moved in record.whole
+    }
+
+
+def _by_operand(record: TrafficMetadata) -> dict[str, TrafficBytes]:
     """What each operand moved, positional against ``(*call.args, call)``."""
     last = len(record.operands) - 1
     return {
@@ -264,9 +281,17 @@ def _loop_footprint_status(record: LoopFootprintMetadata) -> str:
     return "complete" if record.known else "lower-bound"
 
 
-def _interval(record: TimelineMetadata) -> TripInterval:
+def _interval(record: PerformanceMetadata) -> TripInterval:
     """The occurrence's interval, with its repetition folded in."""
-    return TripInterval(record.start_ns, record.end_ns, record.stride_ns, record.trips)
+    timeline = record.timeline
+    return TripInterval(
+        timeline.start_ns, timeline.end_ns, timeline.stride_ns, timeline.trips
+    )
+
+
+def _predicted_ns(record: PerformanceSummaryMetadata) -> int:
+    """How long the whole Function is predicted to take."""
+    return record.timeline.end_ns - record.timeline.start_ns
 
 
 def _source_span(record: SourceSpanMetadata) -> str:
@@ -307,26 +332,29 @@ class AdvisorySummary(IRMetadata):
 
 
 @dataclass(frozen=True)
-class TimelineSummaryView(IRMetadata):
-    """One function's local plan, under the root the report is about.
+class PerformanceSummaryView(IRMetadata):
+    """One function's prediction, under the root the report is about.
 
     ``root`` is the report's own identity composed for a reader, not something
-    the timeline family measured, which is why it lives here and not on
-    ``TimelineSummaryMetadata``. ``waves`` is stated even when it is one: how
+    the family measured, which is why it lives here and not on
+    ``PerformanceSummaryMetadata``. ``waves`` is stated even when it is one: how
     many passes over the machine a plan takes is a conclusion, and one wave is an
     answer rather than nothing to say. It is declared with no value it says
     nothing by, so the suppression rule itself stays one rule.
     """
 
     root: str = ""
-    local_makespan_ns: int = 0
+    predicted_ns: int = 0
     waves: int = 1
-    estimated_kernel_ns: int = 0
 
 
 comment(
     ComputeCostMetadata,
     Projection("flops", dict[str, TotalAndPerUnit[int]], _paired_flops),
+    Projection("service", dict[str, TotalAndPerUnit[int]], _paired_service),
+)
+comment(
+    TrafficMetadata,
     Projection("traffic", dict[str, TotalAndPerUnit[TrafficBytes]], _paired_traffic),
     Projection("operands", dict[str, TrafficBytes], _by_operand, opt_in=True),
 )
@@ -342,20 +370,28 @@ comment(
     Projection("status", str, _loop_footprint_status),
 )
 comment(RooflineMetadata, "ideal_ns", "bound_by")
-comment(TimelineMetadata, Projection("interval", TripInterval, _interval))
-comment(TimelineSummaryMetadata, family="timeline")
+comment(
+    PerformanceMetadata,
+    Projection("interval", TripInterval, _interval),
+    family="performance",
+)
+comment(
+    PerformanceSummaryMetadata,
+    Projection("predicted_ns", int, _predicted_ns),
+    Projection("waves", int, _read("waves")),
+    family="performance",
+)
 comment(SourceSpanMetadata, Projection("span", str, _source_span), family="source")
 comment(ReportIdentity, family="analysis")
 comment(ReportSelection, family="selection")
 comment(MemorySummary, family="peak-footprint")
 comment(AdvisorySummary, family="advisory")
 comment(
-    TimelineSummaryView,
+    PerformanceSummaryView,
     "root",
-    "local_makespan_ns",
+    "predicted_ns",
     Projection("waves", int, _read("waves")),
-    "estimated_kernel_ns",
-    family="timeline",
+    family="performance",
 )
 
 
@@ -372,11 +408,11 @@ __all__ = [
     "RENDER",
     "TRIPS",
     "MemorySummary",
+    "PerformanceSummaryView",
     "Projection",
     "RecordComment",
     "ReportIdentity",
     "ReportSelection",
-    "TimelineSummaryView",
     "comment",
     "comment_of",
     "declared_records",

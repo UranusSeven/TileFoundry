@@ -12,20 +12,22 @@ def builtin_analyzer(selector: str) -> Analyzer | None:
         from tilefoundry.analysis.metadata import ComputeCostMetadata  # noqa: PLC0415
 
         return Analyzer(
-            "compute-cost", analyze_compute_cost, produces=(ComputeCostMetadata,)
+            "compute-cost",
+            analyze_compute_cost,
+            produces=(ComputeCostMetadata,),
         )
     if selector == "memory":
         from tilefoundry.analysis.memory import analyze_memory  # noqa: PLC0415
         from tilefoundry.analysis.metadata import (  # noqa: PLC0415
             LoopFootprintMetadata,
             MemoryMetadata,
+            TrafficMetadata,
         )
 
         return Analyzer(
             "memory",
             analyze_memory,
-            requires=("compute-cost",),
-            produces=(MemoryMetadata, LoopFootprintMetadata),
+            produces=(MemoryMetadata, LoopFootprintMetadata, TrafficMetadata),
         )
     if selector == "roofline":
         from tilefoundry.analysis.metadata import RooflineMetadata  # noqa: PLC0415
@@ -34,21 +36,23 @@ def builtin_analyzer(selector: str) -> Analyzer | None:
         return Analyzer(
             "roofline",
             analyze_roofline,
-            requires=("memory", "compute-cost"),
+            requires=("compute-cost", "memory"),
             produces=(RooflineMetadata,),
         )
-    if selector == "timeline":
+    if selector == "performance":
+        from tilefoundry.analysis.check import PerformanceInputChecker  # noqa: PLC0415
         from tilefoundry.analysis.metadata import (  # noqa: PLC0415
-            TimelineMetadata,
-            TimelineSummaryMetadata,
+            PerformanceMetadata,
+            PerformanceSummaryMetadata,
         )
-        from tilefoundry.analysis.timeline import analyze_timeline  # noqa: PLC0415
+        from tilefoundry.analysis.timeline import analyze_performance  # noqa: PLC0415
 
         return Analyzer(
-            "timeline",
-            analyze_timeline,
-            requires=("compute-cost",),
-            produces=(TimelineMetadata, TimelineSummaryMetadata),
+            "performance",
+            analyze_performance,
+            requires=("compute-cost", "memory"),
+            produces=(PerformanceMetadata, PerformanceSummaryMetadata),
+            input_checker=PerformanceInputChecker(),
         )
     return None
 

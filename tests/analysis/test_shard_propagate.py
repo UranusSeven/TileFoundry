@@ -17,8 +17,11 @@ import pytest
 from tilefoundry.ir.types import make_shard_tensor_type, make_tensor_type
 from tilefoundry.ir.types.shard import Layout, Mesh, ShardLayout, Topology
 from tilefoundry.ir.types.shard.shard_layout import Broadcast, Partial, Split
-from tilefoundry.visitor_registry.access_relation import AccessRelationResult
-from tilefoundry.visitor_registry.relation_build import build_domain
+from tilefoundry.visitor_registry.access_relation import (
+    AccessRelations,
+    AffineAccess,
+    BoundaryRelation,
+)
 from tilefoundry.visitor_registry.shard_propagate import (
     derive_output_shard_layout,
     partial_reductions_by_axis,
@@ -28,20 +31,20 @@ _GPU = Mesh((Topology("gpu", 8),), Layout((8,), (1,)), names=("g",))
 _GPU2 = Mesh((Topology("gpu", 4),), Layout((2, 2), (2, 1)), names=("a", "b"))
 
 
-def _matmul_relation() -> AccessRelationResult:
-    return AccessRelationResult(
-        domain=build_domain((16, 8, 4)),
-        maps=(
-            isl.map("{ [m, n, k] -> [m, k] }"),
-            isl.map("{ [m, n, k] -> [k, n] }"),
-            isl.map("{ [m, n, k] -> [m, n] }"),
+def _matmul_relation() -> AccessRelations:
+    return AccessRelations(
+            inputs=(BoundaryRelation(AffineAccess(isl.map("{ [m, n, k] -> [m, k] }"))), BoundaryRelation(AffineAccess(isl.map("{ [m, n, k] -> [k, n] }"))),),
+            outputs=(BoundaryRelation(AffineAccess(isl.map("{ [m, n, k] -> [m, n] }"),)),
         ),
     )
 
 
-def _elementwise_relation() -> AccessRelationResult:
-    ident = isl.map("{ [m, n] -> [m, n] }")
-    return AccessRelationResult(domain=build_domain((4, 8)), maps=(ident, ident, ident))
+def _elementwise_relation() -> AccessRelations:
+    ident = AffineAccess(isl.map("{ [m, n] -> [m, n] }"))
+    return AccessRelations(
+            inputs=(BoundaryRelation(ident), BoundaryRelation(ident),),
+            outputs=(BoundaryRelation(ident),),
+        )
 
 
 def _strides(shape) -> tuple[int, ...]:
@@ -124,9 +127,10 @@ REFUSED = [
     ),
     pytest.param(
         (make_tensor_type((12,), layout=_shard((12,), Split(0))),),
-        AccessRelationResult(
-            domain=build_domain((4, 8)),
-            maps=(isl.map("{ [m, n] -> [m + n] }"), isl.map("{ [m, n] -> [m, n] }")),
+        AccessRelations(
+            inputs=(BoundaryRelation(AffineAccess(isl.map("{ [m, n] -> [m + n] }"))),),
+            outputs=(BoundaryRelation(AffineAccess(isl.map("{ [m, n] -> [m, n] }"),)),
+        ),
         ),
         (4, 8),
         "non-projection access",
@@ -134,9 +138,10 @@ REFUSED = [
     ),
     pytest.param(
         (make_tensor_type((4, 8), layout=_shard((4, 8), Split(0))),),
-        AccessRelationResult(
-            domain=build_domain((4, 8)),
-            maps=(isl.map("{ [m, n] -> [m, n] }"), isl.map("{ [m, n] -> [m + n] }")),
+        AccessRelations(
+            inputs=(BoundaryRelation(AffineAccess(isl.map("{ [m, n] -> [m, n] }"))),),
+            outputs=(BoundaryRelation(AffineAccess(isl.map("{ [m, n] -> [m + n] }"),)),
+        ),
         ),
         (12,),
         "non-projection output access",
@@ -172,8 +177,11 @@ def test_a_synthesised_layout_agrees_with_a_from_scratch_one():
     """
     lhs_t = make_tensor_type((8, 8), layout=_shard2((8, 8), Split(0), Broadcast()))
     rhs_t = make_tensor_type((8, 8), layout=_shard2((8, 8), Broadcast(), Split(1)))
-    ident = isl.map("{ [m, n] -> [m, n] }")
-    rel = AccessRelationResult(domain=build_domain((8, 8)), maps=(ident, ident, ident))
+    ident = AffineAccess(isl.map("{ [m, n] -> [m, n] }"))
+    rel = AccessRelations(
+            inputs=(BoundaryRelation(ident), BoundaryRelation(ident),),
+            outputs=(BoundaryRelation(ident),),
+        )
 
     out = derive_output_shard_layout((lhs_t, rhs_t), rel, (8, 8))
 
@@ -190,8 +198,11 @@ def test_an_input_partial_propagates_on_its_own_mesh_axis():
     reductions -- collapsing them would make a sum-partial and a max-partial
     indistinguishable, which is a wrong result rather than a wrong layout.
     """
-    ident = isl.map("{ [m, n] -> [m, n] }")
-    rel = AccessRelationResult(domain=build_domain((4, 8)), maps=(ident, ident))
+    ident = AffineAccess(isl.map("{ [m, n] -> [m, n] }"))
+    rel = AccessRelations(
+            inputs=(BoundaryRelation(ident),),
+            outputs=(BoundaryRelation(ident),),
+        )
     x_t = make_tensor_type((4, 8), layout=_shard2((4, 8), Partial("sum"), Broadcast()))
 
     out = derive_output_shard_layout((x_t,), rel, (4, 8))

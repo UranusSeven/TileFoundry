@@ -11,8 +11,10 @@ from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._shard_checks import reject_partials
 from tilefoundry.ir.types import TensorType
 from tilefoundry.visitor_registry import register_typeinfer
-from tilefoundry.visitor_registry.access_relation import register_type_relation
-from tilefoundry.visitor_registry.relation_build import elementwise_relation
+from tilefoundry.visitor_registry.access_relation import (
+    identity_relations,
+    register_access_relation,
+)
 
 _COMMUTES_WITH = frozenset({"max", "min"})
 
@@ -22,7 +24,6 @@ class Sigmoid(Op):
     x = ParamDef(kind="input", pattern=Tensor)
 
 
-register_type_relation(Sigmoid)(elementwise_relation())
 
 
 @register_typeinfer(Sigmoid)
@@ -36,3 +37,6 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
 def _eval_sigmoid(ctx):
 
     return TensorValue(data=torch.sigmoid(ctx.args[0].data), type=ctx.result_type)
+
+
+register_access_relation(Sigmoid)(identity_relations(1))

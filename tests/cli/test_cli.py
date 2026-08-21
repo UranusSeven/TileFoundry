@@ -12,7 +12,10 @@ import pytest
 import tilefoundry.cli.target as target_cli
 from tests.fixtures.shapes.composed_leaf_source import composed_leaf_source
 from tilefoundry import cli
-from tilefoundry.cli.source import load_authored_ir, one_extent_per_dim
+from tilefoundry.cli.source import (
+    load_authored_ir,
+    one_extent_per_dim,
+)
 from tilefoundry.target import CpuTarget, registered_targets
 
 
@@ -112,16 +115,62 @@ def test_schedule_rejects_several_extents_per_dimension(capsys) -> None:
     assert "asking several EXTENTs together is for check" in refused
 
 
+_NEIGHBOURS = """from tilefoundry import func, module
+from tilefoundry.dsl import Mesh, Tensor, Topology, tf
+from tilefoundry.target import CudaTarget
+
+N = 132 * 128
+_H200 = CudaTarget('nvidia.h200_sxm')
+
+
+@module(entry='nope', target=_H200, topologies=(Topology('cta', 132),))
+class Unsound:
+    @func
+    def kernel(x: Tensor[(N,), 'f32']) -> Tensor[(N,), 'f32']:
+        return tf.square(x)
+
+
+@module(entry='kernel', target=_H200, topologies=(Topology('cta', 132),))
+class Sound:
+    @func
+    def kernel(x: Tensor[(N,), 'f32']) -> Tensor[(N,), 'f32']:
+        with Mesh(('cta',), layout=(132,), names=('block',)) as m:
+            placed = tf.reshard(x, (N @ m.block,), 'gmem')
+            return tf.reshard(tf.square(placed), (N @ m.block,), 'gmem')
+"""
+
+
+def test_naming_one_root_does_not_ask_about_the_rest_of_its_file(tmp_path, capsys) -> None:
+    """A selector names one root, and the rest of the file is a different question.
+
+    The unsound root here states an entry naming no function it collected, and it
+    is written first, so a reading that only survives when the broken one comes
+    last is one that got away with it. Asking about the sound root has to answer
+    about the sound root; asking about the file still has to refuse, because then
+    the broken root is one of the programs that was asked for.
+    """
+    source = tmp_path / "neighbours.py"
+    source.write_text(_NEIGHBOURS, encoding="utf-8")
+
+    assert cli.main(["analyze", f"{source}:Sound", "--compute-cost", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["module"] == "Sound"
+    assert report["totals"]["flops"]
+
+    assert cli.main(["analyze", str(source), "--compute-cost", "--json"]) == 1
+    assert "nope" in capsys.readouterr().err
+
+
 def test_analyze_help_explains_topology_effects_and_assumptions(capsys) -> None:
     with pytest.raises(SystemExit) as stopped:
         cli.main(["analyze", "--help"])
 
     assert stopped.value.code == 0
     help_text = capsys.readouterr().out
-    for family in ("compute-cost", "memory", "roofline", "timeline"):
+    for family in ("compute-cost", "memory", "roofline", "performance"):
         assert family in help_text
     assert "flops_per_unit" in help_text
-    assert "traffic_per_unit" in help_text
+    assert "per-unit traffic" in help_text
     assert "global traffic is the device's and counted once" in help_text
     assert "is an observation, not a bound" in help_text
 
@@ -379,10 +428,10 @@ def test_persisted_targets_drive_every_command_without_touching_the_default_regi
         tmp_path,
         "analyze",
         f"{npu_model}:model",
-        "--timeline",
+        "--performance",
     )
     assert unplaced_npu.returncode == 1
-    assert "has no core placement" in unplaced_npu.stderr
+    assert "has no core execution domain" in unplaced_npu.stderr
     scheduled_npu = _run_cli(
         registry,
         tmp_path,
@@ -597,7 +646,7 @@ def test_analyze_binds_an_extent_on_a_root_that_reaches_a_child(tmp_path, capsys
 def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> None:
     source = Path(__file__).parents[1] / "fixtures" / "placed" / "moe_mega_kernel.py"
     selector = f"{source}:MoEMegaKernel"
-    flags = ["--compute-cost", "--memory", "--roofline", "--timeline"]
+    flags = ["--compute-cost", "--memory", "--roofline", "--performance"]
 
     assert cli.main(["analyze", selector, *flags, "--json"]) == 0
     payload = json.loads(capsys.readouterr().out)
@@ -620,13 +669,14 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> N
         "compute-cost",
         "memory",
         "roofline",
-        "timeline",
+        "performance",
     ]
     assert set(payload["function_records"]) == {
         "compute-cost",
+        "traffic",
         "memory",
         "roofline",
-        "timeline",
+        "performance",
     }
     assert "routed_expert(" not in annotated
     assert "shared_expert(" not in annotated
@@ -636,9 +686,9 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> N
     assert "offset=0" in annotated
     assert "offset=120" in annotated
 
-    summary = payload["function_records"]["timeline"]
+    summary = payload["function_records"]["performance"]
     cost = payload["function_records"]["compute-cost"]
-    whole, unit = cost["traffic"]["gmem"], cost["traffic_per_unit"]["gmem"]
+    moved = payload["function_records"]["traffic"]
     peak = payload["function_records"]["memory"]["footprint"]
     bound = payload["function_records"]["roofline"]
     assert header.splitlines() == [
@@ -647,18 +697,20 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> N
         f"# selection requested={','.join(payload['requested'])} "
         f"executed={','.join(payload['executed'])}",
         "# compute-cost "
-        f"flops=f32:{cost['flops']['f32']}@{cost['flops_per_unit']['f32']} "
-        f"traffic=gmem:r{whole['read']}/w{whole['write']}"
-        f"@r{unit['read']}/w{unit['write']}",
+        f"flops=f32:{cost['flops']['f32']}@{cost['flops_per_unit']['f32']}",
+        "# traffic "
+        f"traffic=gmem:r{moved['whole']['gmem']['read']}"
+        f"/w{moved['whole']['gmem']['write']}"
+        f"@r{moved['per_unit']['gmem']['read']}"
+        f"/w{moved['per_unit']['gmem']['write']}",
         f"# peak-footprint=gmem:{peak[0]['peak_bytes']}",
         f"# roofline ideal-ns={bound['ideal_ns']} bound-by={bound['bound_by']}",
-        "# timeline root=MoEMegaKernel::experts "
-        f"local-makespan-ns={summary['local_makespan_ns']} "
-        f"waves={summary['waves']} "
-        f"estimated-kernel-ns={summary['estimated_kernel_ns']}",
+        "# performance root=MoEMegaKernel::experts "
+        f"predicted-ns={summary['timeline']['end_ns']} "
+        f"waves={summary['waves']}",
     ]
     assert payload["totals"]["flops"] == cost["flops"]
-    assert payload["totals"]["traffic"] == cost["traffic"]
+    assert payload["totals"]["traffic"] == moved["whole"]
 
     hoisted = {
         line.split(" = ", 1)[0] for line in lines if " = Mesh((Topology(" in line
@@ -673,9 +725,11 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> N
     rows = payload["calls"]
     assert len(rows) == 7
     assert all(
-        set(row) == {"value", "compute-cost", "roofline", "timeline"}
+        set(row) - {"performance"} == {"value", "compute-cost", "traffic", "roofline"}
         for row in rows
     )
+    timed = [index for index, row in enumerate(rows) if "performance" in row]
+    assert timed == [1, 4, 6]
     starts = []
     for row in rows:
         value, line_text = row["value"].rsplit(":", 1)
@@ -686,13 +740,16 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(capsys) -> N
     for index, (row, start) in enumerate(zip(rows, starts)):
         stop = starts[index + 1] - 1 if index + 1 < len(starts) else len(lines)
         statement = "\n".join(lines[start - 1 : stop])
-        timeline = row["timeline"]
-        assert f"timeline=[{timeline['start_ns']},{timeline['end_ns']})" in statement
+        if "performance" in row:
+            timeline = row["performance"]["timeline"]
+            assert f"performance=[{timeline['start_ns']},{timeline['end_ns']})" in statement
+        else:
+            assert "; performance=" not in statement
         annotated_meshes = set(re.findall(r"@ (\w+)\.", statement.split("  # ", 1)[1]))
         assert annotated_meshes <= hoisted
         placed_meshes = set(re.findall(r"mesh=(\w+),", statement))
         if annotated_meshes and placed_meshes:
             assert annotated_meshes == placed_meshes
-    assert len([line for line in lines if "; timeline=" in line]) == len(rows)
+    assert len([line for line in lines if "; performance=" in line]) == len(timed)
     assert len({row["value"] for row in rows}) == len(rows)
     assert "units=" not in annotated

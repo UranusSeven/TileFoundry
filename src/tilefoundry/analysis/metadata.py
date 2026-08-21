@@ -15,42 +15,55 @@ from tilefoundry.visitor_registry.contexts import TrafficBytes
 
 
 @dataclass(frozen=True)
-class OccurrenceProvenance(IRMetadata):
-    """Identify the authored call and Function-call path of one occurrence."""
-
-    source_call: int
-    call_path: tuple[str, ...]
-
-
-@dataclass(frozen=True)
 class ComputeCostMetadata(IRMetadata):
-    """Record one occurrence's work or one Function's total work.
+    """Record one occurrence's work, or one Function's total work.
 
-    ``flops`` and ``traffic`` state global work; their ``*_per_unit`` partners
-    apply shard projection at the requested topology level. On a Call, all
-    quantities state one occurrence and ``operands`` is positional against
-    ``(*call.args, call)``. On a Function, loops contribute their trip count and
-    ``operands`` is empty.
+    ``flops`` and ``service`` state global work; their ``*_per_unit`` partners
+    apply shard projection at the requested topology level. ``service`` counts
+    what is not floating point -- comparing, selecting, whole-number arithmetic
+    -- by the service it asks for. What an occurrence moves is a separate
+    record, kept by the family that knows where values live. On a Call these
+    state one occurrence; on a Function, loops contribute their trip count.
     """
 
     flops: tuple[tuple[str, int], ...] = ()
     flops_per_unit: tuple[tuple[str, int], ...] = ()
-    traffic: tuple[tuple[str, TrafficBytes], ...] = ()
-    traffic_per_unit: tuple[tuple[str, TrafficBytes], ...] = ()
+    service: tuple[tuple[str, int], ...] = ()
+    service_per_unit: tuple[tuple[str, int], ...] = ()
+
+    def service_per_unit_of(self, kind: str) -> int:
+        """One unit's count of *kind*, zero when the call asks for none."""
+        return next((value for name, value in self.service_per_unit if name == kind), 0)
+
+
+@dataclass(frozen=True)
+class TrafficMetadata(IRMetadata):
+    """The bytes one occurrence moves, whole and for one participant.
+
+    Which way a boundary moves is its Op's evaluator's answer and how much is
+    its relation's; the family that decides where values live attaches the
+    record, and where they landed never corrects a crossing. ``operands`` is
+    positional against ``(*call.args, call)`` on a Call and empty on a Function,
+    whose totals count each occurrence as often as its loops repeat it.
+    """
+
+    whole: tuple[tuple[str, TrafficBytes], ...] = ()
+    per_unit: tuple[tuple[str, TrafficBytes], ...] = ()
     operands: tuple[TrafficBytes, ...] = ()
 
-    def traffic_at(self, level: str) -> TrafficBytes:
-        """Traffic at *level*, zero when the call does not touch it."""
+    def at(self, level: str) -> TrafficBytes:
+        """Bytes moved at *level*, zero when the occurrence does not touch it."""
         return next(
-            (value for name, value in self.traffic if name == level), TrafficBytes()
+            (value for name, value in self.whole if name == level), TrafficBytes()
         )
 
-    def traffic_per_unit_at(self, level: str) -> TrafficBytes:
-        """One unit's traffic at *level*, zero when it does not touch it."""
+    def per_unit_at(self, level: str) -> TrafficBytes:
+        """One unit's bytes at *level*, zero when it does not touch it."""
         return next(
-            (value for name, value in self.traffic_per_unit if name == level),
-            TrafficBytes(),
+            (value for name, value in self.per_unit if name == level), TrafficBytes()
         )
+
+
 
 
 @dataclass(frozen=True)
@@ -116,6 +129,17 @@ class ValueLifetime:
 
 
 @dataclass(frozen=True)
+class AllocationMetadata:
+    """What showing this function's buffers fit took.
+
+    Where any of them would sit is the solver's business and appears nowhere
+    here. What a reader can act on is whether the question was settled.
+    """
+
+    solver_status: str
+
+
+@dataclass(frozen=True)
 class MemoryMetadata(IRMetadata):
     """Record one function's memory behavior against a target hierarchy.
 
@@ -123,12 +147,16 @@ class MemoryMetadata(IRMetadata):
     report cache working-set and order-dependent peak overflow; only a single
     value exceeding an addressable level is an error because no schedule can
     place it.
+
+    ``allocation`` is absent when the function has no addressable buffer to
+    place at the level being analysed, which is a different answer from having
+    placed one: nothing was decided, so nothing is claimed.
     """
 
     footprint: tuple[LevelFootprint, ...] = ()
-    traffic: tuple[tuple[str, TrafficBytes], ...] = ()
     lifetimes: tuple[ValueLifetime, ...] = ()
     advisories: tuple[str, ...] = ()
+    allocation: "AllocationMetadata | None" = None
 
     def level(self, name: str) -> LevelFootprint | None:
         """The footprint recorded for *name*, if the function touches it."""
@@ -156,11 +184,13 @@ class RooflineMetadata(IRMetadata):
 
 
 @dataclass(frozen=True)
-class TimelineMetadata(IRMetadata):
-    """One occurrence's CTA-local interval on the nominal timeline.
+class TimelineMetadata:
+    """One interval on the nominal timeline.
 
     A repeated loop-body occurrence states its first interval plus the trip
-    count and stride needed to derive every later interval.
+    count and stride needed to derive every later interval. This is a value a
+    performance record carries rather than a record of its own: what the
+    interval spans is decided by the record it sits in.
     """
 
     start_ns: int = 0
@@ -170,24 +200,42 @@ class TimelineMetadata(IRMetadata):
 
 
 @dataclass(frozen=True)
-class TimelineSummaryMetadata(IRMetadata):
-    """One Function's local schedule and physical-wave estimate."""
+class PerformanceMetadata(IRMetadata):
+    """One occurrence's interval within one local wave of its Function.
 
-    local_makespan_ns: int = 0
-    waves: int = 1
-    estimated_kernel_ns: int = 0
+    Only an occurrence with a modeled duration carries one. A structural
+    occurrence takes no modeled time, and an empty interval on it would read as
+    a measurement rather than as the absence of one.
+    """
+
+    timeline: TimelineMetadata
+
+
+@dataclass(frozen=True)
+class PerformanceSummaryMetadata(IRMetadata):
+    """One Function's predicted time, and what reaching it took.
+
+    ``timeline`` is the whole-Function envelope from zero, so its duration is
+    the prediction; ``waves`` is the uniform scaling between one local wave and
+    that envelope. The prediction is exact for the model it states, so there is
+    nothing here about how it was reached.
+    """
+
+    timeline: TimelineMetadata
+    waves: int
 
 
 __all__ = [
+    "AllocationMetadata",
     "BufferFootprint",
     "ComputeCostMetadata",
     "LevelFootprint",
     "LoopFootprintMetadata",
     "MemoryMetadata",
-    "OccurrenceProvenance",
+    "PerformanceMetadata",
+    "PerformanceSummaryMetadata",
     "RooflineMetadata",
     "TimelineMetadata",
-    "TimelineSummaryMetadata",
     "TrafficBytes",
     "ValueLifetime",
 ]

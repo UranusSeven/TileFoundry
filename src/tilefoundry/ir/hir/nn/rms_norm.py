@@ -20,19 +20,22 @@ from tilefoundry.ir.hir._shard_checks import reject_partials
 from tilefoundry.ir.types import TensorType
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelationResult,
     AccessRelations,
+    AffineAccess,
+    BoundaryRelation,
+    factored_image,
+    iterating,
+    logical_term,
+    normalised_rows,
     register_access_relation,
-    register_type_relation,
 )
-from tilefoundry.visitor_registry.isl_utility import to_domain
 
 
 def _identity(rank: int) -> "isl.multi_aff":
     if rank == 0:
-        return isl.multi_aff("{ [] -> [] }")
+        return AffineAccess(isl.map("{ [] -> [] }"))
     dims = ", ".join(f"i{i}" for i in range(rank))
-    return isl.multi_aff(f"{{ [{dims}] -> [{dims}] }}")
+    return AffineAccess(isl.map(f"{{ [{dims}] -> [{dims}] }}"))
 
 
 @register_op(name="rms_norm")
@@ -62,55 +65,38 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
 
 @register_access_relation(RMSNorm)
 def _rms_norm_relation(call: "Call", ctx) -> AccessRelations:
-    """GLOBAL level: x identity, weight identity.
+    """GLOBAL level: one row normalised per iteration, read whole.
 
-    GLOBAL level: x identity, weight identity (broadcast along last dim
-    treated as identity at GLOBAL black-box; reduction is internal to the
-    op).
+    A normalisation is asked once per row, because every element of a row needs
+    the whole row's sum before any of it can be written. So the axis it
+    normalises is not a coordinate this Op is asked by: it is free in the images,
+    and the row is what each boundary reaches. The weight matches that axis and
+    nothing else, so every row reaches all of it -- one weight element each.
     """
     x_ty = ctx.type_of(call.args[0])
-    rank = len(x_ty.shape)
-    return AccessRelations(
-        inputs=(_identity(rank), _identity(1)),
-        outputs=(_identity(rank),),
+    w_ty = ctx.type_of(call.args[1])
+    logical_x = ctx.type_of(call.args[0])
+    normalised = len(logical_x.shape) - 1
+    rows, names, guards = normalised_rows(x_ty, logical_x, normalised)
+    domain = ", ".join(f"d{index}" for index in range(len(rows)))
+    where = f" : {' and '.join(guards)}" if guards else ""
+    element = f"{{ [{domain}] -> [{', '.join(names)}]{where} }}"
+    across = ", ".join(
+        factored_image(
+            [logical_term(names, x_ty, logical_x, normalised)],
+            w_ty,
+            ctx.type_of(call.args[1]),
+        )
     )
-
-
-@register_type_relation(RMSNorm)
-def _rms_norm_type_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Model fused row-wise RMSNorm with batch axes as the domain.
-
-    The reduced axis remains a range dimension shared by input, weight, and
-    output maps. Local projection handles sharding before this relation.
-    """
-    x, weight = input_types
-    x_shape, w_shape = x.shape, weight.shape
-    if len(x_shape) < 1 or len(w_shape) != 1:
-        raise NotImplementedError(
-            "RMSNorm type_relation: x must be rank >= 1 and weight rank-1, "
-            f"got x.shape={x_shape} weight.shape={w_shape}"
-        )
-    if x_shape[-1] != w_shape[0]:
-        raise NotImplementedError(
-            f"RMSNorm type_relation: x last dim {x_shape[-1]} != weight dim {w_shape[0]}"
-        )
-    reduce_extent = x_shape[-1]
-    if not isinstance(reduce_extent, int) or isinstance(reduce_extent, bool):
-        raise NotImplementedError(
-            "RMSNorm type_relation: reduction axis must be a static int, "
-            f"got {reduce_extent!r} -- a dynamic reduction axis has no isl "
-            "representation here"
-        )
-
-    batch_shape = x_shape[:-1]
-    domain, param_map = to_domain(batch_shape)
-    dims = [f"d{i}" for i in range(len(batch_shape))]
-    src = "[" + ", ".join(dims) + "]"
-    row = ", ".join(dims + ["j"])
-    row_map = isl.map(f"{{ {src} -> [{row}] : 0 <= j < {reduce_extent} }}")
-    weight_map = isl.map(f"{{ {src} -> [j] : 0 <= j < {reduce_extent} }}")
-    return AccessRelationResult(
-        domain=domain, maps=(row_map, weight_map, row_map), param_map=param_map
+    return iterating(
+        rows,
+        AccessRelations(
+            inputs=(
+                BoundaryRelation(AffineAccess(isl.map(element))),
+                BoundaryRelation(AffineAccess(isl.map(f"{{ [{domain}] -> [{across}]{where} }}"))),
+            ),
+            outputs=(BoundaryRelation(AffineAccess(isl.map(element))),),
+        ),
     )
 
 

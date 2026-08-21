@@ -16,14 +16,16 @@ from tilefoundry.ir.types.dim import DimAdd, DimFloorDiv, DimSub, simplify_dim
 from tilefoundry.ir.types.dim_isl import normalize_dim
 from tilefoundry.ir.types.shape_helpers import i64_const, static_dim_value
 from tilefoundry.ir.types.shard import Layout, try_c_order_strides
-from tilefoundry.ir.types.shard.shard_layout import shard_layout_of, split_target_axes
+from tilefoundry.ir.types.shard.shard_layout import Split, shard_layout_of, split_target_axes
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelationResult,
-    build_relation,
-    register_type_relation,
+    AccessRelations,
+    AffineAccess,
+    BoundaryRelation,
+    coordinates_of,
+    iterating,
+    register_access_relation,
 )
-from tilefoundry.visitor_registry.isl_utility import to_domain
 from tilefoundry.visitor_registry.shard_propagate import (
     derive_output_shard_layout,
     partial_reductions_by_axis,
@@ -157,6 +159,43 @@ def _output_shape(x, weight, stride, padding, dilation, k_h, k_w) -> tuple:
     )
 
 
+def _require_group_aligned_output_split(call, ctx, weight, bias, groups: int) -> None:
+    """A split of the output channels must not cut across a group.
+
+    A shard straddling a boundary reads two groups where its neighbour reads
+    one, and nothing here can tell those participants apart: a projection knows
+    a shard's extent and not its offset. Twelve channels in three groups over
+    four shards would report one footprint for all four where the real ones are
+    1, 2, 2 and 1 groups, so it is refused where the author can align it.
+    """
+    if groups == 1:
+        return
+    channels = static_dim_value(weight.shape[0])
+    if channels is None:
+        return
+    per_group = channels // groups
+    for name, type_ in (("weight", weight), ("bias", bias)):
+        layout = shard_layout_of(type_.layout)
+        if layout is None:
+            continue
+        targets = split_target_axes(layout, type_.shape)
+        for mesh_axis, attr in enumerate(layout.attrs):
+            if not isinstance(attr, Split) or targets[mesh_axis] != 0:
+                continue
+            shards = layout.layout.shape[attr.axis]
+            if not isinstance(shards, int) or shards <= 0:
+                continue
+            held = channels // shards if name == "bias" else channels // shards
+            if held == 0 or (per_group % held and held % per_group):
+                ctx.error(
+                    call,
+                    f"{name} splits {channels} output channels {shards} ways "
+                    f"across {groups} groups of {per_group}, so a participant "
+                    "can straddle a group boundary and no projection here can "
+                    "say which; align the split to the group size",
+                )
+
+
 def _require_exact_partial_state(call, ctx, x, weight, bias) -> None:
     named = (("input", x), ("weight", weight), ("bias", bias))
     placed = [
@@ -250,56 +289,6 @@ def _require_exact_partial_state(call, ctx, x, weight, bias) -> None:
             )
 
 
-@register_type_relation(Conv2D)
-def _conv2d_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    x, weight, _bias = input_types
-    op = call.target
-    k_h = static_dim_value(weight.shape[2])
-    k_w = static_dim_value(weight.shape[3])
-    in_per_group = (
-        x.shape[1]
-        if op.groups == 1
-        else static_dim_value(x.shape[1]) // op.groups
-    )
-    out_per_group = (
-        None
-        if op.groups == 1
-        else static_dim_value(weight.shape[0]) // op.groups
-    )
-    out_shape = _output_shape(
-        x, weight, op.stride, op.padding, op.dilation, k_h, k_w
-    )
-    domain, param_map = to_domain((*out_shape, in_per_group, k_h, k_w))
-    dims = [f"d{i}" for i in range(7)]
-    source = f"[{', '.join(dims)}]"
-    input_channel = (
-        "d4"
-        if op.groups == 1
-        else f"floor(d1/{out_per_group})*{in_per_group}+d4"
-    )
-
-    def spatial(out_dim: str, kernel_dim: str, stride: int, pad: int, dilation: int, k: int):
-        terms = [out_dim if stride == 1 else f"{stride}*{out_dim}"]
-        if k != 1:
-            terms.append(kernel_dim if dilation == 1 else f"{dilation}*{kernel_dim}")
-        expression = "+".join(terms)
-        return expression if pad == 0 else f"{expression}-{pad}"
-
-    input_map = isl.map(
-        f"{{ {source} -> [d0, {input_channel}, "
-        f"{spatial('d2', 'd5', op.stride[0], op.padding[0], op.dilation[0], k_h)}, "
-        f"{spatial('d3', 'd6', op.stride[1], op.padding[1], op.dilation[1], k_w)}] }}"
-    )
-    weight_map = isl.map(f"{{ {source} -> [d1, d4, d5, d6] }}")
-    bias_map = isl.map(f"{{ {source} -> [d1] }}")
-    output_map = isl.map(f"{{ {source} -> [d0, d1, d2, d3] }}")
-    return AccessRelationResult(
-        domain=domain,
-        maps=(input_map, weight_map, bias_map, output_map),
-        param_map=param_map,
-    )
-
-
 @register_typeinfer(Conv2D)
 def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     x = ctx.type_of(call.args[0])
@@ -315,7 +304,8 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
             ctx.error(call, f"output {name} extent must be positive, got {static}")
 
     _require_exact_partial_state(call, ctx, x, w, bias)
-    relation = build_relation(call, (x, w, bias), ctx)
+    _require_group_aligned_output_split(call, ctx, w, bias, _groups)
+    relation = coordinates_of(call, ctx)
     try:
         shard = derive_output_shard_layout(
             (x, w, bias),
@@ -354,3 +344,53 @@ def _eval_conv2d(ctx):
         groups=ctx.op.groups,
     )
     return TensorValue(data=out, type=ctx.result_type)
+
+
+@register_access_relation(Conv2D)
+def _conv2d_access(call: "Call", ctx) -> AccessRelations:
+    """The receptive field, as one affine relation over the space it walks.
+
+    Where a window sits moves affinely with the output coordinate, so this is a
+    relation and not a window: the offset is not a value, it is the coordinate.
+    The space walked is what the result has, plus the contraction and the two
+    kernel taps, all of them derived from the operands and the Op's own strides
+    because the result's Type is what this answer produces.
+    """
+    x = ctx.type_of(call.args[0])
+    weight = ctx.type_of(call.args[1])
+    op = call.target
+    k_h = static_dim_value(weight.shape[2])
+    k_w = static_dim_value(weight.shape[3])
+    contraction = weight.shape[1]
+    result = _output_shape(x, weight, op.stride, op.padding, op.dilation, k_h, k_w)
+    dims = ["n", "co", "oh", "ow", "ci", "kh", "kw"]
+    domain = ", ".join(dims)
+
+    def spatial(out_dim, kernel_dim, stride, pad, dilation, extent):
+        terms = [out_dim if stride == 1 else f"{stride}{out_dim}"]
+        if extent != 1:
+            terms.append(kernel_dim if dilation == 1 else f"{dilation}{kernel_dim}")
+        walked = " + ".join(terms)
+        return walked if pad == 0 else f"{walked} - {pad}"
+
+    height = spatial("oh", "kh", op.stride[0], op.padding[0], op.dilation[0], k_h)
+    width = spatial("ow", "kw", op.stride[1], op.padding[1], op.dilation[1], k_w)
+    guard = " and ".join((f"0 <= {height} < {x.shape[2]}", f"0 <= {width} < {x.shape[3]}"))
+    per_group_out = max(weight.shape[0] // op.groups, 1) if op.groups != 1 else 1
+    channel = "ci" if op.groups == 1 else f"floor(co/{per_group_out})*{contraction}+ci"
+    reached = AffineAccess(
+        isl.map(f"{{ [{domain}] -> [n, {channel}, {height}, {width}] : {guard} }}")
+    )
+    return iterating(
+        (*result, contraction, k_h, k_w),
+        AccessRelations(
+            inputs=(
+                BoundaryRelation(reached),
+                BoundaryRelation(AffineAccess(isl.multi_aff(f"{{ [{domain}] -> [co, ci, kh, kw] }}"))),
+                BoundaryRelation(AffineAccess(isl.multi_aff(f"{{ [{domain}] -> [co] }}"))),
+            ),
+            outputs=(
+                BoundaryRelation(AffineAccess(isl.multi_aff(f"{{ [{domain}] -> [n, co, oh, ow] }}"))),
+            ),
+        ),
+    )

@@ -56,7 +56,7 @@ def test_the_plan_reaches_the_level_below_the_one_it_partitions(
     levels, and a root that stopped declaring ``thread`` leaves this command with
     no level to be given and no test to inject one. Only this model and
     ``qwen2_5_1_5b`` can witness that -- the other roots declare ``thread`` too, but
-    their IR reaches ops with no registered type relation, so the command fails for
+    their IR reaches ops with no registered access relation, so the command fails for
     a reason that has nothing to do with the level.
     """
     contract.scheduled(tf, shipped_source(MODEL), case, planned, topology="thread")
@@ -166,7 +166,7 @@ def test_the_decode_step_and_the_cache_entry_it_hands_back(
 
 
 def test_the_placed_mlp_matches_the_reference(tf, shipped_source, tmp_path) -> None:
-    """The timeline witness keeps the shipped MLP's numerical boundary."""
+    """The performance witness keeps the shipped MLP's numerical boundary."""
     drawn = reference.decode_step_inputs(ctx_len=0, device="cpu")
     want = reference.mlp_reference(drawn.layer, drawn.hidden_new)
 

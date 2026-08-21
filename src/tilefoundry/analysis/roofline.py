@@ -16,7 +16,12 @@ from tilefoundry.target import Target
 
 from .errors import AnalysisError
 from .facts import ThroughputFacts
-from .metadata import ComputeCostMetadata, RooflineMetadata, TrafficBytes
+from .metadata import (
+    ComputeCostMetadata,
+    RooflineMetadata,
+    TrafficBytes,
+    TrafficMetadata,
+)
 from .walk import attach, describe, postorder, reachable_functions
 
 SELECTOR = "roofline"
@@ -60,9 +65,10 @@ def _memory_ns(traffic: TrafficBytes, facts: ThroughputFacts) -> int:
 def _bound(compute_ns: int, memory_ns: int, *, has_work: bool) -> RooflineMetadata:
     """Combine the two sides into one bound and name the one that set it.
 
-    Work the machine has no published rate for still takes time, so a call that
-    does something reports at least one nanosecond. Reporting zero would read as
-    free.
+    A nanosecond is owed by what this could have priced: work of a rated kind
+    whose own rate is missing reports at least one, because reporting zero for
+    it would read as free. Bytes at a level with no published bandwidth owe
+    nothing -- no rate was ever stated for them, so no floor follows.
     """
     ideal = max(compute_ns, memory_ns)
     if not ideal:
@@ -90,16 +96,24 @@ def _bound(compute_ns: int, memory_ns: int, *, has_work: bool) -> RooflineMetada
 
 
 def _cost_bound(
-    cost: ComputeCostMetadata, facts: ThroughputFacts, *, scale: int = 1
+    cost: ComputeCostMetadata, moved: TrafficMetadata, facts: ThroughputFacts
 ) -> RooflineMetadata:
-    """Bound one compute-cost record after applying an execution count."""
-    flops = tuple((name, value * scale) for name, value in cost.flops)
-    traffic = cost.traffic_at(facts.bandwidth_level)
-    traffic = TrafficBytes(traffic.read * scale, traffic.write * scale)
+    """Bound one occurrence from the work it does and the bytes it moves.
+
+    Whole-device work against whole-device rates: the flops the target publishes
+    a peak for, and the bytes at the level it publishes a bandwidth for. Typed
+    service has no whole-device rate to divide by and so does not enter a bound,
+    and neither do bytes at a level with no published bandwidth: what asks for a
+    nanosecond is what this could have priced, so a dtype whose rate is missing
+    still owes one and a level nobody rated does not.
+    """
+    crossed = moved.at(facts.bandwidth_level)
     return _bound(
-        _compute_ns(flops, facts),
-        _memory_ns(traffic, facts),
-        has_work=bool(cost.flops or cost.traffic),
+        _compute_ns(cost.flops, facts),
+        _memory_ns(crossed, facts),
+        has_work=bool(
+            any(value for _name, value in cost.flops) or crossed.total_bytes
+        ),
     )
 
 
@@ -122,14 +136,26 @@ def analyze_roofline(
                     f"{describe(expr)}: roofline needs the compute-cost record "
                     "this call was never given"
                 )
-            attach(expr, _cost_bound(cost, facts))
+            moved = get_metadata(expr, TrafficMetadata)
+            if moved is None:
+                raise AnalysisError(
+                    f"{describe(expr)}: roofline needs the traffic record the "
+                    "memory family states for every call it measures"
+                )
+            attach(expr, _cost_bound(cost, moved, facts))
         total = get_metadata(fn, ComputeCostMetadata)
         if total is None:
             raise AnalysisError(
                 f"function {fn.name!r}: roofline needs the compute-cost root "
                 "record this function was never given"
             )
-        attach(fn, _cost_bound(total, facts))
+        moved = get_metadata(fn, TrafficMetadata)
+        if moved is None:
+            raise AnalysisError(
+                f"function {fn.name!r}: roofline needs the traffic root record "
+                "the memory family states for every function it measures"
+            )
+        attach(fn, _cost_bound(total, moved, facts))
 
 
 __all__ = ["SELECTOR", "analyze_roofline"]

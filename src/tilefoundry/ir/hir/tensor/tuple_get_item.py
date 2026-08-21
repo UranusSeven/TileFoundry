@@ -8,8 +8,8 @@ from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.types import TupleType
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    identity_relations,
     register_access_relation,
+    view_relations,
 )
 
 
@@ -25,7 +25,13 @@ class TupleGetItem(Op):
     index = ParamDef(kind="attribute", annotation=int)
 
 
-register_access_relation(TupleGetItem)(identity_relations(1))
+
+
+
+
+register_access_relation(TupleGetItem)(
+    view_relations(0, field=lambda call, ctx: call.target.index)
+)
 
 
 @register_typeinfer(TupleGetItem)

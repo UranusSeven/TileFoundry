@@ -25,6 +25,7 @@ from tilefoundry.ir.types.shard.shard_layout import (
     layout_axis_to_tensor_axis,
     shard_layout_of,
 )
+from tilefoundry.visitor_registry.access_relation import boundary_maps
 
 
 def partial_reductions_by_axis(
@@ -45,27 +46,41 @@ def partial_reductions_by_axis(
     )
 
 
-def _single_affine_piece(m: "isl.map") -> "isl.multi_aff":
-    """Return one affine access even when its iteration domain is restricted."""
-    pieces: list[isl.multi_aff] = []
-    m.as_pw_multi_aff().foreach_piece(lambda _domain, access: pieces.append(access))
-    if len(pieces) != 1:
-        raise ValueError(
-            f"shard propagation requires one affine access piece, got {len(pieces)}"
-        )
-    return pieces[0]
+def _equal_axis(m: "isl.map", out_axis: int, in_dim: int) -> "isl.map":
+    """Every pair whose result axis *out_axis* is its domain dim *in_dim*."""
+    params = [
+        m.get_dim_name(isl.dim_type.PARAM, index)
+        for index in range(m.dim(isl.dim_type.PARAM))
+    ]
+    prefix = f"[{', '.join(params)}] -> " if params else ""
+    reads = ", ".join(f"i{index}" for index in range(m.dim(isl.dim_type.IN)))
+    writes = ", ".join(f"o{index}" for index in range(m.dim(isl.dim_type.OUT)))
+    return isl.map(f"{prefix}{{ [{reads}] -> [{writes}] : o{out_axis} = i{in_dim} }}")
 
 
-def _result_access(m: "isl.map") -> dict[int, "tuple[str, int | None]"]:
-    """Classify each result (out) axis of *m* by how it accesses the domain: - ``("proj", d)``.
+def _tracked_anyway(m: "isl.map", out_axis: int) -> "int | None":
+    """Whether a constant-looking axis provably *is* its own domain dim.
 
-    Classify each result (out) axis of *m* by how it accesses the domain:
-    - ``("proj", d)`` — a zero-offset pure projection of domain dim ``d``
-      (single in-dim, unit coefficient): the access tracks that domain dim.
-    - ``("const", None)`` — no domain dim involved: a constant (broadcast)
-      access.
-    - ``("complex", None)`` — multiple in-dims, a non-unit coefficient, or
-      otherwise not a pure projection: not supported for shard propagation.
+    An access map is restricted to the space its Op walks, and within a space
+    that gives a dim one value the coordinate and the constant it equals are the
+    same expression: isl prints whichever it likes. Only the axis's own dim is
+    accepted, so what is recovered is the projection that was written and never
+    some other dim that happens to hold the same value.
+    """
+    if out_axis >= m.dim(isl.dim_type.IN):
+        return None
+    return out_axis if m.is_subset(_equal_axis(m, out_axis, out_axis)) else None
+
+
+def _result_access(
+    m: "isl.map", *, folded: bool = False
+) -> dict[int, "tuple[str, int | None]"]:
+    """How each result axis of *m* reaches the domain: proj, const, or complex.
+
+    ``folded`` asks the relation rather than its spelling. A map restricted to
+    the space its Op walks prints an axis of extent one as either the coordinate
+    or the constant it equals, and a result axis has to be traced back to the
+    dim it came from.
     """
     ma = _single_affine_piece(m)
     n_in = ma.dim(isl.dim_type.IN)
@@ -86,7 +101,8 @@ def _result_access(m: "isl.map") -> dict[int, "tuple[str, int | None]"]:
         if has_div:
             out[o] = ("complex", None)
         elif not used:
-            out[o] = ("const", None)
+            tracked = _tracked_anyway(m, o) if folded else None
+            out[o] = ("const", None) if tracked is None else ("proj", tracked)
         elif has_offset:
             out[o] = ("complex", None)
         elif len(used) == 1 and used[0][1] == 1:
@@ -96,10 +112,21 @@ def _result_access(m: "isl.map") -> dict[int, "tuple[str, int | None]"]:
     return out
 
 
+def _single_affine_piece(m: "isl.map") -> "isl.multi_aff":
+    """Return one affine access even when its iteration domain is restricted."""
+    pieces: list[isl.multi_aff] = []
+    m.as_pw_multi_aff().foreach_piece(lambda _domain, access: pieces.append(access))
+    if len(pieces) != 1:
+        raise ValueError(
+            f"shard propagation requires one affine access piece, got {len(pieces)}"
+        )
+    return pieces[0]
+
+
 def _involved_domain_dims(m: "isl.map") -> "set[int]":
     """All domain (in) dims referenced by any result axis of *m*.
 
-    All domain (in) dims referenced by any result axis of *m* — including
+    All domain (in) dims referenced by any result axis of *m* -- including
     those that appear only inside a non-projection (complex) access.
     """
     ma = _single_affine_piece(m)
@@ -128,18 +155,17 @@ def _carrier_layout(
     """Transform a covering input shard layout into the output layout.
 
     Route positions through domain projections and emit them in output-axis
-    order, including permutations and fully reduced axes. Preserve strides for
-    views or rebuild C-order strides for fresh buffers. Return ``None`` when
-    projection, output coverage, or propagated sharding is incomplete so a
-    partial contributor cannot replace layout synthesis.
+    order. This carries a physical factorization across, so anything short of an
+    exact coordinate projection returns ``None`` and lets synthesis build a
+    canonical layout instead.
     See [shard §6](docs/spec/shard.md#6-shardattr) and
     [shard §7.1.1](docs/spec/shard.md#711-layoutshape).
     """
     sl = input_type.layout
     layout = sl.layout
     la2ta_in = layout_axis_to_tensor_axis(layout.shape, input_type.shape)
-    in_access = _result_access(input_map)
-    out_access = _result_access(output_map)
+    in_access = _result_access(input_map, folded=True)
+    out_access = _result_access(output_map, folded=True)
     dom_to_out = {d: o for o, (k, d) in out_access.items() if k == "proj"}
 
     pos_dom: list = []
@@ -233,14 +259,14 @@ def _carrier_layout(
 
 def derive_output_shard_layout(
     input_types: tuple,
-    relation,
+    relations,
     output_shape: tuple,
     *,
     partial_reduction_dims: "frozenset[int]" = frozenset(),
     complete_reduction_dims: "frozenset[int]" = frozenset(),
     fresh_strides: bool = False,
 ):
-    """Derive the output ``ShardLayout`` from the input shards and the forward relation."""
+    """Derive the output ``ShardLayout`` from the input shards and the Op's relations."""
     input_types = tuple(
         replace(type_, layout=layout)
         if (layout := shard_layout_of(type_.layout)) is not None
@@ -261,8 +287,8 @@ def derive_output_shard_layout(
             raise ValueError(f"input {i} references a different mesh")
     mesh_rank = len(mesh.layout.shape)
 
-    *input_maps, output_map = relation.maps
-    out_access = _result_access(output_map)
+    *input_maps, output_map = boundary_maps(relations)
+    out_access = _result_access(output_map, folded=True)
     domain_to_out_axis = {
         d: o for o, (kind, d) in out_access.items() if kind == "proj"
     }

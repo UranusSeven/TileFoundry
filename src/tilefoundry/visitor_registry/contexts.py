@@ -84,6 +84,16 @@ class TypeInferContext:
         self.cache[key] = computed
         return computed
 
+    def local_type_of(self, expr: Expr) -> Type:
+        """Return ``expr``'s Type as written, there being no window here.
+
+        A context with a topology window overrides this. Asking the question of
+        every context is what lets one registered handler answer both the whole
+        program's quantities and one unit's, instead of two handlers that have
+        to be kept saying the same thing.
+        """
+        return self.type_of(expr)
+
     def error(self, node: Union[Expr, Stmt], msg: str) -> NoReturn:
         if isinstance(node, Call):
             name = type(node.target).__name__
@@ -169,16 +179,18 @@ class TrafficBytes:
 class Cost:
     """Leaf-local logical work for one selected ``OpCandidate``.
 
-    ``flops`` groups leaf-local logical work by compute ``DType`` so one Op
-    can report mixed work without selecting an ALU/TensorCore
-    implementation. ``traffic`` carries one entry per operand in call order
-    with the result last, so an Op that reads part of an input says so where
-    it knows it. Neither field selects a hardware implementation, and neither
-    names a memory level: that is a function of the operand's Type.
+    ``flops`` groups leaf-local logical work by compute ``DType`` so one Op can
+    report mixed work without selecting an ALU/TensorCore implementation.
+    ``service`` counts what is not floating point at all -- a comparison, a
+    select, an integer add -- by the service it asks for, because a dtype is not
+    a kind of work. ``traffic`` carries one entry per operand in call order with
+    the result last, so an Op that reads part of an input says so where it knows
+    it. No field names a hardware implementation or a memory level.
     """
 
     flops: Mapping[DType, int]
     traffic: tuple[TrafficBytes, ...]
+    service: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def bytes(self) -> int:
@@ -194,6 +206,11 @@ class Cost:
             for value in (moved.read, moved.write)
         ):
             raise ValueError("Cost traffic must be non-negative integers")
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+            for value in self.service.values()
+        ):
+            raise ValueError("Cost service work must be non-negative integers")
 
 
 __all__ = [

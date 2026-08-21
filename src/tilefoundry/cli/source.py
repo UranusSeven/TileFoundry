@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import contextlib
 import importlib.util
 import io
@@ -83,6 +84,183 @@ def select_ir(namespace: dict[str, object], selector: str | None) -> Module:
     raise ValueError("source defines no TileFoundry Module")
 
 
+def _statement_codes(path: Path) -> tuple[list[tuple[ast.stmt, object]], bool]:
+    """Each top-level statement of *path*, compiled to run on its own.
+
+    The whole file is compiled first and thrown away, so every rule Python
+    applies to a module still applies: a misplaced `__future__` import is refused
+    there. Executing less of a file is what a selector asks for; accepting more of
+    the language is not. Those imports govern the statements after them, so the
+    leading run of them prefixes every statement -- alone, a statement would not
+    have them -- and the compile does not inherit this caller's flags, because
+    what a file postpones is the file's own decision.
+    """
+    text = path.read_text(encoding="utf-8")
+    compile(text, str(path), "exec", dont_inherit=True)
+    tree = ast.parse(text, filename=str(path))
+    future: list[ast.stmt] = []
+    for item in tree.body:
+        if isinstance(item, ast.ImportFrom) and item.module == "__future__":
+            future.append(item)
+            continue
+        if isinstance(item, ast.Expr) and isinstance(item.value, ast.Constant):
+            continue
+        break
+    documented = (
+        tree.body[0]
+        if tree.body
+        and isinstance(tree.body[0], ast.Expr)
+        and isinstance(tree.body[0].value, ast.Constant)
+        and isinstance(tree.body[0].value.value, str)
+        else None
+    )
+    codes = []
+    for statement in tree.body:
+        if statement in future:
+            continue
+        prefix = () if statement is documented else future
+        unit = ast.Module(body=[*prefix, statement], type_ignores=[])
+        codes.append((statement, compile(unit, str(path), "exec", dont_inherit=True)))
+    postponed = any(
+        alias.name == "annotations" for item in future for alias in item.names
+    )
+    return codes, postponed
+
+
+def _at_module_level(statement: ast.stmt, *, postponed: bool = False) -> set[str]:
+    """The names *statement* reads while the file runs.
+
+    Reads, not spellings: a name being written is not a reading of it. A
+    comprehension's variables are its own -- only its first iterable is evaluated
+    where it is written, every later one inside, where all the targets belong to
+    it. A function body runs when something calls it, so its names are not read
+    here, while what decorates it and defaults its arguments is. Whether its
+    annotations are is the file's own decision, which *postponed* carries.
+    """
+    found: set[str] = set()
+    scopes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    comprehensions = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+    def evaluated_around(node: ast.AST) -> list[ast.AST]:
+        """The parts of a function definition the file evaluates as it passes it."""
+        parts: list[ast.AST] = list(getattr(node, "decorator_list", ()))
+        parts.extend(node.args.defaults or ())
+        parts.extend(item for item in (node.args.kw_defaults or ()) if item is not None)
+        if postponed:
+            return parts
+        if getattr(node, "returns", None) is not None:
+            parts.append(node.returns)
+        parts.extend(
+            argument.annotation
+            for argument in ast.walk(node.args)
+            if isinstance(argument, ast.arg) and argument.annotation is not None
+        )
+        return parts
+
+    def walk(node: ast.AST, bound: frozenset[str]) -> None:
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Load) and node.id not in bound:
+                found.add(node.id)
+            return
+        if isinstance(node, scopes):
+            for part in evaluated_around(node):
+                walk(part, bound)
+            return
+        if isinstance(node, comprehensions):
+            inner = bound | {
+                item.id
+                for generator in node.generators
+                for item in ast.walk(generator.target)
+                if isinstance(item, ast.Name)
+            }
+            for index, generator in enumerate(node.generators):
+                walk(generator.iter, bound if index == 0 else inner)
+                for condition in generator.ifs:
+                    walk(condition, inner)
+            for part in (
+                getattr(node, "elt", None),
+                getattr(node, "key", None),
+                getattr(node, "value", None),
+            ):
+                if part is not None:
+                    walk(part, inner)
+            return
+        if postponed and isinstance(node, ast.AnnAssign):
+            for part in (node.target, node.value):
+                if part is not None:
+                    walk(part, bound)
+            return
+        for child in ast.iter_child_nodes(node):
+            walk(child, bound)
+
+    walk(statement, frozenset())
+    return found
+
+
+def _binds(statement: ast.stmt, name: str) -> bool:
+    """Whether *statement* is what gives *name* its value."""
+    if isinstance(statement, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return statement.name == name
+    if isinstance(statement, (ast.Import, ast.ImportFrom)):
+        return any(
+            (alias.asname or alias.name.partition(".")[0]) == name
+            for alias in statement.names
+        )
+    targets: tuple = ()
+    if isinstance(statement, ast.Assign):
+        targets = tuple(statement.targets)
+    elif isinstance(statement, (ast.AnnAssign, ast.AugAssign)):
+        targets = (statement.target,)
+    return any(
+        isinstance(item, ast.Name) and item.id == name
+        for target in targets
+        for item in ast.walk(target)
+    )
+
+
+def _follows_from(error: BaseException, aside: list[ast.stmt]) -> bool:
+    """Whether *error* is a consequence of a statement already set aside.
+
+    A statement that was set aside bound nothing, so one reaching for what it
+    would have bound fails for that reason rather than its own. Reporting the
+    second failure would name the symptom: the file that could not import its
+    sibling would be described as a file with an undefined name in it.
+    """
+    return isinstance(error, NameError) and any(
+        _binds(statement, error.name or "") for statement in aside
+    )
+
+
+def _run_for_selection(path: Path, module: object, root: str) -> None:
+    """Execute *path* for the one root *root* names, statement by statement.
+
+    A class that refuses to be built refuses while the file runs, so naming one
+    root makes the rest a different question: a statement that is not the
+    selection's is set aside when it fails. One that is -- binding the root, or
+    reading it while the file runs -- is building or reconfiguring what was asked
+    for, so its failure is raised even when something failed earlier and even when
+    the root is already bound. Nothing is dropped unexecuted; a missing root at the
+    end means something it needed failed, and the first of those is the reason.
+    """
+    first: BaseException | None = None
+    aside: list[ast.stmt] = []
+    codes, postponed = _statement_codes(path)
+    for statement, code in codes:
+        try:
+            exec(code, module.__dict__)  # noqa: S102 — the authored file
+        except Exception as error:  # noqa: BLE001 — one unfinished statement
+            mine = _binds(statement, root) or root in _at_module_level(
+                statement, postponed=postponed
+            )
+            if mine and not _follows_from(error, aside):
+                raise
+            aside.append(statement)
+            if first is None:
+                first = error
+    if root not in module.__dict__ and first is not None:
+        raise first
+
+
 def load_namespace(source: str) -> tuple[dict[str, object], str | None]:
     """Load one authored file, returning what it defined and its selector.
 
@@ -113,15 +291,14 @@ def load_namespace(source: str) -> tuple[dict[str, object], str | None]:
         module = importlib.util.module_from_spec(spec)
 
 
-
-
-
-
         sys.modules[spec.name] = module
         captured_stdout = io.StringIO()
         with contextlib.redirect_stdout(captured_stdout):
             try:
-                spec.loader.exec_module(module)
+                if selector is None:
+                    spec.loader.exec_module(module)
+                else:
+                    _run_for_selection(path, module, selector.split(".")[0])
             except ModuleNotFoundError as error:
                 raise ValueError(
                     f"{path.name} imports {error.name!r}, which is not importable.\n"
@@ -151,8 +328,7 @@ def load_authored_ir(source: str) -> Module:
 def entry_function(ir: Module | Function) -> Function:
     """Resolve the HIR Function a command runs its pipeline over.
 
-    Resolve the HIR Function a command runs its pipeline over -- the
-    same Module -> entry_function() convention as `selected_target`.
+    The same Module -> entry_function() convention as `selected_target`.
     """
     function = ir.entry_function() if isinstance(ir, Module) else ir
     if not isinstance(function, Function):
@@ -163,9 +339,9 @@ def entry_function(ir: Module | Function) -> Function:
 def selected_target(ir: Module):
     """The Target the selection declares.
 
-    The Target the selection declares. Schedule and Analyze read hardware
-    facts off it, so an undeclared Target is an authoring error rather than a
-    cue to pick one: the selection must name the device it was written for.
+    Schedule and Analyze read hardware facts off it, so an undeclared Target is
+    an authoring error rather than a cue to pick one: the selection must name
+    the device it was written for.
     """
     if not isinstance(ir, Module):
         raise TypeError(

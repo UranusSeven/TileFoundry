@@ -6,7 +6,8 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, fields, is_dataclass
-from typing import get_args, get_origin, get_type_hints
+from types import UnionType
+from typing import Union, get_args, get_origin, get_type_hints
 
 from tilefoundry.analysis.facts import MemoryHierarchyFacts
 from tilefoundry.analysis.memory import cache_pressure
@@ -14,9 +15,10 @@ from tilefoundry.analysis.metadata import (
     ComputeCostMetadata,
     LoopFootprintMetadata,
     MemoryMetadata,
+    PerformanceMetadata,
+    PerformanceSummaryMetadata,
     RooflineMetadata,
-    TimelineMetadata,
-    TimelineSummaryMetadata,
+    TrafficMetadata,
 )
 from tilefoundry.analysis.walk import postorder, tensor_types
 from tilefoundry.ir.core import Call, IRMetadata, binding_name, get_metadata
@@ -77,9 +79,17 @@ def render_record(record: IRMetadata, expr: object) -> dict[str, object]:
 
 
 def _reported_value(value: object, declared: object) -> object:
-    """Serialize one value according to the type its field declared."""
+    """Serialize one value according to the type its field declared.
+
+    A field that may be absent declares a union with ``None``; the value that
+    arrived is not ``None`` here, so what remains of the union is what it is.
+    """
     if value is None:
         return None
+    if get_origin(declared) in (Union, UnionType):
+        stated = [arg for arg in get_args(declared) if arg is not type(None)]
+        if len(stated) == 1:
+            declared = stated[0]
     if is_dataclass(declared) and isinstance(declared, type):
         hints = get_type_hints(declared)
         return {
@@ -118,10 +128,11 @@ for _record_type in (
     LoopFootprintMetadata,
     MemoryMetadata,
     RooflineMetadata,
-    TimelineMetadata,
-    TimelineSummaryMetadata,
 ):
     declare_record(_record_type)
+
+declare_record(PerformanceMetadata, family="performance")
+declare_record(PerformanceSummaryMetadata, family="performance")
 
 
 def _type_text(type_: object) -> str:
@@ -147,7 +158,7 @@ def _operand_name(operand: object) -> str:
 
 
 def _operands(
-    record: ComputeCostMetadata, expr: object
+    record: TrafficMetadata, expr: object
 ) -> list[dict[str, object]] | None:
     """Each recorded amount, against the operand it was charged to."""
     if not isinstance(expr, Call) or not record.operands:
@@ -165,7 +176,7 @@ def _operands(
     ]
 
 
-expr_field(ComputeCostMetadata, "operands", _operands)
+expr_field(TrafficMetadata, "operands", _operands)
 
 
 def _records_of(expr: object, selected: frozenset[type[IRMetadata]]) -> dict[str, object]:
@@ -212,10 +223,6 @@ def report_data(
     selected = frozenset(selected_types_)
     target = module.resolve_target()
     function_records = _records_of(function, selected)
-    if "roofline" in analyses and "memory" not in function_records:
-        support = _roofline_memory_support(function)
-        if support is not None:
-            function_records["memory"] = support
     data = {
         "target": target.identity,
         "module": module.name,
@@ -228,24 +235,12 @@ def report_data(
         "loops": _loop_records(function, selected, target),
     }
     available = set(metadata_types)
-    if ComputeCostMetadata in selected or (
-        "roofline" in analyses and ComputeCostMetadata in available
+    asked = {ComputeCostMetadata, TrafficMetadata}
+    if asked & selected or (
+        "roofline" in analyses and asked & available
     ):
         data["totals"] = _work_totals(function)
     return data
-
-
-def _roofline_memory_support(function: Function) -> dict[str, object] | None:
-    """The bounded memory fact that explains a requested roofline verdict."""
-    record = get_metadata(function, MemoryMetadata)
-    if record is None:
-        return None
-    return {
-        "footprint": [
-            {"level": value.level, "peak_bytes": value.peak_bytes}
-            for value in record.footprint
-        ]
-    }
 
 
 def _call_records(
@@ -305,12 +300,17 @@ def _loop_records(
 
 
 def _work_totals(function: Function) -> dict[str, object]:
-    """The multiplicity-aware work recorded on the Function root."""
+    """The multiplicity-aware work and movement recorded on the Function root.
+
+    Two families answer here, each about its own half, so a report states what
+    a program asks of the machine beside what it moves through it.
+    """
     record = get_metadata(function, ComputeCostMetadata)
-    if record is None:
-        return {"flops": {}, "traffic": {}}
-    reported = render_record(record, function)
-    return {"flops": reported["flops"], "traffic": reported["traffic"]}
+    moved = get_metadata(function, TrafficMetadata)
+    return {
+        "flops": {} if record is None else render_record(record, function)["flops"],
+        "traffic": {} if moved is None else render_record(moved, function)["whole"],
+    }
 
 
 def render_json(data: dict[str, object]) -> str:

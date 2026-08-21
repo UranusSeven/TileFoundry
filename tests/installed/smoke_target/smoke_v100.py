@@ -49,14 +49,14 @@ def test_external_v100_documents_analyse_a_copied_installed_model(
         "--compute-cost",
         "--memory",
         "--roofline",
-        "--timeline",
+        "--performance",
         "--json",
     )
     assert done.returncode == 0, done.stderr
     report = json.loads(done.stdout)
 
     assert report["target"] == "vendor.v100_sxm2_32gb"
-    assert report["executed"] == ["compute-cost", "memory", "roofline", "timeline"]
+    assert report["executed"] == ["compute-cost", "memory", "roofline", "performance"]
     assert report["totals"]["flops"]["f16"] > 0
     assert report["function_records"]["roofline"]["ideal_ns"] > 0
     gmem = next(
@@ -64,17 +64,27 @@ def test_external_v100_documents_analyse_a_copied_installed_model(
         if item["level"] == "gmem"
     )
     assert gmem["peak_bytes"] < 32_000_000_000
-    timeline = report["function_records"]["timeline"]
-    assert timeline["waves"] == 2
-    assert timeline["estimated_kernel_ns"] == 2 * timeline["local_makespan_ns"]
-    call_timelines = [call["timeline"] for call in report["calls"]]
-    assert call_timelines
+    record = report["function_records"]["performance"]
+    assert record["waves"] == 2
+    assert report["function_records"]["memory"]["allocation"]["solver_status"] in (
+        "optimal",
+        "feasible",
+    )
+    call_records = [
+        call["performance"]["timeline"] for call in report["calls"] if "performance" in call
+    ]
+    assert call_records
     assert all(
         set(call) == {"start_ns", "end_ns", "trips", "stride_ns"}
-        for call in call_timelines
+        for call in call_records
     )
-    assert all(call["end_ns"] >= call["start_ns"] for call in call_timelines)
-    assert timeline["local_makespan_ns"] == max(call["end_ns"] for call in call_timelines)
+    assert all(call["end_ns"] > call["start_ns"] for call in call_records)
+    assert record["timeline"] == {
+        "start_ns": 0,
+        "end_ns": 2 * max(call["end_ns"] for call in call_records),
+        "trips": 1,
+        "stride_ns": 0,
+    }
 
     scheduled = tf(
         "schedule",

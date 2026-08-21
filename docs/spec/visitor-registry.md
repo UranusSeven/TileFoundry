@@ -117,7 +117,7 @@ Two node shapes can be registry-dispatched:
   flow, binding, `Evaluate`, user `@intrinsic`. The Stmt subclass is
   the registry key; handler signature is `(stmt: Stmt, ctx) -> T`.
 
-A given analysis registry keys exactly one of the two. The four
+A given analysis registry keys exactly one of the two. The
 instances split as follows:
 
 | Instance | Op-branch handler | Stmt-branch handler | Notes |
@@ -136,7 +136,7 @@ through any registry — their semantic rules are owned by
 
 ## 3. `AnalysisRegistry`
 
-All four instances share one registry implementation. It is a
+Every instance shares one registry implementation. It is a
 class-keyed dict with a duplicate-registration guard.
 
 ```python
@@ -272,85 +272,43 @@ expression structure and needs to recompute types, it calls
 `typeinfer_registry.lookup(...)` directly (see
 [passes](./passes.md)).
 
-### 4.1 Forward relation service — `type_relation`
+### 4.1 Access relation service — `access_relation`
 
-A second registry exposes each op's access relation as a **forward**
-service that typeinfer consumes. Its result carrier is:
-
-```python
-@dataclass
-class AccessRelationResult:
-    domain: isl.set             # the op's bounded iteration domain as an isl.set
-    maps: tuple[isl.map, ...]   # one access isl.map per boundary value, in boundary order (inputs then outputs)
-    param_map: dict             # domain's isl parameter name -> the ShapeDim it stands for; this Call's own data, never shared
-```
-
-- constraints:
-  - the carrier holds **no** tensor shape; the output shape is typeinfer-side
-    data (see [semantic-analysis §1.1](./semantic-analysis.md#11-relation-derived-type-behavior)).
-
-#### `domain`
-
-The op's bounded iteration domain as an `isl.set`. Static iteration
-extents are constant constraints (`0 <= i < N`); a bare `DimVar` extent is
-a same-name isl parameter bound to its own `[lo, hi)`. Any other
-`ShapeDim` expression binds to a fresh opaque isl parameter instead — its
-arithmetic structure never enters isl, only its value range does — keyed
-so the same expression always binds to the same parameter. The domain's
-rank is fixed and is read from the input types.
-
-#### `param_map`
-
-Maps each of `domain`'s isl parameter names back to the `ShapeDim` it
-stands for. Built once alongside `domain` and carried on this result —
-never module-level state, so it is safe across concurrent or repeated
-relation builds. The output-shape derivation that consumes `domain` reads
-`param_map` to resolve a recovered isl expression back to a `ShapeDim`.
-
-#### `maps`
-
-One access `isl.map` per boundary value, in boundary order — inputs
-first, then outputs — each mapping the iteration domain to that tensor's
-index space. The carrier holds **no** tensor shape: the output shape is
-typeinfer-side data, not part of the relation (see
-[semantic-analysis §1.1](./semantic-analysis.md#11-relation-derived-type-behavior)).
-
-Registry + decorator:
+One registry over the Op classes says where each Op reads and writes, and every
+reader asks it. Typeinfer asks it to derive the result's Type, the polyhedral
+model asks it for dependences, and the movement family asks it how much crossed
+each boundary. There is no second registry and no fallback: a boundary nobody
+can price is a boundary nobody can schedule.
 
 ```python
-type_relation_registry: AnalysisRegistry[type[Op]]     # forward relation registry keyed by type[Op]
-def register_type_relation(op_cls: type[Op]): ...       # decorator: register a type_relation handler for one Op class
-```
+class AffineAccess:
+    """One boundary's relation, together with what its parameters are.
 
-Handler signature:
-`(call: Call, input_types: tuple[Type, ...], ctx: TypeInferContext) -> AccessRelationResult`.
+    Attributes:
+        relation: attribute; Which coordinates of its own value it reaches.
+        parameters: attribute; Each isl parameter name paired with the operand element or dimension it is.
+    """
 
-The handler MUST read only `input_types` and the op's attributes. It MUST
-NOT read the Call's own output type (`ctx.type_of(call)`), so the builder
-runs before the output type exists and typeinfer can call it without a
-cycle. `build_relation(call, input_types, ctx)` looks the handler up and
-returns its result, or `None` when the op has no registered builder.
+    relation: "isl.map"
+    parameters: tuple[tuple[str, object], ...] = ()
 
-### 4.2 Per-boundary relation service — `access_relation`
+class BoundaryRelation:
+    """One boundary, as the coordinates it reaches and nothing else.
 
-A second, independent registry over the same Op classes. Where `type_relation`
-([§4.1](#41-forward-relation-service--type_relation)) returns one iteration domain plus one map per boundary and drives
-typeinfer, this one classifies each boundary on its own and admits a boundary
-the affine framework cannot express at all.
+    Attributes:
+        pattern: attribute; The relation from the Op's iteration space to that value's coordinates.
+    """
 
-```python
-AccessRelation = Union["isl.multi_aff", "isl.map", OpaqueRelation]
-
-class OpaqueRelation:
-    """Marker for a boundary the affine framework cannot express."""
-
-OPAQUE: OpaqueRelation      # the single instance
+    pattern: AffineAccess
 
 class AccessRelations:
-    """One relation per boundary value, in boundary order."""
+    """One `BoundaryRelation` per boundary value, in boundary order."""
 
-    inputs: tuple[AccessRelation, ...]
-    outputs: tuple[AccessRelation, ...]
+    inputs: tuple[BoundaryRelation, ...]
+    outputs: tuple[BoundaryRelation, ...]
+
+def coordinates_of(call, ctx) -> AccessRelations: ...
+def relations_of(call, ctx) -> AccessRelations: ...
 ```
 
 Registry + decorator:
@@ -359,22 +317,47 @@ Registry + decorator:
 access_relation_registry: AnalysisRegistry     # keyed by type[Op]
 def register_access_relation(op_cls: type): ...
 ```
-- constraints:
-  - The canonical carrier is `isl.multi_aff`. An `isl.map` is allowed where the
-    relation is reduction-like or otherwise many-to-one.
-  - A boundary whose access pattern is data-dependent, or otherwise outside
-    `isl.multi_aff` / `isl.map`, MUST carry `OPAQUE` rather than an
-    approximation. `OpaqueRelation` is a distinct type from either isl carrier
-    so a consumer can never read "opaque" as "identity".
-  - `OpaqueRelation` is a singleton: every construction returns the same
-    instance, and it round-trips through pickling as that instance.
-  - `inputs` has one entry per input arg in argument order; `outputs` has one
-    per output.
 
-The two registries are peers, not layers: a given Op MAY register with either,
-both, or neither. The polyhedral model ([analysis §1](./analysis.md#1-polyhedral-model))
-reads only [§4.1](#41-forward-relation-service--type_relation)'s forward relation, so an Op it must cover needs a
-`type_relation` regardless of what it registers here.
+- constraints:
+  - A handler has the shape `(call, ctx) -> AccessRelations`. It MUST NOT read
+    the Call's own Type: typeinfer asks it in order to derive that Type, so a
+    handler that asked back would be asking for its own answer. It MAY read its
+    operands' Types, its Op's attributes, and the values its parameters bind.
+  - `AffineAccess` is the only carrier. A boundary MUST NOT take a bare
+    `isl.map` or `isl.multi_aff`: those say where a boundary reaches and nothing
+    about what its parameters stand for, so whoever restricts one guesses.
+    Construction MUST refuse them, and every helper that builds a boundary hands
+    one over already stated. A function handed to `AffineAccess` is kept as the
+    relation it is.
+  - Every `BoundaryRelation.pattern` is a relation from the Op's **whole
+    iteration space** to the coordinates that boundary reaches, stated in the
+    axes the value was written in. Every boundary of one Op shares that space; a
+    boundary MAY be partial in it, which is one relation empty somewhere rather
+    than a second space. There is no separate domain field: what an Op walks is
+    the union of its boundary domains.
+  - A coordinate an Op only learns at run time is a **parameter** of the
+    relation, paired in `parameters` with the operand element or dimension it
+    is, so whoever restricts the relation binds it rather than guessing. A
+    parameter nobody binds is a hole and MUST be refused; one name MUST be one
+    value across the whole Op.
+  - `inputs` has one entry per input arg in argument order; `outputs` has one
+    per output, which for a `TupleType` result is one per field. `coordinates_of`
+    holds the input count, each input image's rank against the supplied Type,
+    the shared iteration arity, boundedness once parameters are bound, and
+    parameter closure -- all before any Type is derived. `relations_of` adds
+    what needs the derived Type: one boundary per output field, at that field's
+    rank in this view.
+  - How much a boundary moves MUST NOT be a second field. It is what the
+    relation reaches over the coordinates its Op iterates, counted from the
+    relation's own image; reaching the same element from many coordinates is one
+    element moved, so an inner iteration axis costs nothing. A projection or a
+    count that cannot be derived MUST fail closed rather than fall back on a
+    stated number.
+  - `relations_of` carries every boundary from logical axes onto the positions
+    the reader addresses, by composing with the layout the value ended up with,
+    and holds every boundary to the iterations this participant performs. A
+    value nobody divided is addressed whole by every participant, so leaving one
+    boundary unheld would charge one participant what all of them read.
 
 ## 5. Instance 2 — `verify`
 
@@ -545,14 +528,17 @@ class Cost:
     """Leaf-local work for one selected candidate.
 
     Attributes:
-        flops: attribute; logical work grouped by compute dtype.
+        flops: attribute; logical floating-point work grouped by compute dtype.
         traffic: attribute; per-operand traffic in argument order, with the
             result last.
+        service: attribute; results asked for that are not floating point,
+            grouped by the kind of service the machine provides.
         bytes: attribute; derived read-only traffic over every operand.
     """
 
     flops: Mapping[DType, int]
     traffic: tuple[TrafficBytes, ...]
+    service: Mapping[str, int]
 
     def bytes(self) -> int: ...
 
@@ -588,35 +574,46 @@ class CostEvaluator(ExprVisitor[Cost]): ...
     and its operand types, so it is the same on every backend; registering them
     from a target package would make one backend's presence decide whether any
     consumer can cost a program at all.
-  - `flops` MUST group leaf-local logical work by compute `DType`.
+  - `flops` MUST group leaf-local floating-point work by compute `DType`. Work
+    that is not floating point MUST NOT appear there under the dtype of its
+    result: a comparison producing `bool` is not `bool` FLOPs, and pricing it as
+    such puts work on a pipe it never went down.
+  - `service` MUST group that work by the kind of service the machine provides,
+    named for the operation rather than for a machine: `integer`, `predicate`,
+    `select`, `special`. A comparison MUST record
+    `predicate`, a selection MUST record `select`, an operation over whole
+    numbers MUST record `integer`, and an operation the machine answers on its
+    special-function unit -- `rsqrt`, `exp`, `log`, `exp2`, `log2` -- MUST
+    record `special` rather than one FLOP each: that unit publishes its own
+    rate, a fraction of the float pipe's, so counting them as arithmetic prices
+    them too fast.
+    Counts MUST be non-negative integers and MUST NOT be booleans. An operation
+    MUST record its work once, under `flops` or under `service` but not both.
+    An evaluator MUST NOT invent a kind no target states a rate for, because a
+    consumer that cannot price a kind refuses rather than substituting zero.
   - `TrafficBytes.total_bytes` and `Cost.bytes` MUST be read-only derived
     properties and MUST NOT be accepted as constructor fields.
   - `traffic` MUST carry exactly one `TrafficBytes` per operand of the call, in
-    argument order with the result last, so an Op that only touches part of an
-    input says so where it knows it. `bytes` is derived: every operand's traffic
-    in either direction.
+    argument order with the result last. Only which of its directions is nonzero
+    is read: a nonzero `read` says that boundary is read and a nonzero `write`
+    says it is written. `bytes` is derived: every operand's traffic in either
+    direction.
   - an evaluator MUST NOT name a memory level. Which level an operand's bytes
     move at follows from that operand's Type, and is the consumer's to read;
     reporting a length that disagrees with the call's operand count MUST fail
     naming the call and both counts.
-  - an operand whose Type spans several levels admits no split of one reported
-    count between them, so a consumer MAY charge that operand's whole Type at
-    each level instead. What the evaluator reported stands as the operand's own
-    amount; a per-level total is therefore not always the sum of the amounts
-    reported here.
-  - an evaluator MUST report the bytes its operation's own semantics move,
-    bounded by what its operand Types state statically:
-    - an operation that writes a window of a container charges the window and
-      MUST NOT charge the container;
-    - an operation that only re-describes or re-indexes existing elements, or
-      that names an existing value at another topology level, charges zero;
-    - when the touched extent is runtime data, the evaluator charges the
-      smallest bound its operand Types state statically.
-  - `Reshape` MUST report zero traffic because it re-indexes the same elements.
-    `Slice` MUST also report zero traffic because it is an addressing view; the
-    consumer that reads or materializes the window owns those bytes. `Transpose`
-    MUST report one result-sized read and write because its evaluator materializes
-    the permutation. Each evaluator answers from its operation's semantics.
+  - an evaluator says which way each boundary moves and whether the operation
+    materialises anything; **how much** crosses is not its answer. A consumer
+    takes every amount from the Op's access relations
+    ([§4.1](#41-access-relation-service--access_relation)) in the window it is
+    asking about, and an Op with no registered relation MUST fail closed rather
+    than have its evaluator's number read as the amount.
+  - so an operation that only re-describes or re-indexes existing elements
+    reports no direction on those boundaries and moves nothing, while the
+    numbers that place a window are read like any other operand: a `Reshape`
+    moves nothing, a `Slice` moves nothing of its tensor source or result and
+    reads the numbers placing it, and a `Transpose` reads and writes because its
+    evaluator materialises the permutation.
   - With no level, `CostContext.local_type_of` MUST return the selected Type as
     written. With a level, it MUST apply `local_type_of` using the context's
     topology hierarchy and MUST reject unresolved or non-concrete local extents
@@ -651,7 +648,7 @@ populated. Re-imports are idempotent (Python caches the module;
 
 ## 10. Defining a new extensible analysis
 
-When adding a per-node-class extensible analysis (say "alias
+When adding a per-node-class extensible analysis (say "liveness
 analysis on top of typeinfer", or "emit for a new target"), follow
 the four-step recipe.
 
@@ -660,16 +657,16 @@ the four-step recipe.
 ```python
 # example
 @dataclass
-class AliasContext(TypeInferContext):
-    alias_sets: dict[Var, set[Var]] = field(default_factory=dict)
+class LivenessContext(TypeInferContext):
+    live_sets: dict[Var, set[Var]] = field(default_factory=dict)
 ```
 
 ### Step 2 — declare a registry + decorator
 
 ```python
 # example
-alias_registry: AnalysisRegistry[type[Op]]   # the new analysis's registry
-def register_alias(op_cls: type[Op]): ...     # decorator: register a handler for one Op class
+liveness_registry: AnalysisRegistry[type[Op]]   # the new analysis's registry
+def register_liveness(op_cls: type[Op]): ...     # decorator: register a handler for one Op class
 ```
 
 Pick `type[Op]` for an analysis that walks `Call`s, `type[Stmt]` for
@@ -681,7 +678,7 @@ needed.
 ```python
 # example
 class AliasVisitor(ExprVisitor[None]):
-    def __init__(self, ctx: AliasContext, registry: AnalysisRegistry = alias_registry): ...   # explicit binding
+    def __init__(self, ctx: LivenessContext, registry: AnalysisRegistry = liveness_registry): ...   # explicit binding
     def visit_Call(self, call: Call) -> None: ...   # look up type(call.target), invoke, then recurse
 ```
 
@@ -689,9 +686,9 @@ class AliasVisitor(ExprVisitor[None]):
 
 ```python
 # example
-# an alias handler keys on the Op class and returns None:
-@register_alias(Reshape)
-def _(call: Call, ctx: AliasContext) -> None: ...
+# a liveness handler keys on the Op class and returns None:
+@register_liveness(Reshape)
+def _(call: Call, ctx: LivenessContext) -> None: ...
 ```
 
 These four steps are what the extensible instances in this spec are doing.

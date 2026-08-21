@@ -12,6 +12,7 @@ from tilefoundry.ir.core import (
     BindingMetadata,
     Call,
     Constant,
+    ExecutionDomainMetadata,
     Expr,
     IRMetadata,
     SourceSpanMetadata,
@@ -182,6 +183,7 @@ def _resolve_tensor_type(
     *,
     mesh_resolver=None,
     default_mesh: Mesh | None = None,
+    mesh_order: "tuple[Mesh, ...]" = (),
     name_resolver=None,
 ) -> TensorType:
     """Resolve tensor annotations identically for HIR and TIR functions.
@@ -204,6 +206,7 @@ def _resolve_tensor_type(
         closure=bindings,
         mesh_resolver=mesh_resolver,
         default_mesh=default_mesh,
+        mesh_order=mesh_order,
     )
     if result is not None:
         return canonicalize_dims(result)
@@ -336,6 +339,7 @@ class BaseExprVisitor:
         self._tile_windows: dict[int, tuple[Any, Any]] = {}
         self._active_source_node: ast.AST | None = None
         self._active_binding_hint: str | None = None
+        self._mesh_scopes: tuple[Any, ...] = ()
         self.source_filename = "<string>"
 
     def _tuple_expr_expr(self, node: ast.Tuple):
@@ -419,6 +423,8 @@ class BaseExprVisitor:
             metadata.append(span)
         if self._active_binding_hint is not None:
             metadata.append(BindingMetadata(self._active_binding_hint))
+        if self._mesh_scopes:
+            metadata.append(ExecutionDomainMetadata(self._mesh_scopes))
         return tuple(metadata)
 
     @staticmethod
@@ -567,6 +573,7 @@ class BaseExprVisitor:
                 self.closure,
                 mesh_resolver=self._resolve_body_mesh,
                 default_mesh=self._current_default_mesh(),
+                mesh_order=self._mesh_scopes,
                 name_resolver=self.env.lookup,
             )
         if isinstance(node.value, ast.Name):
@@ -1366,6 +1373,7 @@ class BaseExprVisitor:
                     ShardLayout,
                     mesh_resolver=self._resolve_body_mesh,
                     default_mesh=self._current_default_mesh(),
+                    mesh_order=self._mesh_scopes,
                     closure=self.closure,
                 )
             except LayoutSugarError:
@@ -1424,6 +1432,7 @@ class BaseExprVisitor:
                 ShardLayout,
                 mesh_resolver=self._resolve_body_mesh,
                 default_mesh=self._current_default_mesh(),
+                mesh_order=self._mesh_scopes,
                 closure=self.closure,
             )
         if annotation is Layout:

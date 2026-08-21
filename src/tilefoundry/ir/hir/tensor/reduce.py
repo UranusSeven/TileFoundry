@@ -22,11 +22,14 @@ from tilefoundry.ir.types.shard import (
 from tilefoundry.ir.types.shard.shard_layout import shard_layout_of
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelationResult,
-    build_relation,
-    register_type_relation,
+    AccessRelations,
+    AffineAccess,
+    BoundaryRelation,
+    coordinates_of,
+    identity_access,
+    iterating,
+    register_access_relation,
 )
-from tilefoundry.visitor_registry.relation_build import build_domain, identity_map
 from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
 
 __all__ = ["ReduceKind", "Reduce"]
@@ -44,26 +47,6 @@ class Reduce(Op):
 
 def _reduced_axes(call: "Call", rank: int) -> tuple:
     return tuple(a % rank if a < 0 else a for a in call.target.axes)
-
-
-@register_type_relation(Reduce)
-def _reduce_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Forward relation for Reduce: an identity input map.
-
-    Forward relation for Reduce: an identity input map; the output map keeps
-    every axis (keepdim) or drops the reduced axes (no keepdim). The reduced
-    axes are reported as completely-reduced dims, so a Split on them collapses
-    to Broadcast and their layout positions collapse to size 1.
-    """
-    (x,) = input_types
-    rank = len(x.shape)
-    reduced = _reduced_axes(call, rank)
-    dims = [f"d{i}" for i in range(rank)]
-    src = "[" + ", ".join(dims) + "]"
-    in_map = identity_map(rank)
-    out_dims = dims if call.target.keepdim else [dims[i] for i in range(rank) if i not in reduced]
-    out_map = isl.map(f"{{ {src} -> [{', '.join(out_dims)}] }}")
-    return AccessRelationResult(domain=build_domain(x.shape), maps=(in_map, out_map))
 
 
 @register_typeinfer(Reduce)
@@ -98,7 +81,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     )
     source_shard = shard_layout_of(x_ty.layout)
     if source_shard is not None:
-        relation = build_relation(call, (x_ty,), ctx)
+        relation = coordinates_of(call, ctx)
         derived = derive_output_shard_layout(
             (x_ty,),
             relation,
@@ -162,3 +145,58 @@ def _eval_reduce(ctx):
     else:
         raise ValueError(f"evaluator: unsupported ReduceKind {kind}")
     return TensorValue(data=out, type=ctx.result_type)
+
+
+def _kept(shape: tuple) -> int:
+    """How many elements a shape of numbers holds."""
+    counted = 1
+    for extent in shape:
+        counted *= extent if isinstance(extent, int) else 1
+    return counted
+
+
+@register_access_relation(Reduce)
+def _reduce_access(call: "Call", ctx) -> AccessRelations:
+    """Every source coordinate feeding a result coordinate, read once.
+
+    A reduction walks what it reads, so the source's own positions are the
+    coordinates: it reads more of them than it writes, which is the whole of what
+    it does, and the collapse happens on the way out. The extents walked are this
+    participant's own, a reduced axis being one a layout can split, and the
+    correspondence to the result comes from both layouts, since a result
+    coordinate names a logical axis and not a position.
+    """
+    source = ctx.type_of(call.args[0])
+    rank = len(source.shape)
+    axes = tuple(
+        axis + rank if axis < 0 else axis for axis in call.target.axes
+    )
+    out_shape = tuple(
+        (1 if axis in axes else extent)
+        for axis, extent in enumerate(source.shape)
+        if call.target.keepdim or axis not in axes
+    )
+    carried = {axis: f"d{axis}" for axis in range(rank)}
+    surviving = [axis for axis in range(rank) if axis not in axes]
+    came_from = (
+        {axis: axis for axis in range(rank)}
+        if call.target.keepdim
+        else dict(enumerate(surviving))
+    )
+    writes_at = [
+        "0"
+        if axis not in came_from or came_from[axis] in axes
+        else carried[came_from[axis]]
+        for axis in range(len(out_shape))
+    ]
+    collapses = ", ".join(writes_at)
+    domain = ", ".join(f"d{index}" for index in range(rank))
+    return iterating(
+        source.shape,
+        AccessRelations(
+            inputs=(BoundaryRelation(identity_access(rank)),),
+            outputs=(
+                BoundaryRelation(AffineAccess(isl.map(f"{{ [{domain}] -> [{collapses}] }}"))),
+            ),
+        ),
+    )

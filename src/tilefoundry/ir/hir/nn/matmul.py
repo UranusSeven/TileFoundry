@@ -15,14 +15,15 @@ from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.shard.shard_layout import shard_layout_of, split_target_axes
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelationResult,
     AccessRelations,
-    build_relation,
+    AffineAccess,
+    BoundaryRelation,
+    coordinates_of,
+    iterating,
+    logical_axes_of,
     register_access_relation,
-    register_type_relation,
+    shape_from_relation,
 )
-from tilefoundry.visitor_registry.isl_utility import to_domain
-from tilefoundry.visitor_registry.relation_build import shape_from_relation
 from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
 
 
@@ -51,65 +52,92 @@ def _broadcast_batch(lhs_batch, rhs_batch):
     return broadcast_shapes(tuple(lhs_batch), tuple(rhs_batch), raising=False)
 
 
+def _held_axis(local, logical, axis: int) -> int:
+    """How much of one logical axis this participant holds."""
+    held = 1
+    for position, owner in enumerate(logical_axes_of(local, logical)):
+        if owner == axis:
+            held *= local.shape[position]
+    return held
+
+
+def _operand_reads(
+    shape: tuple, out_shape: tuple, inner: str, *, contracts_last: bool
+) -> list[str]:
+    """One coordinate per axis of an operand of the contraction.
+
+    The two matrix axes are the contraction and the one the result keeps; which
+    is which is the only difference between the two operands. Batch axes are
+    right-aligned against the result's, and one the operand broadcasts reads its
+    only coordinate rather than the result's.
+    """
+    rank = len(shape)
+    shift = len(out_shape) - rank
+    reads: list[str] = []
+    for axis in range(rank):
+        if axis == rank - 1:
+            reads.append(inner if contracts_last else f"d{len(out_shape) - 1}")
+        elif axis == rank - 2:
+            reads.append(f"d{len(out_shape) - 2}" if contracts_last else inner)
+        elif is_one(shape[axis]) and not is_one(out_shape[axis + shift]):
+            reads.append("0")
+        else:
+            reads.append(f"d{axis + shift}")
+    return reads
+
+
 @register_access_relation(MatMul)
 def _matmul_access_relation(call: "Call", ctx) -> AccessRelations:
-    """GLOBAL black-box — declare identity multi_aff.
+    """Every coordinate of each operand a contraction reaches, read once.
 
-    GLOBAL black-box — declare identity multi_aff (the K-dim reduction is
-    internal to the op semantics at this level).
+    A product walks the axis it sums, so that axis is a coordinate this Op is
+    asked by rather than something existential inside an image, and the result is
+    accumulated over it. Reading an operand at the result's own coordinates would
+    claim a shape it does not have the moment the summed and kept axes differ in
+    extent. Which positions any of these coordinates are is the reader's
+    question; the result's own extents follow from the operands.
     """
-    lhs_ty = ctx.type_of(call.args[0])
-    rhs_ty = ctx.type_of(call.args[1])
-    out_ty = ctx.type_of(call)
-
-    def _ident(rank: int) -> "isl.multi_aff":
-        if rank == 0:
-            return isl.multi_aff("{ [] -> [] }")
-        dims = ", ".join(f"i{i}" for i in range(rank))
-        return isl.multi_aff(f"{{ [{dims}] -> [{dims}] }}")
-
-    return AccessRelations(
-        inputs=(_ident(len(lhs_ty.shape)), _ident(len(rhs_ty.shape))),
-        outputs=(_ident(len(out_ty.shape)),),
+    lhs = ctx.type_of(call.args[0])
+    rhs = ctx.type_of(call.args[1])
+    batch = _broadcast_batch(lhs.shape[:-2], rhs.shape[:-2])
+    if batch is None:
+        raise ValueError(
+            f"MatMul batches {tuple(lhs.shape[:-2])} against "
+            f"{tuple(rhs.shape[:-2])}, which do not broadcast"
+        )
+    out_shape = (*batch, lhs.shape[-2], rhs.shape[-1])
+    summed = lhs.shape[-1]
+    rank = len(out_shape)
+    dims = ", ".join((*(f"d{index}" for index in range(rank)), "k"))
+    inner = "0" if is_one(summed) else "k"
+    inputs = []
+    for shape, contracts_last, held in (
+        (tuple(lhs.shape), True, lhs.shape[-1]),
+        (tuple(rhs.shape), False, rhs.shape[-2]),
+    ):
+        reads = _operand_reads(shape, out_shape, inner, contracts_last=contracts_last)
+        inputs.append(
+            BoundaryRelation(AffineAccess(isl.map(f"{{ [{dims}] -> [{', '.join(reads)}] }}")))
+        )
+        del held
+    accumulates = ", ".join(f"d{index}" for index in range(rank))
+    return iterating(
+        (*out_shape, summed),
+        AccessRelations(
+            inputs=tuple(inputs),
+            outputs=(
+                BoundaryRelation(AffineAccess(isl.map(f"{{ [{dims}] -> [{accumulates}] }}"))),
+            ),
+        ),
     )
 
 
-@register_type_relation(MatMul)
-def _matmul_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Forward access relation for ``(batch.., M, K) × (batch.., K, N)``.
-
-    Iteration domain is ``[batch.., M, N, K]``; the output map drops K (the
-    reduced contraction dim). A batch dim that this operand broadcasts (its
-    extent is 1 while the output extent is larger) accesses a constant 0 rather
-    than the iteration dim, so shard propagation treats it as a broadcast.
-    """
-    lhs, rhs = input_types
-    lhs_batch = lhs.shape[:-2]
-    rhs_batch = rhs.shape[:-2]
-    out_batch = _broadcast_batch(lhs_batch, rhs_batch)
-    b = len(out_batch)
-    m, k, n = lhs.shape[-2], lhs.shape[-1], rhs.shape[-1]
-    domain, param_map = to_domain((*out_batch, m, n, k))
-
-    m_d, n_d, k_d = b, b + 1, b + 2
-    in_dims = [f"d{i}" for i in range(b + 3)]
-
-    def batch_access(in_batch):
-
-        pad = b - len(in_batch)
-        return [
-            "0" if (is_one(in_batch[j]) and not is_one(out_batch[pad + j])) else f"d{pad + j}"
-            for j in range(len(in_batch))
-        ]
-
-    lhs_out = batch_access(lhs_batch) + [f"d{m_d}", f"d{k_d}"]
-    rhs_out = batch_access(rhs_batch) + [f"d{k_d}", f"d{n_d}"]
-    out_out = [f"d{j}" for j in range(b)] + [f"d{m_d}", f"d{n_d}"]
-    src = "[" + ", ".join(in_dims) + "]"
-    maps = tuple(
-        isl.map(f"{{ {src} -> [{', '.join(dst)}] }}") for dst in (lhs_out, rhs_out, out_out)
-    )
-    return AccessRelationResult(domain=domain, maps=maps, param_map=param_map)
+def _elements(shape: tuple) -> int:
+    """How many elements a shape of numbers holds."""
+    counted = 1
+    for extent in shape:
+        counted *= extent if isinstance(extent, int) else 1
+    return counted
 
 
 @register_typeinfer(MatMul)
@@ -136,7 +164,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
 
     check_multilinear_partials(ctx, call, (("lhs", lhs), ("rhs", rhs)))
 
-    relation = build_relation(call, (lhs, rhs), ctx)
+    relation = coordinates_of(call, ctx)
 
     out_batch = _broadcast_batch(lhs.shape[:-2], rhs.shape[:-2])
     out_shape = shape_from_relation(

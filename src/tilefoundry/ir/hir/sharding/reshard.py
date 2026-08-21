@@ -18,11 +18,12 @@ from tilefoundry.ir.types.shard.shard_layout import (
 from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelationResult,
-    register_type_relation,
+    AccessRelations,
+    BoundaryRelation,
+    identity_access,
+    iterating,
+    register_access_relation,
 )
-from tilefoundry.visitor_registry.isl_utility import to_domain
-from tilefoundry.visitor_registry.relation_build import identity_map
 
 
 def _dim_mul(a, b):
@@ -165,35 +166,27 @@ class Reshard(Op):
     storage = ParamDef(kind="attribute", default=None)
 
 
-@register_type_relation(Reshard)
-def _reshard_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Use identity only when Reshard preserves each position's local shape.
 
-    Canonical layouts factor mesh extents into extra positions. Their local
-    projection is one, so discard only those extras when restoring tensor rank.
+
+@register_access_relation(Reshard)
+def _reshard_access(call: "Call", ctx) -> AccessRelations:
+    """Every logical index reads itself. Where those bytes go is a separate fact.
+
+    A reshard moves a value between storages or redistributes it across
+    positions; neither changes which logical element the result's index came
+    from, so the boundary is exactly identity and never opaque. Which positions
+    those indices are is the reader's question, not this one's.
     """
-    (x,) = input_types
-    layout = call.target.layout
-    output_shape = tuple(x.shape)
-    if layout is not None:
-        factored = list(shard_layout_local_shape(layout, require_static=False))
-        excess = len(factored) - len(x.shape)
-        split_positions = {attr.axis for attr in layout.attrs if isinstance(attr, Split)}
-        for position in sorted(split_positions, reverse=True):
-            if excess == 0:
-                break
-            if factored[position] == 1:
-                del factored[position]
-                excess -= 1
-        output_shape = tuple(factored)
-    if output_shape != x.shape:
-        raise NotImplementedError(
-            "Reshard type_relation: cross-position redistribution changes "
-            f"the local shape from {x.shape} to {output_shape}"
-        )
-    domain, param_map = to_domain(x.shape)
-    ident = identity_map(len(x.shape))
-    return AccessRelationResult(domain=domain, maps=(ident, ident), param_map=param_map)
+    logical = ctx.type_of(call.args[0])
+    rank = len(logical.shape)
+    reads = identity_access(rank)
+    return iterating(
+        logical.shape,
+        AccessRelations(
+            inputs=(BoundaryRelation(reads),),
+            outputs=(BoundaryRelation(identity_access(rank)),),
+        ),
+    )
 
 
 @register_typeinfer(Reshard)

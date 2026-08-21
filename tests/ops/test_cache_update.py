@@ -21,7 +21,7 @@ from tests.ops.typeinfer_utils import (
     run_typeinfer_case,
 )
 from tilefoundry import func, module
-from tilefoundry.analysis import ComputeCostMetadata
+from tilefoundry.analysis import ComputeCostMetadata, TrafficMetadata
 from tilefoundry.analysis.api import analyze
 from tilefoundry.analysis.walk import postorder
 from tilefoundry.dsl import Mesh, Tensor, tf
@@ -187,6 +187,13 @@ class _KVCacheAppend:
 
 
 def test_cache_update_function_analyzes_program_and_cta_cost() -> None:
+    """One crossing is the first legal window, in both windows of the question.
+
+    How many rows this writes is a runtime value, so one occurrence is the first
+    legal binding of it: one row. How many such crossings the program performs
+    is the footprint family's question, and raising a single crossing to cover
+    them would be answering it here.
+    """
     entry = _KVCacheAppend.entry_function()
     update = next(
         expr
@@ -213,14 +220,22 @@ def test_cache_update_function_analyzes_program_and_cta_cost() -> None:
         TrafficBytes(write=_WINDOW_BYTES // 2),
     )
 
-    result = analyze(_KVCacheAppend, entry, analysis="compute-cost", level="cta")
+    result = analyze(_KVCacheAppend, entry, analysis=("compute-cost", "memory"), level="cta")
     analysed_update = next(
         expr
         for expr in postorder(result.function.body)
         if isinstance(expr, Call) and isinstance(expr.target, CacheUpdate)
     )
     record = get_metadata(analysed_update, ComputeCostMetadata)
+    moved = get_metadata(analysed_update, TrafficMetadata)
     assert result.level == "cta"
     assert record is not None
     assert record.flops == record.flops_per_unit == ()
-    assert record.operands == _GLOBAL_TRAFFIC
+    row_bytes = _WINDOW_BYTES // 4
+    assert moved.operands == (
+        TrafficBytes(),
+        TrafficBytes(read=4),
+        TrafficBytes(read=4),
+        TrafficBytes(read=row_bytes),
+        TrafficBytes(write=row_bytes),
+    )

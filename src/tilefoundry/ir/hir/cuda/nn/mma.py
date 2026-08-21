@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+import isl
 import torch
 
 from tilefoundry.evaluator import TensorValue, register_eval, to_torch_dtype
@@ -25,6 +26,14 @@ from tilefoundry.ir.types import DType, TensorType
 from tilefoundry.ir.types.shard import Broadcast, Layout, ShardLayout, try_c_order_strides
 from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.visitor_registry import register_typeinfer
+from tilefoundry.visitor_registry.access_relation import (
+    AccessRelations,
+    AffineAccess,
+    BoundaryRelation,
+    identity_access,
+    iterating,
+    register_access_relation,
+)
 
 _FLOAT_ACCUMULATOR_COMBINATIONS = frozenset(
     {
@@ -230,3 +239,58 @@ def _eval_mma(ctx):
 
 
 __all__ = ["Mma", "Mma_SM80_16x8x16", "Wgmma_SM90_64x128x16"]
+
+
+_TILES = {"Mma_SM80_16x8x16": (16, 8, 16), "Wgmma_SM90_64x128x16": (64, 128, 16)}
+
+
+def _whole_read(held: "Type", rank: int) -> "AffineAccess":
+    """Every coordinate of one operand, whatever the result coordinate is.
+
+    A tile instruction reads its operands entire, so no result coordinate picks
+    out part of one. The coordinates are the operand's own axes; which positions
+    a layout made of them is the reader's question, answered by composing this
+    with that layout rather than by naming them here.
+    """
+    terms, guards = [], []
+    for position, extent in enumerate(held.shape):
+        if extent == 1:
+            terms.append("0")
+            continue
+        terms.append(f"p{position}")
+        guards.append(f"0 <= p{position} < {extent}")
+    dims = ", ".join(f"d{index}" for index in range(rank))
+    image = ", ".join(terms) if terms else "0"
+    where = " and ".join(guards)
+    return AffineAccess(
+        isl.map(f"{{ [{dims}] -> [{image}]" + (f" : {where} }}" if where else " }"))
+    )
+
+
+def _tile_access(call: "Call", ctx) -> AccessRelations:
+    """A fixed tile: both operands read whole, the accumulator written whole.
+
+    ``_TILES`` holds each instruction's own count, which is what separates these
+    from a MatMul: one instruction moves one instruction's elements however many
+    participants issue it. That count is the accumulator's own extents, so the
+    space is stated from the instruction rather than from the Type being
+    derived. Where those elements sit is the reader's answer, so the patterns
+    are stated in the axes the operands were written in.
+    """
+    m, n, _ = _TILES[type(call.target).__name__]
+    tile = (m, n)
+    rank = len(tile)
+    return iterating(
+        tile,
+        AccessRelations(
+            inputs=(
+                BoundaryRelation(_whole_read(ctx.type_of(call.args[0]), rank)),
+                BoundaryRelation(_whole_read(ctx.type_of(call.args[1]), rank)),
+            ),
+            outputs=(BoundaryRelation(identity_access(rank)),),
+        ),
+    )
+
+
+register_access_relation(Mma_SM80_16x8x16)(_tile_access)
+register_access_relation(Wgmma_SM90_64x128x16)(_tile_access)

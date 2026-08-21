@@ -24,13 +24,15 @@ from tilefoundry.ir.hir._shard_checks import check_multilinear_partials, reject_
 from tilefoundry.ir.types import TupleType
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    OPAQUE,
-    AccessRelationResult,
     AccessRelations,
+    AffineAccess,
+    BoundaryRelation,
+    index_set,
+    iterating,
+    logical_coordinates,
+    reached_at,
     register_access_relation,
-    register_type_relation,
 )
-from tilefoundry.visitor_registry.isl_utility import to_domain
 
 
 @register_op
@@ -81,66 +83,65 @@ def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
 
 @register_access_relation(RoPE)
 def _rope_access_relation(call: "Call", ctx: "TypeInferContext") -> AccessRelations:
-    """GLOBAL level.
+    """GLOBAL level: a rotation per element, read out of a table by position.
 
-    Inputs:
-      - q, k: per-element identity (rotation is per (token, head, head_dim/2 pair))
-      - cos_cache, sin_cache: indexed by pos_ids → opaque (data-dependent index)
-      - pos_ids: opaque (1D index input feeding cache lookup)
-
-    Outputs:
-      - q_rope, k_rope: per-element identity vs Q / K respectively.
+    Rotating Q and rotating K are instances of the same work, so the space this
+    Op walks says which: one coordinate names the value rotated, Q's boundaries
+    answer where it is Q and K's where it is K, which keeps them apart even at
+    equal width. Grouped-query K holds fewer heads and answers on that much. A
+    table carries head_dim last and rows before it, so it is read at the rotated
+    value's head_dim coordinate and at any row those axes could name -- the row
+    is an element of `pos_ids`, which nothing here holds, read whole by both.
     """
-    q_ty = ctx.type_of(call.args[0])
-    k_ty = ctx.type_of(call.args[1])
-
-    def _ident(rank: int) -> "isl.multi_aff":
-        dims = ", ".join(f"i{i}" for i in range(rank))
-        return isl.multi_aff(f"{{ [{dims}] -> [{dims}] }}")
-
-    q_id = _ident(len(q_ty.shape))
-    k_id = _ident(len(k_ty.shape))
-
-    return AccessRelations(
-        inputs=(q_id, k_id, OPAQUE, OPAQUE, OPAQUE),
-        outputs=(q_id, k_id),
+    q_ty, k_ty = ctx.type_of(call.args[0]), ctx.type_of(call.args[1])
+    logical_q = ctx.type_of(call.args[0])
+    rank = len(q_ty.shape)
+    head_dim = len(logical_q.shape) - 1
+    carried = logical_coordinates(q_ty, logical_q)
+    walked = ", ".join((*(f"d{index}" for index in range(rank)), f"d{rank}"))
+    own = ", ".join(f"d{index}" for index in range(rank))
+    value = isl.map(f"{{ [{walked}] -> [{own}] : d{rank} = 0 }}")
+    grouped = isl.map(f"{{ [{walked}] -> [{own}] : d{rank} = 1 }}")
+    narrower = index_set(tuple(k_ty.shape))
+    if narrower is not None:
+        grouped = grouped.intersect_range(narrower)
+    value, grouped = AffineAccess(value), AffineAccess(grouped)
+    positions = ctx.type_of(call.args[4])
+    tables = []
+    for operand in (2, 3):
+        table = ctx.type_of(call.args[operand])
+        logical_table = ctx.type_of(call.args[operand])
+        rows = len(logical_table.shape) - 1
+        tables.append(
+            BoundaryRelation(reached_at(
+                    rank + 1,
+                    table,
+                    logical_table,
+                    {rows: carried.get(head_dim, "0")},
+                    free=tuple(range(rows)),
+                ))
+        )
+    return iterating(
+        (*q_ty.shape, 2),
+        AccessRelations(
+            inputs=(
+                BoundaryRelation(value),
+                BoundaryRelation(grouped),
+                *tables,
+                BoundaryRelation(reached_at(
+                        rank + 1,
+                        positions,
+                        ctx.type_of(call.args[4]),
+                        {},
+                        free=tuple(range(len(ctx.type_of(call.args[4]).shape))),
+                    )),
+            ),
+            outputs=(
+                BoundaryRelation(value),
+                BoundaryRelation(grouped),
+            ),
+        ),
     )
-
-
-@register_type_relation(RoPE)
-def _rope_type_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Build the forward relation for one independently modeled RoPE branch.
-
-    The value input is paired with itself so Q and K may have different head
-    counts. Cache access is identity on sequence and head dimension with batch
-    and head broadcast; this models prefill positions as ``arange(seq)``.
-    """
-    x_ty, x2_ty, cos_ty, sin_ty, pos_ty = input_types
-    if x_ty.shape != x2_ty.shape:
-        raise NotImplementedError(
-            "RoPE type_relation: expects the value input paired with "
-            "itself (analysis.extract splits a real Hq != Hkv call into "
-            f"two such branches -- see _rope_access), got shapes "
-            f"{x_ty.shape} vs {x2_ty.shape}"
-        )
-    if len(x_ty.shape) != 4:
-        raise NotImplementedError(
-            "RoPE type_relation: V1 only supports rank-4 [batch,seq,head,"
-            f"head_dim] q/k, got shape {x_ty.shape}"
-        )
-    if len(cos_ty.shape) != 2 or len(sin_ty.shape) != 2:
-        raise NotImplementedError(
-            "RoPE type_relation: V1 only supports rank-2 [max_pos,head_dim] "
-            f"cos/sin caches, got {cos_ty.shape} / {sin_ty.shape}"
-        )
-
-    domain, param_map = to_domain(x_ty.shape)
-    x_map = isl.map("{ [d0,d1,d2,d3] -> [d0,d1,d2,d3] }")
-    cache_map = isl.map("{ [d0,d1,d2,d3] -> [d1,d3] }")
-    pos_map = isl.map("{ [d0,d1,d2,d3] -> [d1] }")
-
-    maps = (x_map, x_map, cache_map, cache_map, pos_map, x_map, x_map)
-    return AccessRelationResult(domain=domain, maps=maps, param_map=param_map)
 
 
 @register_eval(RoPE)

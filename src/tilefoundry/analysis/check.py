@@ -3,9 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
-from tilefoundry.ir.core import BindingMetadata, Call, Constant, Expr, Tuple, Var
+from tilefoundry.ir.core import (
+    BindingMetadata,
+    Call,
+    Constant,
+    ExecutionDomainMetadata,
+    Expr,
+    Tuple,
+    Var,
+    get_metadata,
+)
 from tilefoundry.ir.core.module import Module, owning_module, subtree
 from tilefoundry.ir.core.pattern import DimVarRangePat
 from tilefoundry.ir.hir._call_binding import binding_for
@@ -17,12 +26,18 @@ from tilefoundry.ir.hir.specialize import (
     _record_complete_bindings,
     dim_vars_reached,
     is_concrete,
-    origin_of,
     specialize_concretely,
 )
 from tilefoundry.ir.types import Type, callable_type_for
 from tilefoundry.ir.types.shape_helpers import static_dim_value
-from tilefoundry.ir.types.shard import ComposedLayout, Layout, Mesh, ShardLayout, Topology
+from tilefoundry.ir.types.shard import (
+    ComposedLayout,
+    Layout,
+    Mesh,
+    ShardLayout,
+    Topology,
+    level_projection,
+)
 from tilefoundry.ir.types.shard.layout_algebra import (
     NotProjectable,
     apply,
@@ -38,20 +53,22 @@ from tilefoundry.ir.types.substitute import (
     substitute_topology_dims,
 )
 from tilefoundry.ir.visitor import ExprMutator
+from tilefoundry.target import UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import CostContext, FunctionScope, TypeInferContext
 from tilefoundry.visitor_registry.visitors import CostEvaluator
 
 from .compute_cost import _call_cost_record, _is_structural_occurrence
 from .errors import AnalysisError
-from .facts import ThroughputFacts
+from .facts import ParallelCapacityFacts, PerformanceServiceFacts, ThroughputFacts
 from .metadata import (
     ComputeCostMetadata,
     MemoryMetadata,
-    OccurrenceProvenance,
+    PerformanceMetadata,
+    PerformanceSummaryMetadata,
     RooflineMetadata,
-    TimelineMetadata,
-    TimelineSummaryMetadata,
+    TrafficMetadata,
 )
+from .movement import call_traffic
 from .preflight import infer_authored_types, validate_call_context
 from .walk import describe, postorder, reachable_functions, tensor_types
 
@@ -59,9 +76,10 @@ _INLINE_NODES = 10_000
 _DERIVED_METADATA = {
     ComputeCostMetadata,
     MemoryMetadata,
+    PerformanceMetadata,
+    PerformanceSummaryMetadata,
     RooflineMetadata,
-    TimelineMetadata,
-    TimelineSummaryMetadata,
+    TrafficMetadata,
 }
 _ResourceKey = tuple[str, str]
 Placement = frozenset[int]
@@ -77,19 +95,23 @@ def _layout_shards(layout: object) -> tuple[ShardLayout, ...]:
 
 
 def _mesh_image(mesh: Mesh, selected: Topology) -> Placement:
-    """The exact selected-topology positions named by one Mesh."""
+    """The exact selected-topology positions named by one Mesh.
+
+    A Mesh may name more than one level, and then its axes are that many
+    consecutive segments: the positions of one level are the axes up to and
+    including its own, with the positions below it divided out. A thread is a
+    position within its CTA, and asking where the CTA is means asking that
+    question of the part of the mesh that says so.
+    """
     actual = tuple(topology.name for topology in mesh.topologies)
-    if len(mesh.topologies) != 1:
-        raise AnalysisError(
-            f"one placement Mesh names topology levels {actual}; selected level "
-            f"{selected.name!r} requires one level whose positions can be projected"
-        )
-    (mesh_topology,) = mesh.topologies
-    if mesh_topology.name != selected.name:
+    named = [topology for topology in mesh.topologies if topology.name == selected.name]
+    if not named:
+        levels = ", ".join(repr(name) for name in actual)
         raise AnalysisError(
             f"selected topology level {selected.name!r}, but the result Mesh is "
-            f"placed at level {mesh_topology.name!r}"
+            f"placed at level(s) {levels}"
         )
+    (mesh_topology,) = named
     selected_size = static_dim_value(selected.size)
     mesh_size = static_dim_value(mesh_topology.size)
     if selected_size is None or selected_size <= 0:
@@ -104,7 +126,15 @@ def _mesh_image(mesh: Mesh, selected: Topology) -> Placement:
             f"{selected.size!r}"
         )
 
-    layout = mesh.layout
+    if len(mesh.topologies) == 1:
+        layout = mesh.layout
+    else:
+        try:
+            layout = level_projection(mesh, selected.name)
+        except ValueError as error:
+            raise AnalysisError(
+                f"the {selected.name!r} result Mesh is not projectable: {error}"
+            ) from None
     try:
         if isinstance(layout, Layout):
             count = size(layout)
@@ -217,14 +247,58 @@ def _result_placement(type_: Type, selected: Topology) -> Placement:
     return next(iter(unique))
 
 
-def _timeline_placements(
+def _timed_level(target: object) -> str | None:
+    """The one storage level this target publishes a bandwidth for, if any.
+
+    A machine that states no throughputs times nothing, which is a different
+    answer from timing zero: with no level to price, only the work an occurrence
+    computes can put it on a clock.
+    """
+    try:
+        return target.get_facts(ThroughputFacts).bandwidth_level
+    except (UnsupportedCapabilityError, AttributeError):
+        return None
+
+
+def _execution_placement(expr: Call, selected: Topology) -> Placement:
+    """Which participants run one occurrence, from where it was authored.
+
+    An occurrence runs on the participants of the Mesh it was written inside.
+    The layout its result carries says where that result's bytes were put, which
+    is a different question: a value laid out across threads may well have been
+    produced by work one CTA did. Where both answer, they MUST agree -- a result
+    placed somewhere its own work never ran is a program this cannot read.
+    """
+    domain = get_metadata(expr, ExecutionDomainMetadata)
+    lexical = domain.at(selected.name) if domain is not None else None
+    if lexical is None:
+        raise AnalysisError(
+            f"has no {selected.name} execution domain; it was authored outside "
+            f"any {selected.name} Mesh, and where its result was laid out does "
+            "not say where the work ran. Write it inside a Mesh of that level"
+        )
+    running = _mesh_image(lexical, selected)
+    try:
+        carried = _result_placement(expr.type, selected)
+    except AnalysisError:
+        return running
+    if carried != running:
+        raise AnalysisError(
+            f"runs on {selected.name} positions {sorted(running)} but its result "
+            f"is laid out on {sorted(carried)}; a result cannot be placed where "
+            "the work that made it never ran"
+        )
+    return running
+
+
+def _call_placements(
     module: Module,
     function: Function,
     level: str,
-    facts: ThroughputFacts,
 ) -> dict[int, Placement]:
-    """Validate and prepare every primitive Call placement for timeline."""
+    """Validate and prepare every primitive Call placement for performance."""
     selected = module.resolve_topology(level)
+    timed = _timed_level(module.resolve_target())
     scope = FunctionScope(module, function)
     whole = CostEvaluator(CostContext(scope=scope))
     local = CostEvaluator(
@@ -239,14 +313,116 @@ def _timeline_placements(
         if not isinstance(expr, Call) or isinstance(expr.target, Function):
             continue
         try:
-            result[id(expr)] = _result_placement(expr.type, selected)
+            result[id(expr)] = _execution_placement(expr, selected)
         except AnalysisError as error:
             cost = _call_cost_record(expr, whole, local)
-            if _is_structural_occurrence(cost, facts):
+            moved = call_traffic(expr, whole, local)
+            if _is_structural_occurrence(cost, moved, bandwidth_level=timed):
                 result[id(expr)] = frozenset()
                 continue
-            raise AnalysisError(f"timeline: {describe(expr)}: {error}") from None
+            raise AnalysisError(f"performance: {describe(expr)}: {error}") from None
     return result
+
+
+@dataclass
+class AnalysisCheckContext:
+    """What every input check reads: the program, the machine, and the level.
+
+    The evaluators are bound to the derived Function the analyses will read, so
+    a check answers about the same program they do. Costing here is a question,
+    not a record: nothing this context computes is attached.
+    """
+
+    module: Module
+    function: Function
+    target: object
+    level: str | None
+    whole: CostEvaluator
+    local: CostEvaluator
+
+    @property
+    def selected_topology(self) -> Topology:
+        """The topology level the analyses were asked about."""
+        if self.level is None:
+            raise AnalysisError(
+                "no topology level was selected, so results cannot carry an "
+                "execution placement"
+            )
+        return self.module.resolve_topology(self.level)
+
+
+def analysis_check_context(
+    module: Module, function: Function, level: str | None
+) -> AnalysisCheckContext:
+    """Bind one context to the derived Function the analyses will read."""
+    scope = FunctionScope(module, function)
+    whole = CostEvaluator(CostContext(scope=scope))
+    local = CostEvaluator(
+        CostContext(scope=scope, level=level, topologies=module.effective_topologies())
+    )
+    return AnalysisCheckContext(
+        module=module,
+        function=function,
+        target=module.resolve_target(),
+        level=level,
+        whole=whole,
+        local=local,
+    )
+
+
+class PerformanceInputChecker:
+    """What `performance` needs before anything measures the program.
+
+    Two things, and nothing about storage: rates it can put on a clock, and a
+    placement for every occurrence that will take time. Where the buffers go is
+    the solver's question, answered against the schedule it is choosing.
+    """
+
+    def check_target(self, ctx: AnalysisCheckContext) -> None:
+        """Require a machine whose stated capacity and rates fit the question."""
+        try:
+            capacity = ctx.target.get_facts(ParallelCapacityFacts)
+            services = ctx.target.get_facts(PerformanceServiceFacts)
+        except UnsupportedCapabilityError as error:
+            raise AnalysisError(f"performance: {error}") from None
+        if ctx.level is None:
+            raise AnalysisError(
+                "performance: no topology level was selected, so results cannot "
+                "carry an execution placement"
+            )
+        if capacity.topology != ctx.level:
+            raise AnalysisError(
+                f"performance: selected topology level {ctx.level!r}, but the "
+                f"target's parallel capacity is stated for {capacity.topology!r}"
+            )
+        units = capacity.parallel_units
+        if isinstance(units, bool) or not isinstance(units, int) or units <= 0:
+            raise AnalysisError(
+                "performance: the target must publish a positive parallel-unit "
+                f"capacity, got {units!r}"
+            )
+        if services.unit != ctx.level:
+            raise AnalysisError(
+                f"performance: selected topology level {ctx.level!r}, but the "
+                f"target's one-unit throughputs are stated for {services.unit!r}"
+            )
+
+    def check_call(self, call: Call, ctx: AnalysisCheckContext) -> None:
+        """Require a placement for every occurrence that will take time."""
+        cost = _call_cost_record(call, ctx.whole, ctx.local)
+        moved = call_traffic(call, ctx.whole, ctx.local)
+        if _is_structural_occurrence(
+            cost, moved, bandwidth_level=_timed_level(ctx.target)
+        ):
+            return
+        try:
+            _execution_placement(call, ctx.selected_topology)
+        except AnalysisError as error:
+            raise AnalysisError(f"performance: {describe(call)}: {error}") from None
+
+    def finish(self, function: Function, ctx: AnalysisCheckContext) -> None:
+        """Nothing further: where the buffers go is decided with the schedule."""
+        return None
 
 
 def _program_dim_vars(module: Module, function: Function) -> dict[str, object]:
@@ -399,40 +575,6 @@ def _require_concrete_function_geometry(
         )
 
 
-def _authored_call(function: Function, call: Call) -> Call:
-    """Follow Function rebuilds to the authored Call at the same SSA position."""
-    current_function = function
-    current_call = call
-    seen: set[int] = set()
-    while id(current_function) not in seen:
-        seen.add(id(current_function))
-        origin = origin_of(current_function)
-        if origin is None:
-            return current_call
-        current_calls = tuple(
-            expr for expr in postorder(current_function.body) if isinstance(expr, Call)
-        )
-        origin_calls = tuple(
-            expr for expr in postorder(origin.body) if isinstance(expr, Call)
-        )
-        if len(current_calls) != len(origin_calls):
-            raise AnalysisError(
-                f"cannot trace Call provenance through rebuilt Function "
-                f"{current_function.name!r}: body shape changed"
-            )
-        try:
-            index = next(
-                index for index, candidate in enumerate(current_calls) if candidate is current_call
-            )
-        except StopIteration:
-            raise AnalysisError(
-                f"cannot trace a Call outside rebuilt Function {current_function.name!r}"
-            ) from None
-        current_function = origin
-        current_call = origin_calls[index]
-    raise AnalysisError(f"cyclic Function provenance on {current_function.name!r}")
-
-
 def _module_paths(module: Module) -> dict[int, str]:
     paths = {id(module): ""}
 
@@ -511,8 +653,7 @@ def _view_metadata(expr: Expr) -> tuple:
     return tuple(
         item
         for item in expr.metadata
-        if type(item) not in _DERIVED_METADATA
-        and type(item) not in {BindingMetadata, OccurrenceProvenance}
+        if type(item) not in _DERIVED_METADATA and type(item) is not BindingMetadata
     )
 
 
@@ -624,13 +765,7 @@ class _InlineMutator(ExprMutator):
                 self.active,
             )
             return self._finish(expr, rebuilt)
-        metadata = (
-            *_view_metadata(expr),
-            BindingMetadata(self.owner._binding()),
-            OccurrenceProvenance(
-                source_call=id(_authored_call(self.function, expr)), call_path=self.path
-            ),
-        )
+        metadata = (*_view_metadata(expr), BindingMetadata(self.owner._binding()))
         return self._finish(expr, replace(expr, args=new_args, metadata=metadata))
 
     def default_visit(self, expr: Expr) -> Expr:
@@ -750,11 +885,16 @@ def check_program(
     *,
     level: str | None = None,
     budget: int = _INLINE_NODES,
+    analyzers: tuple[object, ...] = (),
 ) -> Function:
     """Prove one program holds together, then return the view analysis will read.
 
     The returned Function has no Function-call wrapper. GridRegionExpr survives
     unchanged: a loop stays a loop. The authored Module and Function are untouched.
+
+    Each analysis states what it needs of the program through its own checker,
+    and every one of them answers before any of them writes. One traversal of
+    the derived calls serves them all, so a program is walked for this once.
     """
     if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
         raise AnalysisError(
@@ -780,7 +920,21 @@ def check_program(
     functions = reachable_functions(function)
     infer_authored_types(functions, module)
     validate_call_context(module, functions)
-    return _inline_view(module, function, budget)
+    derived = _inline_view(module, function, budget)
+    checkers = tuple(analyzer.input_checker for analyzer in analyzers)
+    if not checkers:
+        return derived
+    ctx = analysis_check_context(module, derived, level)
+    for checker in checkers:
+        checker.check_target(ctx)
+    for expr in postorder(derived.body):
+        if not isinstance(expr, Call) or isinstance(expr.target, Function):
+            continue
+        for checker in checkers:
+            checker.check_call(expr, ctx)
+    for checker in checkers:
+        checker.finish(derived, ctx)
+    return derived
 
 
-__all__ = ["check_program"]
+__all__ = ["AnalysisCheckContext", "PerformanceInputChecker", "check_program"]

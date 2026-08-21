@@ -50,6 +50,67 @@ containing `SOURCE` MUST be first on the Python module search path, so a file be
 it MAY be imported by its module name. A command MUST capture and suppress standard
 output that `SOURCE` emits while loading.
 
+How much of `SOURCE` is executed depends on whether it named a root, and the two
+boundaries are different:
+
+- Without a selector, `SOURCE` MUST be executed as one unit. The command was asked
+  about the file, so the first statement that fails is the answer and MUST be
+  reported as itself.
+- With a selector, each top-level statement of `SOURCE` MUST be executed on its own
+  and in source order, and one that fails MUST be set aside rather than ending the
+  load. No statement MAY be skipped unexecuted: what the selection needs is whatever
+  it turns out to read, and a reader cannot decide that from the text without
+  deciding which names are a function's own.
+
+  `SOURCE` MUST first be compiled whole, so that every rule the language applies
+  to a module still applies: a `__future__` import that is not at the beginning of
+  the file MUST be refused here exactly as an interpreter refuses it. Executing
+  less of a file is what a selector asks for; accepting more of the language is
+  not.
+
+  `SOURCE`'s leading `__future__` imports MUST then prefix each statement so that
+  they still govern it, and each statement MUST be compiled without inheriting the
+  compiling code's own `__future__` flags. The module docstring MUST NOT be
+  prefixed: it is the docstring because nothing precedes it, and a load that put
+  anything in front of it would leave the module with none. What a file postpones is that file's
+  decision: a file that postpones its annotations MUST keep them postponed, and
+  one that does not MUST have them evaluated, exactly as loading it as one unit
+  would.
+
+  A statement that is the selection's own MUST NOT be set aside. That is one that
+  binds the selected root, or that reads it while the file runs. Reads means free
+  reads and not spellings: a name being written is not a reading of it, and a
+  function body is not read then -- so a class attribute or a parameter sharing the
+  root's name is not a reading of it. A comprehension's variables are its own,
+  every one of them: only its first iterable is evaluated where the comprehension
+  is written, so a name read there is a name from outside, while every later
+  iterable is evaluated inside where all the targets already belong to it.
+
+  What decorates a function and what defaults its arguments IS read then. Whether
+  its annotations are is the file's own decision: where `SOURCE` postpones its
+  annotations they stay strings and reach for nothing, and where it does not they
+  are read like anything else.
+  Such a statement is building or reconfiguring what was named, so its failure
+  MUST be reported even when an earlier statement also failed and even when the
+  root is already bound. Only an `Exception` MAY be set aside at all: anything
+  else is the interpreter unwinding rather than an unfinished program, and MUST
+  propagate.
+
+  The exception is a failure that follows from one already set aside: a statement
+  reaching for a name that a set-aside statement would have bound fails for that
+  reason rather than its own, and reporting it would name the symptom instead of
+  the cause. Such a failure MUST be set aside too.
+
+  The selected root MUST then be resolved from what the load bound. If it is not
+  bound, the load MUST fail with the first failure it set aside, because something
+  the selection needed is what failed. A root reached under a second name is that
+  same root and keeps its own name.
+
+A class body runs when the file does, so a class that refuses to be built refuses
+there. The selector boundary above is what makes naming one root of a file a
+question about that root: a file is where programs are kept, not a claim that all
+of them are finished.
+
 `check` reads the same `SOURCE` shape and one thing more: its selector MAY name a
 runtime twin instead of an authored Module. A twin generated from an authored
 Module states which Module that is ([runtime §1.1](./runtime.md#11-runtimemodule)),
@@ -285,9 +346,9 @@ explicit analysis; there is no ordinary `--target` option.
     operation's `level`, and name the unit for per-unit figures. Its help MUST
     state the default and, for every family, which figure changes with the level
     and when to pass it, together with the global-traffic and observed-peak
-    assumptions. Compute cost MUST name both `flops_per_unit` and
-    `traffic_per_unit` as projected figures while keeping `flops` and `traffic`
-    explicitly global.
+    assumptions. Compute cost MUST name `flops_per_unit` and `service_per_unit`
+    as its projected figures while keeping `flops` and `service` explicitly
+    global; movement MUST name `TrafficMetadata.per_unit` against `whole`.
     With no analysis flag it MUST be accepted and inert.
   - `--dim NAME=EXTENT` MUST bind one dimension the selection leaves open, and
     MUST be repeatable to bind several. One dimension MUST receive one extent;

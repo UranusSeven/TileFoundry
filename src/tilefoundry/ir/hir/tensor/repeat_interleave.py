@@ -13,10 +13,13 @@ from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.shard.shard_layout import Broadcast, ShardLayout
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelationResult,
-    register_type_relation,
+    AccessRelations,
+    AffineAccess,
+    BoundaryRelation,
+    identity_access,
+    iterating,
+    register_access_relation,
 )
-from tilefoundry.visitor_registry.relation_build import build_domain, identity_map
 
 
 @register_op(name="repeat_interleave")
@@ -35,35 +38,6 @@ class RepeatInterleave(Op):
 
 def _normalize_axis(axis: int, rank: int) -> int:
     return axis if axis >= 0 else axis + rank
-
-
-@register_type_relation(RepeatInterleave)
-def _repeat_interleave_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Forward relation for RepeatInterleave.
-
-    Forward relation for RepeatInterleave: the iteration domain is the
-    *output* shape (the named axis already expanded to ``in_extent *
-    repeats``); the output map is identity -- every domain point writes
-    exactly one output element. The input map reads the source element at
-    ``out_idx // repeats`` along the named axis (``repeats`` consecutive
-    output positions alias the same input element); every other axis is
-    identity.
-    """
-    (x,) = input_types
-    op = call.target
-    rank = len(x.shape)
-    ax = _normalize_axis(op.axis, rank)
-    repeats = op.repeats
-
-    out_shape = list(x.shape)
-    out_shape[ax] = out_shape[ax] * repeats
-
-    dims = [f"d{i}" for i in range(rank)]
-    src = "[" + ", ".join(dims) + "]"
-    in_dims = [f"floor({dims[i]}/{repeats})" if i == ax else dims[i] for i in range(rank)]
-    in_map = isl.map(f"{{ {src} -> [{', '.join(in_dims)}] }}")
-    out_map = identity_map(rank)
-    return AccessRelationResult(domain=build_domain(tuple(out_shape)), maps=(in_map, out_map))
 
 
 @register_typeinfer(RepeatInterleave)
@@ -98,3 +72,38 @@ def _eval_repeat_interleave(ctx):
 
     out = torch.repeat_interleave(ctx.args[0].data, ctx.op.repeats, dim=ctx.op.axis)
     return TensorValue(data=out, type=ctx.result_type)
+
+
+@register_access_relation(RepeatInterleave)
+def _repeat_interleave_access(call: "Call", ctx) -> AccessRelations:
+    """Several result coordinates read one source coordinate, which is read once.
+
+    The pattern is many-to-one and the amount is its image. That three output
+    positions depend on one element is the pattern's business; the element still
+    crossed the boundary once.
+    """
+    source = ctx.type_of(call.args[0])
+    rank = len(source.shape)
+    axis = call.target.axis + rank if call.target.axis < 0 else call.target.axis
+    repeats = call.target.repeats
+    dims = [f"d{index}" for index in range(rank)]
+    reads = list(dims)
+    reads[axis] = f"floor(d{axis} / {repeats})" if repeats != 1 else dims[axis]
+    domain = ", ".join(dims)
+    out_shape = (
+        *source.shape[:axis],
+        source.shape[axis] * repeats,
+        *source.shape[axis + 1 :],
+    )
+    produced = 1
+    for extent in out_shape:
+        produced *= extent if isinstance(extent, int) else 1
+    return iterating(
+        out_shape,
+    AccessRelations(
+            inputs=(
+                BoundaryRelation(AffineAccess(isl.multi_aff(f"{{ [{domain}] -> [{', '.join(reads)}] }}"))),
+            ),
+            outputs=(BoundaryRelation(identity_access(rank)),),
+        ),
+    )

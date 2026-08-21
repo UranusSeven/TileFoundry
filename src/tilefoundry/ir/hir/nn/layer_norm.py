@@ -14,10 +14,14 @@ from tilefoundry.ir.types import DType, TensorType
 from tilefoundry.ir.types.shard.shard_layout import ShardLayout, split_target_axes
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelationResult,
-    register_type_relation,
+    AccessRelations,
+    AffineAccess,
+    BoundaryRelation,
+    iterating,
+    logical_axes_of,
+    normalised_rows,
+    register_access_relation,
 )
-from tilefoundry.visitor_registry.isl_utility import to_domain
 
 
 @register_op(name="layer_norm")
@@ -27,43 +31,6 @@ class LayerNorm(Op):
     bias = ParamDef(kind="input", pattern=Tensor)
     axis = ParamDef(kind="attribute", annotation=int)
     eps = ParamDef(kind="attribute", annotation=float)
-
-
-@register_type_relation(LayerNorm)
-def _layer_norm_relation(call: "Call", input_types, ctx) -> AccessRelationResult:
-    """Model LayerNorm over its complete normalized suffix."""
-    x, weight, bias = input_types
-    axis = _normalized_axis(call, ctx, len(x.shape))
-    normalized_shape = x.shape[axis:]
-    if weight.shape != normalized_shape or bias.shape != normalized_shape:
-        raise NotImplementedError(
-            "LayerNorm type_relation: weight and bias must match normalized "
-            f"shape {normalized_shape}, got {weight.shape} and {bias.shape}"
-        )
-    if any(not isinstance(extent, int) or isinstance(extent, bool) for extent in normalized_shape):
-        raise NotImplementedError(
-            "LayerNorm type_relation: normalized axes must be static ints, "
-            f"got {normalized_shape}"
-        )
-
-    prefix_shape = x.shape[:axis]
-    domain, param_map = to_domain(prefix_shape)
-    prefix = [f"d{i}" for i in range(axis)]
-    normalized = [f"j{i}" for i in range(len(normalized_shape))]
-    src = "[" + ", ".join(prefix) + "]"
-    row = ", ".join((*prefix, *normalized))
-    suffix = ", ".join(normalized)
-    bounds = " and ".join(
-        f"0 <= {dim} < {extent}"
-        for dim, extent in zip(normalized, normalized_shape, strict=True)
-    )
-    row_map = isl.map(f"{{ {src} -> [{row}] : {bounds} }}")
-    affine_map = isl.map(f"{{ {src} -> [{suffix}] : {bounds} }}")
-    return AccessRelationResult(
-        domain=domain,
-        maps=(row_map, affine_map, affine_map, row_map),
-        param_map=param_map,
-    )
 
 
 def _normalized_axis(call: "Call", ctx: "TypeInferContext", rank: int) -> int:
@@ -135,3 +102,39 @@ def _eval_layer_norm(ctx):
     axis = ctx.op.axis + rank if ctx.op.axis < 0 else ctx.op.axis
     out = F.layer_norm(x, tuple(x.shape[axis:]), weight, bias, ctx.op.eps)
     return TensorValue(data=out, type=ctx.result_type)
+
+
+@register_access_relation(LayerNorm)
+def _layer_norm_access(call: "Call", ctx) -> AccessRelations:
+    """One row normalised per iteration; the parameters read across the suffix.
+
+    Normalising needs the whole suffix before any of it can be written, so those
+    axes are not coordinates this Op is asked by. The parameters match the whole
+    suffix rather than one axis of it, which is what this Op's own type contract
+    already requires of them; the verifier refuses a split at or beyond that
+    axis, so
+    their footprint is the suffix's product in every view.
+    """
+    x = ctx.type_of(call.args[0])
+    authored = call.target.axis
+    axis = authored + len(x.shape) if authored < 0 else authored
+    rows, names, guards = normalised_rows(x, x, axis)
+    domain = ", ".join(f"d{index}" for index in range(len(rows)))
+    where = f" : {' and '.join(guards)}" if guards else ""
+    row = AffineAccess(isl.map(f"{{ [{domain}] -> [{', '.join(names)}]{where} }}"))
+    belongs = logical_axes_of(x, x)
+    suffix = ", ".join(
+        names[position] for position, owner in enumerate(belongs) if owner >= axis
+    ) or "0"
+    across = AffineAccess(isl.map(f"{{ [{domain}] -> [{suffix}]{where} }}"))
+    return iterating(
+        rows,
+        AccessRelations(
+            inputs=(
+                BoundaryRelation(row),
+                BoundaryRelation(across),
+                BoundaryRelation(across),
+            ),
+            outputs=(BoundaryRelation(row),),
+        ),
+    )
