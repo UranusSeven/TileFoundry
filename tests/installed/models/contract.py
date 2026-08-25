@@ -28,9 +28,6 @@ LOGICAL_FAMILIES = ("compute-cost", "memory", "roofline")
 FAMILIES = (*LOGICAL_FAMILIES, "performance")
 
 
-SOLVER = ("--solver-timeout=60", "--solver-workers=4", "--first-plan")
-
-
 def model_cases(model: str) -> tuple[ModelCase, ...]:
     """Every case the named model states, in the order it states them.
 
@@ -55,6 +52,18 @@ def dim_args(dims: Mapping[str, int] | None) -> list[str]:
     return [f"--dim={name}={extent}" for name, extent in (dims or {}).items()]
 
 
+def _run_with_report(tf, arguments: Sequence[object], *, suffix: str):
+    """Run a command whose report lives outside the installed command's stdout."""
+    with tempfile.NamedTemporaryFile(suffix=suffix) as report_file:
+        done = tf(*arguments, report_file.name)
+        report_text = ""
+        if done.returncode == 0:
+            assert done.stdout == ""
+            report_file.seek(0)
+            report_text = report_file.read().decode()
+        return done, report_text
+
+
 def analysed(
     tf,
     source: Path,
@@ -66,15 +75,19 @@ def analysed(
     json_output: bool = False,
 ):
     """One ``analyze`` command for one family, held to succeeding."""
-    done = tf(
+    arguments = [
         "analyze",
         static(source, case, selector),
         f"--{family}",
-        *(("--json",) if json_output else ()),
         *dim_args(dims),
+    ]
+    if json_output:
+        arguments.append("--json")
+    done, report_text = _run_with_report(
+        tf, arguments, suffix=".json" if json_output else ".py"
     )
     assert done.returncode == 0, done.stderr
-    return done
+    return report_text
 
 
 def reported(
@@ -86,15 +99,19 @@ def reported(
     dims: Mapping[str, int] | None = None,
 ) -> dict:
     """The JSON report several families write about one function."""
-    done = tf(
-        "analyze",
-        static(source, case, selector),
-        *(f"--{family}" for family in families),
-        "--json",
-        *dim_args(dims),
+    done, report_text = _run_with_report(
+        tf,
+        [
+            "analyze",
+            static(source, case, selector),
+            *(f"--{family}" for family in families),
+            *dim_args(dims),
+            "--json",
+        ],
+        suffix=".json",
     )
     assert done.returncode == 0, done.stderr
-    return json.loads(done.stdout)
+    return json.loads(report_text)
 
 
 def _compute_cost_evidence(report: dict) -> str | None:
@@ -195,30 +212,19 @@ def performance_refused(
     selected: FunctionCase,
 ) -> None:
     """One unplaced shipped-model function must identify the domain it lacks."""
-    rejected = tf(
-        "analyze",
-        static(source, case, selected.selector),
-        "--performance",
-        *dim_args(selected.dims),
+    rejected, _report_text = _run_with_report(
+        tf,
+        [
+            "analyze",
+            static(source, case, selected.selector),
+            "--performance",
+            *dim_args(selected.dims),
+        ],
+        suffix=".py",
     )
     assert rejected.returncode == 1, rejected.stdout + rejected.stderr
     assert "performance:" in rejected.stderr
     assert "has no" in rejected.stderr and "execution domain" in rejected.stderr
-
-
-def scheduled(tf, source: Path, case: ModelCase, planned: FunctionCase, *, topology: str = ""):
-    """One ``schedule`` command at a level the source has to declare itself."""
-    level = topology or planned.topology
-    done = tf(
-        "schedule",
-        static(source, case, planned.selector),
-        "--topology",
-        level,
-        *dim_args(planned.dims),
-        *SOLVER,
-    )
-    assert done.returncode == 0, done.stderr
-    return done
 
 
 def lifetimes(

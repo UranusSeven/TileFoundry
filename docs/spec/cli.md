@@ -33,7 +33,7 @@ hierarchy it inherits from the owners it was reached through.
 A selector MAY name a top-level binding that is a bare `Function` — a source
 whose `@func` declares no execution context binds one. Every verb here reads
 hardware facts, so such a selection MUST be rejected naming the Module that
-would declare its context, rather than analysed or scheduled against a default
+would declare its context, rather than analysed against a default
 ([target §6](./target.md#6-target-ownership-and-compile-resolution)).
 
 The file in `SOURCE` is any readable Python file. Nothing privileges the model
@@ -170,6 +170,9 @@ bounds the caller stated.
     not which side is closer to truth. A reference MAY carry its own rounding, and
     establishing accuracy needs an independent high-precision reference that
     `check` does not run.
+  - `--json PATH` MUST write the machine-readable report to `PATH` and MUST NOT
+    write any byte of that report to stdout. Without `--json`, the human report
+    MUST remain on stdout.
   - Reaching one leaf MUST read only that leaf Module's own weights. A comparison
     of one kernel MUST NOT materialise a whole model. A Module is the unit that
     loads, so what a run binds is everything the selected Module declares, not the
@@ -242,7 +245,7 @@ that runs before it can be read is a reference that decides what it describes.
     Module that declares none MUST NOT be listed as one. Declaring the machine is
     what makes a Module answerable on its own; a component or layer template
     reached through the root that owns it would otherwise be offered as a selector
-    that Analyze and Schedule cannot answer.
+    that Analyze cannot answer.
   - A run of sibling Modules MAY be written once as the range it covers, and only
     when the run is adjacent, identically shaped down its whole subtree, named from
     one stem, and numbered consecutively. Such an entry MUST name every Module it
@@ -314,12 +317,12 @@ whole; a reader who asked what a rule says is not asking for every rule.
 
 ## Analyze
 
-`analyze` first runs deterministic type inference and then prints complete type
+`analyze` first runs deterministic type inference and then writes complete type
 comments, regardless of analysis flags. It never performs candidate search,
 layout enumeration, or automatic resharding.
 
 Each flag names one root analysis. With no analysis flag, `analyze` requests no
-family: it type-checks the selection and prints its complete inferred HIR. The
+family: it type-checks the selection and writes its complete inferred HIR. The
 selected Module's resolved Target determines the hardware specification for an
 explicit analysis; there is no ordinary `--target` option.
 
@@ -332,10 +335,16 @@ explicit analysis; there is no ordinary `--target` option.
   - A selection MUST resolve to a Module. A bare Function MUST be rejected
     naming the reason: it declares neither the Target its numbers are measured
     against nor the topology hierarchy they divide over.
-  - `--json` MUST print the report as JSON instead of text. It MUST be refused as
-    an argument-combination error when no analysis flag was supplied, naming that
-    a report needs a requested root and printing the `analyze` usage. Both
-    formats MUST carry the same conclusions
+  - `analyze` MUST require a `PATH` whether or not an analysis flag was supplied.
+    Its typed HIR, text report, or JSON report MUST be written to that path, and
+    successful execution MUST write none of the report to stdout.
+  - `--json` MUST write the report as JSON to the required `PATH` instead of text.
+    Its `source` field MUST carry the annotated HIR rendered alongside that report.
+    `--operands` MUST NOT change `source`: it is always the annotated HIR from the
+    render without operand annotations.
+    It MUST be refused as an argument-combination error when no analysis flag was
+    supplied, naming that a report needs a requested root and printing the
+    `analyze` usage. Both formats MUST carry the same conclusions
     ([analysis §2](./analysis.md#2-authored-hir-metrics)).
   - `--operands` MUST add each operand's share of a call's traffic to that call's
     annotation, and MUST NOT change the JSON report, which carries that split
@@ -356,7 +365,7 @@ explicit analysis; there is no ordinary `--target` option.
     several extents together are a `check` request. It MUST be passed through as the
     operation's `dims` ([analysis §2.2](./analysis.md#22-analysis-families));
     the CLI MUST NOT specialise the selection itself, because then what it
-    printed would be about a program the operation never saw.
+    wrote would be about a program the operation never saw.
   - A `--dim` argument that is not `NAME=EXTENT`, or whose extent is not an
     integer, MUST be rejected naming which argument and why.
   - Repeating `--dim` states another dimension. One dimension stated twice MUST
@@ -368,7 +377,7 @@ explicit analysis; there is no ordinary `--target` option.
     its declared `[lo, hi)` interval, and concrete extents inside that interval
     the caller can use: inferring its concrete program requires an extent, and a
     range is not one. The bare form MUST apply stated dimensions before running
-    the public program check used by Analyze and Schedule, followed by the same
+    the public program check used by Analyze, followed by the same
     authored-analysis readiness validation as Analyze; this is an internal CLI
     path, not a public typecheck operation. It MUST reject an unsupported declared
     topology level or an extent over that level's target limit, even though no
@@ -387,82 +396,12 @@ explicit analysis; there is no ordinary `--target` option.
     measurements reported.
   - The report's `target` field MUST be the concrete Target value's `identity`,
     so two products served by one Target class remain distinguishable.
-  - On success with at least one requested root, text output begins with the
-    `#`-headed report followed by annotated HIR. With no analysis flag, output is
-    the typed HIR alone, with no report header and no analysis Metadata comment.
+  - On success with at least one requested root, the `PATH` file begins with the
+    `#`-headed report followed by annotated HIR. With no analysis flag, the `PATH`
+    file contains typed HIR alone, with no report header and no analysis Metadata
+    comment.
     On inference, verification, or analysis failure, stdout MUST be empty and
     stderr MUST report the source location, binding where available, and reason.
-
-## Schedule
-
-`schedule` makes one public Schedule call
-([schedule §1](./schedule.md#1-the-public-schedule-operation)) and prints the
-Plan that call produced. It composes nothing itself: which algorithm runs, what
-it decides, and how the decision reads are owned by the algorithm registered for
-the selected Module's target at the requested level.
-
-The target is not a flag. It comes from the selected Module's resolved Target
-([core-ir §1](./core-ir.md#1-module)): a kernel is authored against one target.
-A selection that is a bare Function, or a Module whose owner chain declares no
-Target, MUST be rejected -- `schedule` does not resolve an omission to a default
-([target §6](./target.md#6-target-ownership-and-compile-resolution)).
-
-- constraints:
-  - `--topology` MUST be required and MUST name one level the selected Module
-    declares. A level the Module does not declare, or one the target has no
-    algorithm for, MUST be reported as that.
-  - The command MUST call the public operation once and MUST NOT compose the
-    algorithm's stages itself, so what it prints cannot drift from what the
-    operation decided.
-  - `--dim NAME=EXTENT` MUST behave as it does for `analyze`, passed through as
-    the operation's `dims` ([schedule §1](./schedule.md#1-the-public-schedule-operation)).
-  - `--solver-timeout SECONDS` and `--solver-workers COUNT` MUST state the search
-    budget the operation is given, and either omitted MUST leave that part of the
-    budget at the operation's own default. A solver that sizes itself to the
-    machine is the right default for one schedule and the wrong one for several at
-    once, so the caller running several MUST be able to say so; a budget that
-    cannot be stated is a configuration nobody can reproduce.
-  - `--first-plan` MUST ask for the first plan that satisfies the constraints
-    rather than the best one within the budget, and MUST NOT lift the time limit:
-    a search that has found nothing yet stays bounded by it. Omitted, the search
-    MUST run as the operation's default does. The distinction is the caller's
-    because a search that cannot prove its objective optimal spends its whole
-    budget improving, so a caller who needs a plan and not the best plan otherwise
-    pays the full budget for an answer it already had.
-  - A search that ends without an answer MUST be reported as the search ending
-    without one, and MUST NOT be reported as the selection having no schedule.
-  - Output MUST be the Plan's own rendering: its `render()` by default, its
-    `to_json()` under `--json`. The command MUST NOT impose a shape across
-    algorithms, because two algorithms deciding different things have nothing to
-    share a format for.
-  - On any failure stdout MUST be empty and stderr MUST carry one
-    `tilefoundry: error:` line naming the cause.
-
-Scheduling this CUDA kernel at the level its Module divides over:
-
-```python
-# example
-@func(
-    target=CudaTarget("nvidia.h200_sxm"),
-    topologies=(Topology("cta", 4),),
-)
-def blocked_matmul(
-    x: Tensor[(64, 128), "bf16"],
-    w: Tensor[(128, 64), "bf16"],
-) -> Tensor[(64, 64), "bf16"]:
-    return matmul(x, w)
-```
-
-```text
-# example
-$ tilefoundry schedule model.py:blocked_matmul --topology cta
-partition cta on nvidia.h200_sxm (OPTIMAL, makespan 35ns)
-  MatMul x4 [0, 35)
-```
-
-The same Module scheduled at a level it also declares answers with that level's
-own algorithm and that algorithm's own Plan, which reads differently because it
-decided different things.
 
 ## Target
 

@@ -23,11 +23,7 @@ CASES = contract.model_cases(MODEL)
 ANALYSED = [
     pytest.param(case, selected, id=selected.id) for case in CASES for selected in case.analyze
 ]
-PLANNED = [
-    pytest.param(case, planned, id=planned.id) for case in CASES for planned in case.schedule
-]
-
-FIRST_PLAN = [pytest.param(case, case.schedule[0], id=case.id) for case in CASES]
+JSON_CASES = [pytest.param(case, case.schedule[0], id=case.id) for case in CASES]
 SIZED = [pytest.param(case, sized, id=sized.id) for case in CASES for sized in case.sized]
 
 
@@ -39,27 +35,6 @@ def test_every_selected_function_analyses(tf, shipped_source, case, selected) ->
     contract.analysed_every_family(
         tf, shipped_source(MODEL), case, selected.selector, selected.dims
     )
-
-
-@pytest.mark.parametrize(("case", "planned"), PLANNED)
-def test_every_selected_function_plans(tf, shipped_source, case, planned) -> None:
-    contract.scheduled(tf, shipped_source(MODEL), case, planned)
-
-
-@pytest.mark.parametrize(("case", "planned"), FIRST_PLAN)
-def test_the_plan_reaches_the_level_below_the_one_it_partitions(
-    tf, shipped_source, case, planned
-) -> None:
-    """The source declares two levels, and this model can be asked for both.
-
-    Nothing here names an extent for either: the copied ``model.py`` carries the
-    levels, and a root that stopped declaring ``thread`` leaves this command with
-    no level to be given and no test to inject one. Only this model and
-    ``qwen2_5_1_5b`` can witness that -- the other roots declare ``thread`` too, but
-    their IR reaches ops with no registered access relation, so the command fails for
-    a reason that has nothing to do with the level.
-    """
-    contract.scheduled(tf, shipped_source(MODEL), case, planned, topology="thread")
 
 
 @pytest.mark.parametrize(("case", "sized"), SIZED)
@@ -100,19 +75,19 @@ def test_the_open_dimensions_are_analysed_at_zero(tf, shipped_source, case, size
     assert all(nonzero[binding] > 0 for binding in ZERO_SIZED)
 
 
-@pytest.mark.parametrize(("case", "planned"), FIRST_PLAN)
-def test_the_command_reports_a_real_model_as_json(tf, shipped_source, case, planned) -> None:
-    done = contract.analysed(
+@pytest.mark.parametrize(("case", "selected"), JSON_CASES)
+def test_the_command_reports_a_real_model_as_json(tf, shipped_source, case, selected) -> None:
+    report = contract.analysed(
         tf,
         shipped_source(MODEL),
         case,
-        planned.selector,
+        selected.selector,
         "compute-cost",
-        planned.dims,
+        selected.dims,
         json_output=True,
     )
 
-    assert json.loads(done.stdout)
+    assert json.loads(report)
 
 
 @pytest.mark.parametrize("ctx_len", [0, 24])
