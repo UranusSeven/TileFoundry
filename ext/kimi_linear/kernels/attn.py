@@ -1,3 +1,4 @@
+
 """Kimi-Linear-48B-A3B MLA decode step, as five tilelang kernels.
 
 One token per step, shapes fixed by the checkpoint's config: hidden 2304,
@@ -16,6 +17,13 @@ in five launches:
     3  _kv_b_kernel          latent rms_norm + @ w_kv_b   -> kv partials
     4  _attn_kernel          rope, softmax over cache + self, k_new/v_new out
     5  _out_kernel           log-sum-exp merge + @ w_o    -> out (atomic adds)
+
+Two entry points wrap the same five launches. `mla_attention` is the authored
+contract: the cache's length is its shape and the caller appends -- which
+compiles kernel 4 once per context length, so it serves checks, not runs.
+`mla_attention_cap` is the driver's: the cache is a fixed-capacity buffer
+whose live length arrives on the device (`_attn_kernel_cap`), compiled once
+per capacity bucket.
 
 Every GEMV is the 16-row-MMA idiom from the qwen3.5 example's
 ``kernels/basic.py``: the vector sits in row 0 of a 16-row tile, rows 1..15
@@ -464,6 +472,195 @@ def _attn_kernel(C: int, KSA: int, KSB: int):
 
 
 # --------------------------------------------------------------------------
+# 4b. the same kernel, with the live cache length a device value
+# --------------------------------------------------------------------------
+@functools.lru_cache(maxsize=None)
+def _attn_kernel_cap(CAP: int, KSA: int, KSB: int):
+    """`_attn_kernel` over a fixed-capacity cache, live length in `Pos`.
+
+    The contract kernel compiles `C` into the binary, so a decode run through
+    it would pay one tilelang compilation per token. Here the cache is a
+    fixed `CAP`-row buffer (a bucket, see `_bucket`) and the live length rides
+    in `Pos`: at a decode step the position IS the prior length, and NoPE
+    makes the rope tables constant, so one tensor carries both. Loads past
+    the live length are predicated to zero and a dead slot's score is forced
+    to `_MNEG` -- the masking the contract kernel's tail tile does, at every
+    tile -- so dead positions contribute exactly nothing to the softmax.
+
+    Two costs, both bounded by the bucket granularity. The whole-tile fast
+    path (`T.copy`) is gone: its guard would be a runtime branch around a
+    GEMM, which tilelang's layout inference rejects (the KDA line measured
+    the same for a reduce). And every block walks all of CAP, live or not,
+    since the grid is static. `Cos`/`Sin` are `(CAP, _ROPE)` so `pos` is
+    always in bounds; the caller guarantees `pos < CAP` by switching buckets.
+    """
+    P = _ATT_P
+    NT = max(CAP // P, 1)
+    TPB = (NT + min(_ATT_SPLITS, NT) - 1) // min(_ATT_SPLITS, NT)
+    NSPLIT = (NT + TPB - 1) // TPB
+    SLOTS = NSPLIT + 1
+    TH = 128
+
+    @tilelang.jit
+    def build():
+        @T.prim_func
+        def main(
+            QP: T.Tensor((2, _NQ), "float32"),
+            KVP: T.Tensor((KSB, _NBV), "float32"),
+            CA: T.Tensor((KSA, _NA), "float32"),
+            Cos: T.Tensor((CAP, _ROPE), "bfloat16"),
+            Sin: T.Tensor((CAP, _ROPE), "bfloat16"),
+            Pos: T.Tensor((1,), "int32"),
+            Kc: T.Tensor((CAP, _NH, _QK), "bfloat16"),
+            Vc: T.Tensor((CAP, _NH, _V), "bfloat16"),
+            Scale: T.Tensor((1,), "bfloat16"),
+            Op: T.Tensor((SLOTS, _NH, _V), "float32"),
+            Mp: T.Tensor((SLOTS, _NH), "float32"),
+            Lp: T.Tensor((SLOTS, _NH), "float32"),
+            Kn: T.Tensor((_NH, _QK), "bfloat16"),
+            Vn: T.Tensor((_NH, _V), "bfloat16"),
+            Oacc: T.Tensor((_HID,), "float32"),
+        ):
+            with T.Kernel(_NH * NSPLIT, threads=TH) as b:
+                h = b % _NH
+                s = b // _NH
+                tid = T.get_thread_binding()
+                pos = Pos[0]
+                nctx = pos  # decode: the position IS the prior length
+
+                qraw = T.alloc_shared((_QK,), "float32")
+                krr = T.alloc_shared((_ROPE,), "float32")
+                knew = T.alloc_shared((_QK,), "float32")
+                vnew = T.alloc_shared((_V,), "float32")
+                css = T.alloc_shared((_ROPE,), "float32")
+                sss = T.alloc_shared((_ROPE,), "float32")
+                qsh = T.alloc_shared((_QK,), "float32")
+                qs = T.alloc_shared((BM, _QK), "bfloat16")
+                kf = T.alloc_shared((P, _QK), "bfloat16")
+                vf = T.alloc_shared((P, _V), "bfloat16")
+                psh = T.alloc_shared((BM, P), "bfloat16")
+                accs = T.alloc_fragment((BM, P), "float32")
+                ssh = T.alloc_shared((BM, P), "float32")
+                acco = T.alloc_fragment((BM, _V), "float32")
+                osh = T.alloc_shared((BM, _V), "float32")
+                scf = T.alloc_fragment((P,), "float32")
+                red = T.alloc_fragment((1,), "float32")
+                msh = T.alloc_shared((1,), "float32")
+                lsh = T.alloc_shared((1,), "float32")
+                nsh = T.alloc_shared((1,), "float32")
+                csh = T.alloc_shared((1,), "float32")
+
+                # ---- stage q, the shared k rope part, this token's k/v ----
+                for d in T.Parallel(_ROPE):
+                    css[d] = T.cast(Cos[pos, d], "float32")
+                    sss[d] = T.cast(Sin[pos, d], "float32")
+                for d in T.Parallel(_QK):
+                    qraw[d] = _psum(QP, h * _QK + d, 2)
+                for d in T.Parallel(_ROPE):
+                    krr[d] = _psum(CA, _LAT + d, KSA)
+                for d in T.Parallel(_NOPE):
+                    knew[d] = _psum(KVP, h * _KVB + d, KSB)
+                for d in T.Parallel(_V):
+                    vnew[d] = _psum(KVP, h * _KVB + _NOPE + d, KSB)
+                T.sync_threads()
+
+                sc = T.cast(Scale[0], "float32")
+                for d in T.Parallel(_NOPE):
+                    qsh[d] = qraw[d] * sc
+                for d in T.Parallel(_ROPE):
+                    qsh[_NOPE + d] = (
+                        _rope64(qraw[_NOPE + d], qraw[_NOPE + _partner(d)],
+                                css[d], sss[d], d) * sc
+                    )
+                    knew[_NOPE + d] = _rope64(krr[d], krr[_partner(d)],
+                                              css[d], sss[d], d)
+                for d in T.Parallel(_QK):
+                    qs[0, d] = T.cast(qsh[d], "bfloat16")
+                if tid == 0:
+                    msh[0] = _MNEG
+                    lsh[0] = 0.0
+                T.clear(acco)
+                T.sync_threads()
+
+                if s == 0:
+                    for d in T.Parallel(_QK):
+                        Kn[h, d] = T.cast(knew[d], "bfloat16")
+                    for d in T.Parallel(_V):
+                        Vn[h, d] = T.cast(vnew[d], "bfloat16")
+                    T.sync_threads()
+                    if tid == 0:
+                        sacc = T.alloc_var("float32", init=0.0)
+                        for d in T.serial(_QK):
+                            sacc = sacc + T.cast(T.cast(qsh[d], "bfloat16"), "float32") * T.cast(
+                                T.cast(knew[d], "bfloat16"), "float32")
+                        Mp[SLOTS - 1, h] = sacc
+                        Lp[SLOTS - 1, h] = 1.0
+                    for d in T.Parallel(_V):
+                        Op[SLOTS - 1, h, d] = vnew[d]
+                if b == 0:
+                    for i in T.Parallel(_HID):
+                        Oacc[i] = 0.0
+
+                # ---- the cached positions, live length from the device ----
+                for it in T.serial(TPB):
+                    base = (s * TPB + it) * P
+                    # Predicated scalar loads everywhere: a slot past the live
+                    # length lands as zero and its score is forced to _MNEG
+                    # below, so it contributes exp(-1e30 - m) * 0 = 0.
+                    for pp, d in T.Parallel(P, _QK):
+                        t = base + pp
+                        tc = T.min(t, CAP - 1)
+                        kf[pp, d] = T.if_then_else(
+                            t < nctx, Kc[tc, h, d], T.cast(0.0, "bfloat16"))
+                    for pp, d in T.Parallel(P, _V):
+                        t = base + pp
+                        tc = T.min(t, CAP - 1)
+                        vf[pp, d] = T.if_then_else(
+                            t < nctx, Vc[tc, h, d], T.cast(0.0, "bfloat16"))
+                    T.sync_threads()
+
+                    T.clear(accs)
+                    T.gemm(qs, kf, accs, transpose_B=True)
+                    T.copy(accs, ssh)
+                    for pp in T.Parallel(P):
+                        t = base + pp
+                        scf[pp] = T.if_then_else(
+                            t < nctx, ssh[0, pp], T.float32(_MNEG))
+                    T.reduce_max(scf, red, dim=0)
+                    T.copy(red, nsh)
+                    T.sync_threads()
+                    if tid == 0:
+                        nm = T.max(nsh[0], msh[0])
+                        csh[0] = T.exp(msh[0] - nm)
+                        msh[0] = nm
+                    T.sync_threads()
+                    for pp in T.Parallel(P):
+                        e = T.exp(scf[pp] - msh[0])
+                        psh[0, pp] = T.cast(e, "bfloat16")
+                        scf[pp] = e
+                    T.reduce_sum(scf, red, dim=0)
+                    T.copy(red, nsh)
+                    T.sync_threads()
+                    if tid == 0:
+                        lsh[0] = lsh[0] * csh[0] + nsh[0]
+                    for j, d in T.Parallel(BM, _V):
+                        acco[j, d] = acco[j, d] * csh[0]
+                    T.sync_threads()
+                    T.gemm(psh, vf, acco)
+
+                T.copy(acco, osh)
+                for d in T.Parallel(_V):
+                    Op[s, h, d] = osh[0, d]
+                if tid == 0:
+                    Mp[s, h] = msh[0]
+                    Lp[s, h] = lsh[0]
+
+        return main
+
+    return build(), NSPLIT, SLOTS
+
+
+# --------------------------------------------------------------------------
 # 5. log-sum-exp merge + o_proj
 # --------------------------------------------------------------------------
 @functools.lru_cache(maxsize=None)
@@ -635,4 +832,57 @@ def mla_attention(hidden, gamma_in, w_q, w_kv_a, gamma_kv_a, w_kv_b,
             v_new.view(1, 1, _NH, _V))
 
 
-__all__ = ["mla_attention"]
+#: Bucket sizes the capacity kernel is compiled at. Small contexts waste
+#: little at 128; past 2K the cache reads dominate and a coarser bucket costs
+#: nothing measurable. The distinct buckets a run crosses are the number of
+#: compilations it pays, once (tilelang caches them on disk).
+def bucket(n: int) -> int:
+    """The capacity an attention kernel is compiled for: *n* rounded up."""
+    if n <= 2048:
+        return max(128, ((n + 127) // 128) * 128)
+    return ((n + 1023) // 1024) * 1024
+
+
+def mla_attention_cap(hidden, gamma_in, w_q, w_kv_a, gamma_kv_a, w_kv_b,
+                      cos_cache, sin_cache, pos_ids, k_buf, v_buf, scale, w_o):
+    """`mla_attention` over fixed-capacity buffers, for the decode driver.
+
+    Same arguments and returns as `mla_attention`, except `k_buf` / `v_buf`
+    are `(1, CAP, ...)` -- a bucket-capacity prefix of the caller's persistent
+    cache, contiguous by construction -- and `pos_ids` carries the position,
+    which at a decode step is also the live cache length (see
+    `_attn_kernel_cap`). `cos_cache` / `sin_cache` are `(CAP, _ROPE)`. The
+    caller writes the returned k/v into slot `pos` itself.
+    """
+    assert hidden.dtype is torch.bfloat16, f"expected bf16, got {hidden.dtype}"
+    dev = hidden.device
+    CAP = int(k_buf.shape[1])
+    assert CAP % _ATT_P == 0, f"CAP {CAP} must be a multiple of {_ATT_P}"
+
+    x = hidden.reshape(_HID)
+    gin = gamma_in.reshape(_HID)
+
+    kern, _, slots = _attn_kernel_cap(CAP, _KSA, _KSB)
+    ws = _workspaces(dev, CAP, slots)
+
+    _input_proj(_NQ, 2, 128, 64, 3)(x, gin, w_q.reshape(_HID, _NQ), ws["qp"])
+    _input_proj(_NA, _KSA, 64, 64, 3)(x, gin, w_kv_a.reshape(_HID, _NA), ws["ca"])
+    _kv_b_kernel(_KSA, _KSB)(ws["ca"], gamma_kv_a.reshape(_LAT),
+                             w_kv_b.reshape(_LAT, _NBV), ws["kvp"])
+
+    k_new = torch.empty(_NH, _QK, dtype=torch.bfloat16, device=dev)
+    v_new = torch.empty(_NH, _V, dtype=torch.bfloat16, device=dev)
+    kern(ws["qp"], ws["kvp"], ws["ca"],
+         cos_cache.reshape(CAP, _ROPE), sin_cache.reshape(CAP, _ROPE),
+         pos_ids.reshape(1), k_buf.view(CAP, _NH, _QK), v_buf.view(CAP, _NH, _V),
+         scale.reshape(1),
+         ws["op"], ws["mp"], ws["lp"], k_new, v_new, ws["out"])
+
+    _out_kernel(slots)(ws["op"], ws["mp"], ws["lp"], w_o.reshape(_OI, _HID), ws["out"])
+
+    return (ws["out"].to(torch.bfloat16).view(1, 1, _HID),
+            k_new.view(1, 1, _NH, _QK),
+            v_new.view(1, 1, _NH, _V))
+
+
+__all__ = ["bucket", "mla_attention", "mla_attention_cap"]
