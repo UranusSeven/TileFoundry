@@ -660,13 +660,18 @@ their input when it states one. An input with `layout=None` produces a view with
 
 ##### Concat
 
-`Concat(inputs..., axis=a)` materializes a rank-preserving tensor by joining
+`Concat([inputs...], axis=a)` materializes a rank-preserving tensor by joining
 each input segment along `a`. All inputs MUST have one common rank and dtype,
 and every non-concatenated dimension MUST match. Negative `axis` values resolve
 against that rank. The output's concatenated extent is the sum of the input
 extents; every input access map is defined only on its segment and subtracts
 the preceding segments' extent from that axis, while the output map is the
 identity.
+
+The authored `inputs` value MUST be one explicit list, tuple, or supported
+static list comprehension. Its Tensor elements flatten into `Call.args` in
+source order; direct positional tensors and implicit iterable expansion are not
+part of this surface.
 
 Type inference derives fresh output ownership from those access maps. A
 `Split` on a non-concatenated axis MAY propagate when shared ownership
@@ -859,15 +864,15 @@ class Stack(Op):
     Attributes:
         inputs: input; variadic tensors to stack.
         axis: attribute; inserted result axis.
-        is_variadic: attribute; Whether the input parameter consumes all args.
     """
 
-    inputs: Tensor
+    inputs: Tuple[Tensor]
     axis: int
-    is_variadic: ClassVar[bool] = True
 ```
 
 - constraints:
+  - The authored `inputs` value MUST be one explicit list, tuple, or supported
+    static list comprehension. Its Tensor elements flatten into `Call.args`.
   - At least one input is required; every input MUST have the same shape and
     dtype. `axis` MUST resolve in `[-rank-1, rank]`.
   - The operation materializes one distinct result. The inserted axis is local
@@ -1264,6 +1269,12 @@ Consensus torch.nn.functional ops.
     is `Broadcast` / replicated. On each mesh axis, one `Partial(sum)` is
     therefore allowed; a double-Partial input or a non-`sum` reduction is
     rejected.
+  - `MatMul.a_layout` is `"MK"` (the default) or `"KM"`; `MatMul.b_layout` is
+    `"KN"` (the default) or `"NK"`. These literals state the physical order of
+    each operand's final two axes. The access relation maps them to logical
+    `(M, K)` and `(K, N)` before deriving the output, contraction ownership, and
+    `Partial(sum)` state. Its cost is `2 * numel(local_output) * local_K`, where
+    `local_K` is reconstructed from that same logical-axis mapping.
   - `Conv2D` requires rank-4 NCHW input and OIHW weight, a rank-1 bias, and one
     common operand dtype. `stride` and `dilation` are positive length-2 tuples,
     `padding` is a non-negative length-2 tuple, and `groups` is positive. Input

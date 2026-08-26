@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Tuple
+
 import isl
 import torch
 
@@ -38,9 +40,7 @@ from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_lay
 class Stack(Op):
     """Variadic input op. See Concat for encoding rationale."""
 
-    is_variadic: ClassVar[bool] = True
-
-    inputs = ParamDef(kind="input", pattern=Tensor)
+    inputs = ParamDef(kind="input", annotation=Tuple[Tensor], pattern=Tensor)
     axis = ParamDef(kind="attribute", annotation=int)
 
 

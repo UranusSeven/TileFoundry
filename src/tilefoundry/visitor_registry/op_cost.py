@@ -21,7 +21,7 @@ from tilefoundry.ir.hir.math.unary import Unary
 from tilefoundry.ir.hir.nn.conv2d import Conv2D
 from tilefoundry.ir.hir.nn.gelu import Gelu
 from tilefoundry.ir.hir.nn.layer_norm import LayerNorm
-from tilefoundry.ir.hir.nn.matmul import MatMul
+from tilefoundry.ir.hir.nn.matmul import MatMul, matmul_axes
 from tilefoundry.ir.hir.nn.relu import ReLU
 from tilefoundry.ir.hir.nn.rms_norm import RMSNorm
 from tilefoundry.ir.hir.nn.rope import RoPE
@@ -58,6 +58,7 @@ from tilefoundry.ir.hir.tensor.zeros import Zeros
 from tilefoundry.ir.types import DType, IntegerDType, TensorType, Type, numel, tensor_bytes
 from tilefoundry.ir.types.shard import ShardLayout
 from tilefoundry.ir.types.shard.shard_layout import layout_axis_to_tensor_axis
+from tilefoundry.visitor_registry.access_relation import logical_axes_of
 
 from .contexts import Cost, CostContext, TrafficBytes
 from .registries import register_cost_evaluator
@@ -115,21 +116,24 @@ def _serviced(call: Call, ctx: CostContext, kind: str) -> Cost:
 
 @register_cost_evaluator(MatMul)
 def _matmul(call: Call, ctx: CostContext) -> Cost:
-    """One multiply and one add per multiply-accumulate, over every batch.
-
-    The batch comes from the output rather than from the left operand. Either side
-    may be the one that is broadcast: a block of a weight matrix multiplied by one
-    token has its batch on the right, and reading the left gave a batch of one --
-    the whole block loop's arithmetic charged as a single tile's. The output's batch
-    is what the call produced, and every batch of it was computed.
-    """
+    """One multiply and one add per multiply-accumulate: 2 * batch * m * k * n."""
     lhs, rhs = _input_types(call, ctx)
     output = _output_type(call, ctx)
     if not all(isinstance(type, TensorType) for type in (lhs, rhs, output)):
         raise ValueError("MatMul cost requires tensor inputs and output")
-    m, k, n = lhs.shape[-2], lhs.shape[-1], rhs.shape[-1]
-    batch = math.prod(output.shape[:-2])
-    flops = 2 * batch * m * k * n
+    logical_lhs = ctx.type_of(call.args[0])
+    if not isinstance(logical_lhs, TensorType):
+        raise ValueError("MatMul cost requires a tensor lhs")
+    _a_m, a_k, _b_n, _b_k = matmul_axes(call.target)
+    k_axis = a_k % len(logical_lhs.shape)
+    k = math.prod(
+        extent
+        for extent, logical_axis in zip(
+            lhs.shape, logical_axes_of(lhs, logical_lhs)
+        )
+        if logical_axis == k_axis
+    )
+    flops = 2 * numel(output) * k
     return Cost({lhs.dtype: flops}, _traffic((lhs, rhs), output))
 
 

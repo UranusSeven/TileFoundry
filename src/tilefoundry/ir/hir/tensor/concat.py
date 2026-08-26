@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Tuple
+
 import isl
 import torch
 
@@ -47,9 +49,7 @@ class Concat(Op):
     Expr). The lone Param entry documents element type.
     """
 
-    is_variadic: ClassVar[bool] = True
-
-    inputs = ParamDef(kind="input", pattern=Tensor)
+    inputs = ParamDef(kind="input", annotation=Tuple[Tensor], pattern=Tensor)
     axis = ParamDef(kind="attribute", annotation=int)
 
 

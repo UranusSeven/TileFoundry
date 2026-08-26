@@ -393,10 +393,11 @@ class Call(Expr):
   - a value-form `Call` is anchored by `LetStmt` in TIR; a Stmt-position effect
     invocation is `Evaluate(op, args)`.
   - A `Call` MUST NOT appear as a top-level Stmt directly.
-  - `len(args)` MUST equal the number of `kind="input"` ParamDefs on
-    `target`.
-  - Each `args[i].type` MUST satisfy the i-th input ParamDef's pattern
-    / typeinfer rule.
+  - Normally, `len(args)` MUST equal the number of `kind="input"` ParamDefs on
+    `target`. A sole input annotated `Tuple[T]` describes a variadic sequence,
+    and every flattened argument corresponds to that ParamDef.
+  - Each argument MUST satisfy its corresponding input ParamDef's pattern /
+    typeinfer rule.
 
 ### 2.2 `Var` / `Constant` / `Tuple`
 
