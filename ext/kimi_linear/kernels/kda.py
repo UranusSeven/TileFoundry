@@ -1,3 +1,4 @@
+
 """`KimiDeltaAttention`: the KDA mixer at one token per step, in tilelang.
 
 Three kernels, mirroring `examples/qwen3_5_35b_a3b-tilelang/kernels/gdn.py`
@@ -43,7 +44,12 @@ What is different from GDN
   projections are then bf16 x bf16 with f32 accumulate, the same arithmetic
   the oracle's cuBLAS matmuls perform.
 """
-from __future__ import annotations
+# NOTE: no `from __future__ import annotations` here -- annotations must
+# evaluate eagerly at `def main` time so the nh shadowing above each
+# builder is what T.Tensor shapes see. Under PEP 563 they would be
+# strings, resolved later against module globals (TP1 constants) --
+# tilelang's get_type_hints only adds closure names the *body* uses,
+# so annotation-only names silently fell back to the 32-head shapes.
 
 import functools
 import os
@@ -103,8 +109,13 @@ def _use_torch() -> bool:
 
 
 @functools.lru_cache(maxsize=None)
-def _in_proj():
+def _in_proj(nh: int = NH):
     """`entry`, the shifted convolution windows, gate partials, zeroed `Out`.
+
+    `nh` is the head count this build serves: 32 for TP1, 16 for a TP2 rank.
+    The capitalized locals below shadow the TP1 globals -- tilelang resolves
+    annotation and body names against the defining frame, so the one function
+    source serves both (measured in m2_scratch/celltest.py).
 
     `entry` is this token's raw q/k/v projections. The q/k/v blocks are uniform
     because the caller stacks the three weights
@@ -129,9 +140,13 @@ def _in_proj():
     `T.atomic_add` and a kernel boundary is the only grid-wide barrier; 96 qkv
     blocks x 24 scalars cover it.
     """
+    NH = nh
+    KP = NH * DK
+    QKV = 3 * KP
+    NQ = KP // 128
     BN, BK, threads = 128, 128, 128
     KO = H // BK  #: 18
-    OPB = H // (3 * NQ)  #: 24 out scalars each qkv block zeroes
+    OPB = H // (3 * NQ)  #: 24 out scalars each qkv block zeroes (48 at nh=16)
     # xs (16, 2304) bf16 = 73.7 KB resident + stages * 32 KB weight tile + 8 KB
     # epilogue has to stay under the 227 KB an H200 SM hands out.
     stages = 4
@@ -306,8 +321,8 @@ def _in_proj():
 
 
 @functools.lru_cache(maxsize=None)
-def _conv_delta():
-    """One block is `(head, 32-row group of the V axis)`; 32*4 = 128 blocks.
+def _conv_delta(nh: int = NH):
+    """One block is `(head, 32-row group of the V axis)`; nh*4 blocks.
 
     Each block recomputes its head's q/k convolutions and l2 norms, the low-rank
     partial-sum reductions, and the f_b gate matmul -- 4x redundant per head and
@@ -328,6 +343,9 @@ def _conv_delta():
     The conv output and silu are rounded to bf16 before the l2 norm, matching
     the dtype the fla kernel's q/k/v carry; all arithmetic is f32.
     """
+    NH = nh
+    KP = NH * DK
+    QKV = 3 * KP
     threads = 128
 
     @tilelang.jit
@@ -515,7 +533,7 @@ def _conv_delta():
 
 
 @functools.lru_cache(maxsize=None)
-def _out_proj():
+def _out_proj(nh: int = NH):
     """`out = (rms_norm(read, gamma_o) * sigmoid(g2)) @ w_o`.
 
     w_o is K=4096, N=2304: 18 tiles of 128 would put 18 SMs on 18.9 MB, so K is
@@ -524,6 +542,10 @@ def _out_proj():
     a block holds every value dim of every head it touches and takes each head's
     RMS by itself. `G2` arrives with the sigmoid already applied (kernel 2).
     """
+    NH = nh
+    KP = NH * DK
+    NK = KP // OKS  #: 512 = 4 whole heads (256 = 2 at nh=16)
+    HPB = NK // DK
     BN, BK, threads = 128, 128, 128
     KO = NK // BK  #: 4
     stages = 5  #: 16 KB vector + 5 * 32 KB tile + 8 KB epilogue = 184 KB
@@ -591,7 +613,7 @@ def _out_proj():
 
 
 @functools.lru_cache(maxsize=None)
-def _short_conv():
+def _short_conv(nh: int = NH):
     """`silu(sum_j window[j] * conv_w[j])` over all KP channels, plus the window.
 
     The window to store next drops the oldest slot and appends this token. One
@@ -599,6 +621,7 @@ def _short_conv():
     KP-strided column, so this is four coalesced row reads and the kernel is
     launch-bound.
     """
+    KP = nh * DK
     threads = 256
 
     @tilelang.jit
@@ -631,8 +654,9 @@ def _short_conv():
 
 
 @functools.lru_cache(maxsize=None)
-def _l2_normalize():
+def _l2_normalize(nh: int = NH):
     """`x * rsqrt(sum(x^2) + 1e-6)` per head. One block per head, 128 threads."""
+    NH = nh
 
     @tilelang.jit
     def build():
@@ -676,7 +700,9 @@ def short_conv(x: torch.Tensor, conv_w: torch.Tensor, conv_state: torch.Tensor):
         return torch_ref.short_conv(x, conv_w, conv_state)
     y = torch.empty_like(x)
     cn = torch.empty_like(conv_state)
-    _short_conv()(x.contiguous(), conv_w.contiguous(), conv_state.contiguous(), y, cn)
+    _short_conv(x.shape[-1] // DK)(
+        x.contiguous(), conv_w.contiguous(), conv_state.contiguous(), y, cn
+    )
     return y, cn
 
 
@@ -685,7 +711,7 @@ def l2_normalize(x: torch.Tensor):
     if _use_torch():
         return torch_ref.l2_normalize(x)
     y = torch.empty_like(x)
-    _l2_normalize()(x.contiguous(), y)
+    _l2_normalize(x.shape[2])(x.contiguous(), y)
     return y
 
 
@@ -700,12 +726,14 @@ def _stack_qkv(w_q, w_k, w_v):
     copy, so it happens once per weight-set identity, not once per token.
     Weights are persistent in every real caller; keyed on the three data_ptrs.
     """
+    kp = w_q.shape[-1]
     key = (w_q.data_ptr(), w_k.data_ptr(), w_v.data_ptr())
     hit = _QKV_CACHE.get(key)
     if hit is None:
         hit = (
-            torch.cat([w_q.view(H, KP), w_k.view(H, KP), w_v.view(H, KP)], dim=1)
-            .contiguous()
+            torch.cat(
+                [w_q.view(H, kp), w_k.view(H, kp), w_v.view(H, kp)], dim=1
+            ).contiguous()
         )
         _QKV_CACHE[key] = hit
     return hit
@@ -734,6 +762,7 @@ def kda_step(
     w_o: torch.Tensor,
     state: torch.Tensor,
     scale: torch.Tensor,
+    keep_f32: bool = False,
 ):
     """One KDA decode step: `(out, state_next, conv_q_next, conv_k_next, conv_v_next)`.
 
@@ -753,6 +782,8 @@ def kda_step(
             conv_state_q, conv_state_k, conv_state_v, w_f_a, w_f_b, dt_bias,
             a_log, w_b, w_g_a, w_g_b, gamma_o, w_o, state, scale,
         )
+    nh = state.shape[1]
+    kp = nh * DK
     dev = hidden.device
     skey = scale.data_ptr()
     if skey not in _SCALE_SEEN:
@@ -767,34 +798,39 @@ def kda_step(
     cs_k = conv_state_k.contiguous()
     cs_v = conv_state_v.contiguous()
 
-    entry = torch.empty((QKV,), dtype=torch.bfloat16, device=dev)
-    cn_q = torch.empty((1, WS, KP), dtype=torch.bfloat16, device=dev)
-    cn_k = torch.empty((1, WS, KP), dtype=torch.bfloat16, device=dev)
-    cn_v = torch.empty((1, WS, KP), dtype=torch.bfloat16, device=dev)
+    entry = torch.empty((3 * kp,), dtype=torch.bfloat16, device=dev)
+    cn_q = torch.empty((1, WS, kp), dtype=torch.bfloat16, device=dev)
+    cn_k = torch.empty((1, WS, kp), dtype=torch.bfloat16, device=dev)
+    cn_v = torch.empty((1, WS, kp), dtype=torch.bfloat16, device=dev)
     pf = torch.empty((NBA, DK), dtype=torch.float32, device=dev)
     pg = torch.empty((NBA, DK), dtype=torch.float32, device=dev)
-    pbt = torch.empty((NBA, NH), dtype=torch.float32, device=dev)
-    read = torch.empty((1, NH, DK), dtype=torch.float32, device=dev)
-    g2 = torch.empty((NH, DK), dtype=torch.float32, device=dev)
-    updated = torch.empty((1, NH, DK, DK), dtype=torch.bfloat16, device=dev)
+    pbt = torch.empty((NBA, nh), dtype=torch.float32, device=dev)
+    read = torch.empty((1, nh, DK), dtype=torch.float32, device=dev)
+    g2 = torch.empty((nh, DK), dtype=torch.float32, device=dev)
+    updated = torch.empty((1, nh, DK, DK), dtype=torch.bfloat16, device=dev)
     out32 = torch.empty((H,), dtype=torch.float32, device=dev)
 
     wqkv = _stack_qkv(w_q, w_k, w_v)
-    _in_proj()(
+    _in_proj(nh)(
         hidden.reshape(H), gamma_in, wqkv,
-        w_f_a.view(H, DK), w_g_a.view(H, DK), w_b.view(H, NH),
+        w_f_a.view(H, DK), w_g_a.view(H, DK), w_b.view(H, nh),
         cs_q, cs_k, cs_v,
         entry, cn_q, cn_k, cn_v, pf, pg, pbt, out32,
     )
-    _conv_delta()(
+    _conv_delta(nh)(
         entry, cs_q, cs_k, cs_v,
         conv_w_q.contiguous(), conv_w_k.contiguous(), conv_w_v.contiguous(),
         pf, pg, pbt,
-        w_f_b.view(DK, KP), w_g_b.view(DK, KP), dt_bias, a_log,
+        w_f_b.view(DK, kp), w_g_b.view(DK, kp), dt_bias, a_log,
         state.contiguous(), read, updated, g2,
     )
-    _out_proj()(read, g2, gamma_o, w_o.view(KP, H), out32)
-    return out32.view(1, 1, H).to(torch.bfloat16), updated, cn_q, cn_k, cn_v
+    _out_proj(nh)(read, g2, gamma_o, w_o.view(kp, H), out32)
+    # keep_f32: a TP2 rank all-reduces the un-rounded o_proj accumulator and
+    # lands bf16 once, on the sum.
+    out = out32.view(1, 1, H)
+    if not keep_f32:
+        out = out.to(torch.bfloat16)
+    return out, updated, cn_q, cn_k, cn_v
 
 
 __all__ = ["kda_step", "l2_normalize", "short_conv"]

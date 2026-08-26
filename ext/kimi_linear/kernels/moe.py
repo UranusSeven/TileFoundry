@@ -693,7 +693,8 @@ def experts(tokens, weights, indices, w_gate, w_up, w_down,
 
 
 def moe_block(hidden, gamma_post, w_router, bias, routed_scale,
-              w_gate, w_up, w_down, sh_gate, sh_up, sh_down) -> torch.Tensor:
+              w_gate, w_up, w_down, sh_gate, sh_up, sh_down,
+              keep_f32: bool = False) -> torch.Tensor:
     """The authored `moe.moe`, end to end: post-norm -> routing -> experts.
 
     Takes and returns the authored shapes -- `hidden` `[1, 1, H]` bf16, the
@@ -707,10 +708,13 @@ def moe_block(hidden, gamma_post, w_router, bias, routed_scale,
         tok, w, i, w_gate, w_up, w_down,
         sh_gate.view(H, -1), sh_up.view(H, -1), sh_down.view(-1, H),
     )
-    return out.to(torch.bfloat16)
+    # keep_f32: a TP2 rank all-reduces the un-rounded partial and lands bf16
+    # once, on the sum.
+    return out if keep_f32 else out.to(torch.bfloat16)
 
 
-def dense_mlp(hidden, gamma_post, w_gate, w_up, w_down) -> torch.Tensor:
+def dense_mlp(hidden, gamma_post, w_gate, w_up, w_down,
+              keep_f32: bool = False) -> torch.Tensor:
     """Layer 0's dense SwiGLU (`KimiDenseMlp.mlp`): fused post-norm, then the
 
     shared-expert kernels at IS=9216. Weights are the authored `[1, H, I]` /
@@ -721,7 +725,8 @@ def dense_mlp(hidden, gamma_post, w_gate, w_up, w_down) -> torch.Tensor:
     out = shared_expert(
         tok, w_gate.view(H, -1), w_up.view(H, -1), w_down.view(-1, H)
     )
-    return out.view(1, 1, H).to(torch.bfloat16)
+    out = out.view(1, 1, H)
+    return out if keep_f32 else out.to(torch.bfloat16)
 
 
 __all__ = [

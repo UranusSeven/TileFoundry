@@ -3,7 +3,11 @@
 
 One token per step, shapes fixed by the checkpoint's config: hidden 2304,
 32 heads, qk head dim 192 (128 nope + 64 rope), v head dim 128, kv lora
-rank 512. Semantics follow ``tests/models/kimi_linear_48b_a3b/model.py``'s
+rank 512. Every builder also takes `nh`, the head count it serves: 32 for
+TP1, 16 for one rank of TP2. The capitalized locals shadow the module
+constants -- tilelang resolves annotation and body names against the
+defining frame, so the one source serves both (same trick as
+``kernels/kda.py``). Semantics follow ``tests/models/kimi_linear_48b_a3b/model.py``'s
 ``mla_attention`` exactly -- same roundings, same rope, same cache contract
 (the caller appends; this returns only the new token's k and v).
 
@@ -53,7 +57,12 @@ NoPE note: Kimi ships ``mla_use_nope: true``, expressed by the caller as
 ``cos = 1, sin = 0`` -- the identity by arithmetic. The rotary is always
 applied here; there is one code path.
 """
-from __future__ import annotations
+# NOTE: no `from __future__ import annotations` here -- annotations must
+# evaluate eagerly at `def main` time so the nh shadowing above each
+# builder is what T.Tensor shapes see. Under PEP 563 they would be
+# strings, resolved later against module globals (TP1 constants) --
+# tilelang's get_type_hints only adds closure names the *body* uses,
+# so annotation-only names silently fell back to the 32-head shapes.
 
 import functools
 
@@ -198,7 +207,7 @@ def _input_proj(N: int, KS: int, BN: int, BK: int, ST: int):
 # 3. latent rms_norm + @ w_kv_b  ->  (KS, 8192) f32 partials
 # --------------------------------------------------------------------------
 @functools.lru_cache(maxsize=None)
-def _kv_b_kernel(KSA: int, KS: int):
+def _kv_b_kernel(KSA: int, KS: int, nh: int = _NH):
     """`kv = rms_norm(latent) @ w_kv_b`, latent summed from `KSA` partials.
 
     The latent norm is recomputed per block (512 values against 131 KB of
@@ -206,6 +215,7 @@ def _kv_b_kernel(KSA: int, KS: int):
     bf16. The rope tail of the compressed vector (columns 512..576) is not
     touched here; the attention kernel reads it from the same partials.
     """
+    _NBV = nh * _KVB
     BN, BK, ST = 128, 64, 3
     KB = _LAT // KS
     KO = KB // BK
@@ -269,7 +279,7 @@ def _kv_b_kernel(KSA: int, KS: int):
 # 4. rope + softmax over the cache and this token, per (head, split)
 # --------------------------------------------------------------------------
 @functools.lru_cache(maxsize=None)
-def _attn_kernel(C: int, KSA: int, KSB: int):
+def _attn_kernel(C: int, KSA: int, KSB: int, nh: int = _NH):
     """Online softmax over `C` cached positions plus this token, per head.
 
     One block per (head, context split). MLA here has no GQA sharing -- every
@@ -287,6 +297,9 @@ def _attn_kernel(C: int, KSA: int, KSB: int):
     rotated per head and the scale is folded into q once, here, rather than
     into every score.
     """
+    _NH = nh
+    _NQ = nh * _QK
+    _NBV = nh * _KVB
     P = _ATT_P
     NT = max((C + P - 1) // P, 1)  # context tiles the kernel may look at
     TPB = (NT + min(_ATT_SPLITS, NT) - 1) // min(_ATT_SPLITS, NT)
@@ -475,7 +488,7 @@ def _attn_kernel(C: int, KSA: int, KSB: int):
 # 4b. the same kernel, with the live cache length a device value
 # --------------------------------------------------------------------------
 @functools.lru_cache(maxsize=None)
-def _attn_kernel_cap(CAP: int, KSA: int, KSB: int):
+def _attn_kernel_cap(CAP: int, KSA: int, KSB: int, nh: int = _NH):
     """`_attn_kernel` over a fixed-capacity cache, live length in `Pos`.
 
     The contract kernel compiles `C` into the binary, so a decode run through
@@ -494,6 +507,9 @@ def _attn_kernel_cap(CAP: int, KSA: int, KSB: int):
     since the grid is static. `Cos`/`Sin` are `(CAP, _ROPE)` so `pos` is
     always in bounds; the caller guarantees `pos < CAP` by switching buckets.
     """
+    _NH = nh
+    _NQ = nh * _QK
+    _NBV = nh * _KVB
     P = _ATT_P
     NT = max(CAP // P, 1)
     TPB = (NT + min(_ATT_SPLITS, NT) - 1) // min(_ATT_SPLITS, NT)
@@ -664,7 +680,7 @@ def _attn_kernel_cap(CAP: int, KSA: int, KSB: int):
 # 5. log-sum-exp merge + o_proj
 # --------------------------------------------------------------------------
 @functools.lru_cache(maxsize=None)
-def _out_kernel(SLOTS: int):
+def _out_kernel(SLOTS: int, nh: int = _NH):
     """`out = merge(partials) @ w_o`, K-split with atomic accumulation.
 
     o_proj contracts 4096, which at BN=128 is 18 column tiles -- a seventh of
@@ -676,6 +692,8 @@ def _out_kernel(SLOTS: int):
     Each K-split owns 512 of the 4096, exactly four query heads, so a block
     merges only the heads it contracts.
     """
+    _NH = nh
+    _OI = nh * _V
     KS, BN, BK, ST = 8, 128, 64, 3
     KB = _OI // KS       # 512
     KO = KB // BK
@@ -764,18 +782,18 @@ _KSB = 2
 _WS: dict = {}
 
 
-def _workspaces(dev, C: int, slots: int):
-    key = (str(dev), C)
+def _workspaces(dev, C: int, slots: int, nh: int):
+    key = (str(dev), C, nh)
     ws = _WS.get(key)
     if ws is None:
         f32 = torch.float32
         ws = dict(
-            qp=torch.empty(2, _NQ, dtype=f32, device=dev),
+            qp=torch.empty(2, nh * _QK, dtype=f32, device=dev),
             ca=torch.empty(_KSA, _NA, dtype=f32, device=dev),
-            kvp=torch.empty(_KSB, _NBV, dtype=f32, device=dev),
-            op=torch.empty(slots, _NH, _V, dtype=f32, device=dev),
-            mp=torch.empty(slots, _NH, dtype=f32, device=dev),
-            lp=torch.empty(slots, _NH, dtype=f32, device=dev),
+            kvp=torch.empty(_KSB, nh * _KVB, dtype=f32, device=dev),
+            op=torch.empty(slots, nh, _V, dtype=f32, device=dev),
+            mp=torch.empty(slots, nh, dtype=f32, device=dev),
+            lp=torch.empty(slots, nh, dtype=f32, device=dev),
             out=torch.empty(_HID, dtype=f32, device=dev),
         )
         _WS[key] = ws
@@ -793,43 +811,45 @@ def mla_attention(hidden, gamma_in, w_q, w_kv_a, gamma_kv_a, w_kv_b,
     assert hidden.dtype is torch.bfloat16, f"expected bf16, got {hidden.dtype}"
     dev = hidden.device
     C = int(k_cache.shape[1])  # a host-side shape, not a device value
+    nh = w_q.shape[-1] // _QK  # 32, or 16 for one TP2 rank
 
     x = hidden.reshape(_HID)
     gin = gamma_in.reshape(_HID)
 
-    kern, _, slots = _attn_kernel(C, _KSA, _KSB)
-    ws = _workspaces(dev, C, slots)
+    kern, _, slots = _attn_kernel(C, _KSA, _KSB, nh)
+    ws = _workspaces(dev, C, slots, nh)
 
     # 1. q = rms_norm(hidden) @ w_q, 2 K-splits.
-    _input_proj(_NQ, 2, 128, 64, 3)(x, gin, w_q.reshape(_HID, _NQ), ws["qp"])
+    _input_proj(nh * _QK, 2, 128, 64, 3)(x, gin, w_q.reshape(_HID, nh * _QK), ws["qp"])
 
     # 2. compressed = rms_norm(hidden) @ w_kv_a.
     _input_proj(_NA, _KSA, 64, 64, 3)(x, gin, w_kv_a.reshape(_HID, _NA), ws["ca"])
 
     # 3. kv = rms_norm(latent) @ w_kv_b.
-    _kv_b_kernel(_KSA, _KSB)(ws["ca"], gamma_kv_a.reshape(_LAT),
-                             w_kv_b.reshape(_LAT, _NBV), ws["kvp"])
+    _kv_b_kernel(_KSA, _KSB, nh)(ws["ca"], gamma_kv_a.reshape(_LAT),
+                                 w_kv_b.reshape(_LAT, nh * _KVB), ws["kvp"])
 
     # 4. attention, returning this token's k/v for the caller to append.
-    k_new = torch.empty(_NH, _QK, dtype=torch.bfloat16, device=dev)
-    v_new = torch.empty(_NH, _V, dtype=torch.bfloat16, device=dev)
+    k_new = torch.empty(nh, _QK, dtype=torch.bfloat16, device=dev)
+    v_new = torch.empty(nh, _V, dtype=torch.bfloat16, device=dev)
     if C == 0:
-        kc = torch.zeros(1, _NH, _QK, dtype=torch.bfloat16, device=dev)
-        vc = torch.zeros(1, _NH, _V, dtype=torch.bfloat16, device=dev)
+        kc = torch.zeros(1, nh, _QK, dtype=torch.bfloat16, device=dev)
+        vc = torch.zeros(1, nh, _V, dtype=torch.bfloat16, device=dev)
     else:
-        kc = k_cache.view(C, _NH, _QK)
-        vc = v_cache.view(C, _NH, _V)
+        kc = k_cache.view(C, nh, _QK)
+        vc = v_cache.view(C, nh, _V)
     kern(ws["qp"], ws["kvp"], ws["ca"],
          cos_cache.reshape(1, _ROPE), sin_cache.reshape(1, _ROPE),
          pos_ids.reshape(1), kc, vc, scale.reshape(1),
          ws["op"], ws["mp"], ws["lp"], k_new, v_new, ws["out"])
 
     # 5. log-sum-exp merge + o_proj.
-    _out_kernel(slots)(ws["op"], ws["mp"], ws["lp"], w_o.reshape(_OI, _HID), ws["out"])
+    _out_kernel(slots, nh)(ws["op"], ws["mp"], ws["lp"],
+                           w_o.reshape(nh * _V, _HID), ws["out"])
 
     return (ws["out"].to(torch.bfloat16).view(1, 1, _HID),
-            k_new.view(1, 1, _NH, _QK),
-            v_new.view(1, 1, _NH, _V))
+            k_new.view(1, 1, nh, _QK),
+            v_new.view(1, 1, nh, _V))
 
 
 #: Bucket sizes the capacity kernel is compiled at. Small contexts waste
@@ -844,7 +864,8 @@ def bucket(n: int) -> int:
 
 
 def mla_attention_cap(hidden, gamma_in, w_q, w_kv_a, gamma_kv_a, w_kv_b,
-                      cos_cache, sin_cache, pos_ids, k_buf, v_buf, scale, w_o):
+                      cos_cache, sin_cache, pos_ids, k_buf, v_buf, scale, w_o,
+                      keep_f32: bool = False):
     """`mla_attention` over fixed-capacity buffers, for the decode driver.
 
     Same arguments and returns as `mla_attention`, except `k_buf` / `v_buf`
@@ -853,36 +874,45 @@ def mla_attention_cap(hidden, gamma_in, w_q, w_kv_a, gamma_kv_a, w_kv_b,
     which at a decode step is also the live cache length (see
     `_attn_kernel_cap`). `cos_cache` / `sin_cache` are `(CAP, _ROPE)`. The
     caller writes the returned k/v into slot `pos` itself.
+
+    The head count comes from `w_q`: 32 for the full model, 16 for one TP2
+    rank. With `keep_f32` the output is returned un-rounded -- the o_proj
+    accumulator itself -- for a TP rank to all-reduce in f32 before the one
+    bf16 landing; it aliases the workspace, so the caller must consume it
+    before the next call.
     """
     assert hidden.dtype is torch.bfloat16, f"expected bf16, got {hidden.dtype}"
     dev = hidden.device
     CAP = int(k_buf.shape[1])
     assert CAP % _ATT_P == 0, f"CAP {CAP} must be a multiple of {_ATT_P}"
+    nh = w_q.shape[-1] // _QK  # 32, or 16 for one TP2 rank
 
     x = hidden.reshape(_HID)
     gin = gamma_in.reshape(_HID)
 
-    kern, _, slots = _attn_kernel_cap(CAP, _KSA, _KSB)
-    ws = _workspaces(dev, CAP, slots)
+    kern, _, slots = _attn_kernel_cap(CAP, _KSA, _KSB, nh)
+    ws = _workspaces(dev, CAP, slots, nh)
 
-    _input_proj(_NQ, 2, 128, 64, 3)(x, gin, w_q.reshape(_HID, _NQ), ws["qp"])
+    _input_proj(nh * _QK, 2, 128, 64, 3)(x, gin, w_q.reshape(_HID, nh * _QK), ws["qp"])
     _input_proj(_NA, _KSA, 64, 64, 3)(x, gin, w_kv_a.reshape(_HID, _NA), ws["ca"])
-    _kv_b_kernel(_KSA, _KSB)(ws["ca"], gamma_kv_a.reshape(_LAT),
-                             w_kv_b.reshape(_LAT, _NBV), ws["kvp"])
+    _kv_b_kernel(_KSA, _KSB, nh)(ws["ca"], gamma_kv_a.reshape(_LAT),
+                                 w_kv_b.reshape(_LAT, nh * _KVB), ws["kvp"])
 
-    k_new = torch.empty(_NH, _QK, dtype=torch.bfloat16, device=dev)
-    v_new = torch.empty(_NH, _V, dtype=torch.bfloat16, device=dev)
+    k_new = torch.empty(nh, _QK, dtype=torch.bfloat16, device=dev)
+    v_new = torch.empty(nh, _V, dtype=torch.bfloat16, device=dev)
     kern(ws["qp"], ws["kvp"], ws["ca"],
          cos_cache.reshape(CAP, _ROPE), sin_cache.reshape(CAP, _ROPE),
-         pos_ids.reshape(1), k_buf.view(CAP, _NH, _QK), v_buf.view(CAP, _NH, _V),
+         pos_ids.reshape(1), k_buf.view(CAP, nh, _QK), v_buf.view(CAP, nh, _V),
          scale.reshape(1),
          ws["op"], ws["mp"], ws["lp"], k_new, v_new, ws["out"])
 
-    _out_kernel(slots)(ws["op"], ws["mp"], ws["lp"], w_o.reshape(_OI, _HID), ws["out"])
+    _out_kernel(slots, nh)(ws["op"], ws["mp"], ws["lp"],
+                           w_o.reshape(nh * _V, _HID), ws["out"])
 
-    return (ws["out"].to(torch.bfloat16).view(1, 1, _HID),
-            k_new.view(1, 1, _NH, _QK),
-            v_new.view(1, 1, _NH, _V))
+    out = ws["out"].view(1, 1, _HID)
+    return (out if keep_f32 else out.to(torch.bfloat16),
+            k_new.view(1, 1, nh, _QK),
+            v_new.view(1, 1, nh, _V))
 
 
 __all__ = ["bucket", "mla_attention", "mla_attention_cap"]
