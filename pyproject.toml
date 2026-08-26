@@ -119,5 +119,7 @@ ignore = ["E501", "F821", "E741"]
 # authoring-surface ergonomics. Internal implementation code in
 # `src/` must NOT use star imports (no exception here).
 "tests/**/*.py" = ["F403", "F405"]
+# ext/ is authored-model territory too (see tests/models above).
+"ext/**/*.py" = ["F403", "F405"]
 [tool.ruff.lint.pydocstyle]
 convention = "google"

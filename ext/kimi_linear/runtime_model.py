@@ -370,7 +370,7 @@ def _root_twin(sem_root):
 KimiLinear48BA3B = _root_twin(sem.KimiLinear48BA3B)
 
 
-def precompile(capacity: int) -> int:
+def precompile(capacity: int, nh: int = _NH) -> int:
     """Compile every attention bucket a run up to *capacity* crosses.
 
     The capacity attention kernel compiles once per bucket (tilelang caches
@@ -381,8 +381,8 @@ def precompile(capacity: int) -> int:
     """
     n, count = 128, 0
     while n <= capacity:
-        _kern, _nsplit, slots = _attn._attn_kernel_cap(n, _attn._KSA, _attn._KSB)
-        _attn._out_kernel(slots)
+        _kern, _nsplit, slots = _attn._attn_kernel_cap(n, _attn._KSA, _attn._KSB, nh)
+        _attn._out_kernel(slots, nh)
         count += 1
         n += 128 if n < 2048 else 1024
     return count
@@ -403,6 +403,23 @@ class Session:
     bucket-compiled attention kernel reads.
     """
 
+    #: Heads in one rank's MLA caches -- all of them at world size 1.
+    #: `runtime_tp2.SessionTP2` overrides.
+    _cache_heads = _NH
+
+    def _twin_cls(self):
+        """The twin class to instantiate (runtime_tp2 substitutes its own)."""
+        if self.cfg is sem.config:
+            return KimiLinear48BA3B
+        return _root_twin(self.sem)
+
+    def _post_load(self) -> None:
+        """After the weights bind: a TP session slices them here."""
+
+    def _shard_kda_entry(self, entry):
+        """A KDA cache entry as this rank holds it (whole, at world size 1)."""
+        return entry
+
     def __init__(
         self,
         cfg=None,
@@ -417,19 +434,18 @@ class Session:
         if cfg is None:
             self.sem = sem.KimiLinear48BA3B
             self.kinds = sem.LAYER_KINDS
-            twin_cls = KimiLinear48BA3B
         else:
             built = sem.build(cfg)
             self.sem = built["KimiLinear48BA3B"]
             self.kinds = built["LAYER_KINDS"]
-            twin_cls = _root_twin(self.sem)
-        self.twin = twin_cls()
+        self.twin = self._twin_cls()()
 
         t0 = time.perf_counter()
         resource, tally = wt.decoder_resource(
             self.sem, ckpt=ckpt, cfg=cfg, device=device, verbose=verbose
         )
         self.twin.load(resource)
+        self._post_load()
         self.load_seconds = time.perf_counter() - t0
         self.loaded_bytes = tally["bytes"]
 
@@ -457,10 +473,10 @@ class Session:
         for index, (mixer, _ffn) in enumerate(self.kinds):
             if mixer == "mla":
                 self.kbuf[index] = torch.zeros(
-                    1, self.capacity, _NH, _QK, dtype=_BF16, device=device
+                    1, self.capacity, self._cache_heads, _QK, dtype=_BF16, device=device
                 )
                 self.vbuf[index] = torch.zeros(
-                    1, self.capacity, _NH, _V, dtype=_BF16, device=device
+                    1, self.capacity, self._cache_heads, _V, dtype=_BF16, device=device
                 )
         self.reset()
 
@@ -471,7 +487,7 @@ class Session:
         self.kda = {}
         for i, entry in enumerate(self.twin.init_caches(device=self.device)):
             if self.kinds[i][0] == "kda":
-                self.kda[i] = entry
+                self.kda[i] = self._shard_kda_entry(entry)
         for buf in (*self.kbuf.values(), *self.vbuf.values()):
             buf.zero_()
         self.pos = 0

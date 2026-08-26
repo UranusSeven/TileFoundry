@@ -224,7 +224,7 @@ def _router_logits(wdt: str, H: int, E: int, NS: int, xdt: str):
 
 @functools.lru_cache(maxsize=None)
 def _router_select(E: int, K: int, NS: int, bdt: str, sdt: str):
-    """select on sigmoid(logits) + bias -> weights from the UNBIASED scores.
+    """Select on sigmoid(logits) + bias -> weights from the UNBIASED scores.
 
     The selection is K rounds of one `reduce_max` over an int64 key,
     `bits(exp(b - max)) << 32 | (E-1-j)`: `exp(b - max)` is non-negative so
@@ -669,7 +669,7 @@ def shared_expert(tokens, sh_gate, sh_up, sh_down) -> torch.Tensor:
 
 def experts(tokens, weights, indices, w_gate, w_up, w_down,
             sh_gate, sh_up, sh_down) -> torch.Tensor:
-    """routed + shared, (1, 1, H) f32, in two kernels.
+    """Routed + shared, (1, 1, H) f32, in two kernels.
 
     The shared expert's gate/up joins the routed gate/up kernel (same token,
     16 more blocks) and its down joins the routed down kernel (36 more blocks,

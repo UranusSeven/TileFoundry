@@ -11,6 +11,9 @@ Switches:
                  is the default and is what two runs get compared through
     --check [N]  before the run, replay N steps through the authored
                  evaluator over the same weights and diff the logits
+    --tp 2       tensor-parallel over two GPUs; run under
+                 `torchrun --nproc_per_node=2` (see runtime_tp2.py)
+    --out PATH   write the produced ids as json (--compare reads these)
 
 What the printed rate means
 ---------------------------
@@ -77,6 +80,16 @@ def parse_args(argv=None):
         help="diff the greedy token ids against an hf_greedy.py json",
     )
     p.add_argument("--verbose", action="store_true")
+    p.add_argument(
+        "--tp", type=int, default=1, choices=[1, 2],
+        help="tensor parallelism over this many GPUs; 2 must run under "
+        "torchrun --nproc_per_node=2 (see runtime_tp2.py's docstring)",
+    )
+    p.add_argument(
+        "--out", metavar="PATH", default=None,
+        help="write the produced token ids as json (hf_greedy.py's format, "
+        "usable as another run's --compare)",
+    )
     return p.parse_args(argv)
 
 
@@ -156,10 +169,34 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     if args.impl is not None:
         os.environ["TF_IMPL"] = args.impl
+
+    rank, device = 0, "cuda"
+    dist = None
+    if args.tp == 2:
+        import torch.distributed as dist  # noqa: PLC0415
+
+        dist.init_process_group("nccl")
+        rank = dist.get_rank()
+        local = int(os.environ["LOCAL_RANK"])
+        torch.cuda.set_device(local)
+        device = f"cuda:{local}"
+        if rank != 0:
+            # Replicated ranks compute but do not speak.
+            sys.stdout = open(os.devnull, "w")  # noqa: SIM115
+
     # Imported after TF_IMPL is set: the twins bind their implementations at
     # import time so a per-call dispatch never appears in the step.
     import runtime_model as rt  # noqa: PLC0415
     import weights as wt  # noqa: PLC0415
+
+    if args.tp == 2:
+        import runtime_tp2 as rt2  # noqa: PLC0415
+
+        if args.check is not None:
+            print("--check replays the authored evaluator, which is the "
+                  "full-width computation; under --tp 2 the comparison is "
+                  "TP2 tokens vs a TP1/HF json (--compare).", file=sys.stderr)
+            return 2
 
     ckpt = args.ckpt or wt.CKPT
     cfg = None
@@ -179,7 +216,12 @@ def main(argv=None) -> int:
     need = len(prompt_ids) + args.max_new_tokens + 1
 
     print(f"loading {ckpt} ...", flush=True)
-    session = rt.Session(cfg, ckpt=ckpt, capacity=need, verbose=args.verbose)
+    if args.tp == 2:
+        session = rt2.SessionTP2(
+            cfg, ckpt=ckpt, capacity=need, device=device, verbose=args.verbose
+        )
+    else:
+        session = rt.Session(cfg, ckpt=ckpt, capacity=need, verbose=args.verbose)
     print(
         f"loaded {session.loaded_bytes / 1e9:.1f} GB in {session.load_seconds:.1f}s"
         f"  ({session.loaded_bytes / 1e9 / session.load_seconds:.2f} GB/s)",
@@ -187,7 +229,9 @@ def main(argv=None) -> int:
     )
 
     t0 = time.perf_counter()
-    n_buckets = rt.precompile(session.capacity)
+    n_buckets = rt.precompile(
+        session.capacity, nh=rt._NH // args.tp if hasattr(rt, "_NH") else 32
+    )
     print(
         f"attention buckets ready ({n_buckets}) in {time.perf_counter() - t0:.1f}s",
         flush=True,
@@ -223,6 +267,9 @@ def main(argv=None) -> int:
 
     # -- decode --------------------------------------------------------------
     produced: list[int] = []
+    if dist is not None:
+        dist.barrier()
+        rt2.comm_reset()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(args.max_new_tokens):
@@ -260,6 +307,19 @@ def main(argv=None) -> int:
           f"  ({4.8 / active_gb * 1e3:.0f} tok/s).")
     print(f"      this run moves them at {active_gb / (ms / 1e3) / 1e3:.2f} TB/s"
           f" effective ({active_gb / (ms / 1e3) / 1e3 / 4.8 * 100:.0f}% of peak).")
+
+    if args.out and rank == 0:
+        import json  # noqa: PLC0415
+
+        with open(args.out, "w") as fh:
+            json.dump({"prompt": args.prompt, "greedy_ids": produced}, fh)
+        print(f"wrote {len(produced)} ids to {args.out}")
+
+    if dist is not None:
+        torch.cuda.synchronize()
+        if rank == 0:
+            print(rt2.comm_report(len(produced)))
+        dist.destroy_process_group()
 
     if args.profile:
         profile_decode(session, produced[-1])

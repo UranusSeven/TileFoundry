@@ -13,4 +13,11 @@ shell's declared weights (converters on demand, expert stacks grouped);
 driver; `run.py` decodes real tokens and reports decode tok/s;
 `check_twin.py` validates twins against the authored evaluator on real
 weights. `check_{kda,mla,moe}_kernel.py` are the per-kernel validations.
+
+Milestone 2 (TP2): `ops.py` registers the external HIR op `tf.all_reduce`
+(the Partial -> converged boundary of docs/spec/shard.md);
+`runtime_tp2.py` is the two-GPU twins -- weights sliced per rank, one
+NCCL all-reduce per mixer/FFN output -- and its `SessionTP2` driver;
+`run.py --tp 2` runs them under torchrun. `check_allreduce_op.py` and
+`check_tp2_shards.py` are their validations.
 """

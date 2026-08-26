@@ -42,10 +42,10 @@ for _p in (_HERE, _ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import torch  # noqa: E402
-
 import ops  # noqa: E402,F401 -- registers tf.all_reduce
+import torch  # noqa: E402
 from ops import AllReduce  # noqa: E402
+
 from tilefoundry import func, module  # noqa: E402
 from tilefoundry.dsl import Tensor, tf  # noqa: E402,F401 -- tf used by the @func body
 from tilefoundry.dsl.tf import *  # noqa: E402,F403 -- bare op bindings for @func bodies
@@ -53,8 +53,12 @@ from tilefoundry.evaluator import evaluate  # noqa: E402
 from tilefoundry.ir.core.errors import VerifyError  # noqa: E402
 from tilefoundry.ir.types import DType, make_shard_tensor_type, make_tensor_type  # noqa: E402
 from tilefoundry.ir.types.shard import Topology, make_mesh  # noqa: E402
-from tilefoundry.ir.types.shard.shard_layout import Broadcast, Partial, Split  # noqa: E402
-from tilefoundry.ir.types.shard.shard_layout import canonical_shard_layout  # noqa: E402
+from tilefoundry.ir.types.shard.shard_layout import (  # noqa: E402
+    Broadcast,
+    Partial,
+    Split,
+    canonical_shard_layout,  # noqa: E402
+)
 from tilefoundry.runtime import runtime_func, runtime_module  # noqa: E402
 
 #: A two-rank device mesh. `make_mesh` defaults the topology name to "gpu",

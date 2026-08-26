@@ -34,7 +34,6 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import torch  # noqa: E402
-
 from kernels import attn as _attn  # noqa: E402
 from kernels import kda as _kda  # noqa: E402
 from kernels import moe as _moe  # noqa: E402
