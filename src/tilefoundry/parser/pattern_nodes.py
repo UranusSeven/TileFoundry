@@ -29,6 +29,7 @@ from tilefoundry.ir.core import (
     get_metadata,
     replace_metadata,
 )
+from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.tir.launch import launch_call
 from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.dim import DimVar
@@ -61,6 +62,7 @@ from .ast_pattern import (
     LiteralPattern,
     LoopFrame,
     MatchContext,
+    MatchFailure,
     OptionalPattern,
     ParseError,
     PatternFailure,
@@ -1401,10 +1403,14 @@ class StaticDictPattern(ElementPattern):
     )
 
     @staticmethod
-    def _bind(node: object, context: MatchContext, matched: AstMatch[Any]) -> AstMatch[Any] | None:
+    def _bind(
+        node: object, context: MatchContext, matched: AstMatch[Any]
+    ) -> AstMatch[Any] | MatchFailure | None:
         assert isinstance(node, ast.Dict)
         if any(key is None for key in node.keys):
-            return None
+            return PatternFailure(
+                "static_dict", node, "`**` unpacking is not a static dictionary form"
+            )
         children: list[AstChild] = []
         for index, (key, value) in enumerate(zip(node.keys, node.values)):
             assert key is not None
@@ -1552,11 +1558,18 @@ class StaticCallPattern(ElementPattern):
     )
 
     @staticmethod
-    def _bind(node: object, context: MatchContext, matched: AstMatch[Any]) -> AstMatch[Any] | None:
+    def _bind(
+        node: object, context: MatchContext, matched: AstMatch[Any]
+    ) -> AstMatch[Any] | MatchFailure | None:
         assert isinstance(node, ast.Call)
         keyword_names = [keyword.arg for keyword in node.keywords]
         if len(set(keyword_names)) != len(keyword_names):
-            return None
+            repeated = sorted(
+                {name for name in keyword_names if name and keyword_names.count(name) > 1}
+            )
+            return PatternFailure(
+                "static_call", node, f"keyword given more than once: {', '.join(repeated)}"
+            )
         children = [AstChild("callee", StaticValuePattern(), node.func, "static_callee")]
         children.extend(
             AstChild(
@@ -2028,8 +2041,7 @@ def _variadic_item_annotation(param: object) -> object | None:
 @dataclass(frozen=True)
 class CallVariadicInputFormRule:
     STATEMENT: ClassVar[str] = (
-        "A variadic call must use one explicit list, tuple, or supported static "
-        "list comprehension."
+        "A variadic call must use one explicit list, tuple, or supported static list comprehension."
     )
 
     def apply(self, value, *, match, context):
@@ -2102,7 +2114,7 @@ class CallPattern(ElementPattern):
     @staticmethod
     def _schema_children(
         node: ast.Call, schema: object, context: MatchContext
-    ) -> tuple[AstChild, ...] | None:
+    ) -> tuple[AstChild, ...] | MatchFailure | None:
         """Bind a call's arguments to one op schema's inputs and attributes.
 
         A ``Tuple[T]`` input consumes exactly one explicit sequence and flattens
@@ -2112,10 +2124,7 @@ class CallPattern(ElementPattern):
         params = tuple(schema.signature)
         inputs = [param for param in params if param.kind == "input"]
         attrs = [param for param in params if param.kind == "attribute"]
-        variadic = (
-            len(inputs) == 1
-            and _variadic_item_annotation(inputs[0]) is not None
-        )
+        variadic = len(inputs) == 1 and _variadic_item_annotation(inputs[0]) is not None
         positional = list(node.args)
         children: list[AstChild] = []
         bound_attrs: set[str] = set()
@@ -2152,7 +2161,12 @@ class CallPattern(ElementPattern):
                 continue
             attr_index = index - len(inputs)
             if attr_index >= len(attrs):
-                return None
+                return PatternFailure(
+                    "op_call",
+                    node,
+                    f"{schema.name} takes at most {len(inputs) + len(attrs)} positional "
+                    f"arguments, got {len(node.args)}",
+                )
             param = attrs[attr_index]
             bound_attrs.add(param.name)
             children.append(
@@ -2165,11 +2179,24 @@ class CallPattern(ElementPattern):
                 )
             )
         for keyword in node.keywords:
-            if keyword.arg is None or keyword.arg in bound_attrs:
-                return None
+            if keyword.arg is None:
+                return PatternFailure(
+                    "op_call", node, "`**` unpacking is not an authored call form"
+                )
+            if keyword.arg in bound_attrs:
+                return PatternFailure(
+                    "op_call",
+                    node,
+                    f"attribute {keyword.arg!r} is already bound by a positional argument",
+                )
             param = next((item for item in attrs if item.name == keyword.arg), None)
             if param is None:
-                return None
+                known = ", ".join(item.name for item in attrs) or "none"
+                return PatternFailure(
+                    "op_call",
+                    node,
+                    f"{schema.name} has no attribute {keyword.arg!r}; its attributes are: {known}",
+                )
             bound_attrs.add(param.name)
             children.append(
                 AstChild(
@@ -2181,11 +2208,17 @@ class CallPattern(ElementPattern):
                 )
             )
         if not variadic and len(positional) < len(inputs):
-            return None
+            return PatternFailure(
+                "op_call",
+                node,
+                f"{schema.name} takes {len(inputs)} inputs, got {len(positional)}",
+            )
         return tuple(children)
 
     @staticmethod
-    def _bind(node: object, context: MatchContext, matched: AstMatch[Any]) -> AstMatch[Any] | None:
+    def _bind(
+        node: object, context: MatchContext, matched: AstMatch[Any]
+    ) -> AstMatch[Any] | MatchFailure | None:
         assert isinstance(node, ast.Call)
         module_owner = None
         try:
@@ -2195,14 +2228,18 @@ class CallPattern(ElementPattern):
         if isinstance(callee, runtime.Module):
             module_owner = callee
             if node.keywords:
-                return None
+                return PatternFailure(
+                    "op_call", node, "a module call takes positional arguments only"
+                )
             try:
                 callee = callee.entry_function()
-            except ValueError:
-                return None
+            except ValueError as error:
+                return PatternFailure("op_call", node.func, str(error))
         if isinstance(callee, runtime.Function):
             if node.keywords:
-                return None
+                return PatternFailure(
+                    "op_call", node, "a function call takes positional arguments only"
+                )
             return dataclasses.replace(
                 matched,
                 pattern_id="call.function",
@@ -2230,8 +2267,8 @@ class CallPattern(ElementPattern):
         if not isinstance(schema, runtime.OpSchema):
             return None
         children = CallPattern._schema_children(node, schema, context)
-        if children is None:
-            return None
+        if children is None or isinstance(children, MatchFailure):
+            return children
         return dataclasses.replace(
             matched,
             pattern_id="call.operation",
@@ -2248,7 +2285,9 @@ class CallPattern(ElementPattern):
             if isinstance(variadic_inputs, VariadicInputs):
                 inputs = variadic_inputs.items
             else:
-                inputs = tuple(value for name, value in children.items() if name.startswith("input_"))
+                inputs = tuple(
+                    value for name, value in children.items() if name.startswith("input_")
+                )
             attrs = {
                 name.removeprefix("attr_"): value
                 for name, value in children.items()
@@ -2331,6 +2370,60 @@ _EXPR_BINARY_KINDS: Mapping[type[ast.AST], str] = {
 }
 
 
+def _expression_operator_pattern(operator_type: type[ast.AST]) -> ChoicePattern:
+    return ChoicePattern(
+        *(
+            AstNodePattern(node_type)
+            for node_type in _EXPR_BINARY_KINDS
+            if issubclass(node_type, operator_type)
+        )
+    )
+
+
+_CALL_RESULT_RULES: tuple[AstRule[Any], ...] = (
+    CallBindingRule(),
+    CallTypeInferenceRule(),
+    CallExpectedTypeRule(),
+)
+
+
+class MatMulExpressionPattern(ElementPattern):
+    element_name = "matmul_expression"
+    syntax = LazyPattern(
+        lambda: BranchPattern(
+            "matmul_expression",
+            AstNodePattern(
+                ast.BinOp,
+                FieldPattern("op", AstNodePattern(ast.MatMult)),
+                FieldPattern(
+                    "left",
+                    ChildPattern("left", ExpressionPattern(), "expression"),
+                ),
+                FieldPattern(
+                    "right",
+                    ChildPattern("right", ExpressionPattern(), "expression"),
+                ),
+            ),
+            pattern_id="expression.matmul",
+        )
+    )
+
+    @staticmethod
+    def construct(match, children, context):
+        args = (children["left"], children["right"])
+        placeholder_type = next(
+            (arg.type for arg in args if getattr(arg, "type", None) is not None),
+            runtime.TensorType.scalar(runtime.DType.f32),
+        )
+        return runtime.Call(
+            type=placeholder_type,
+            target=MatMul(),
+            args=args,
+        )
+
+    RULES: ClassVar[tuple[AstRule[Any], ...]] = _CALL_RESULT_RULES
+
+
 class BinaryExpressionPattern(ElementPattern):
     element_name = "binary_expression"
     syntax = LazyPattern(
@@ -2341,10 +2434,7 @@ class BinaryExpressionPattern(ElementPattern):
                     ast.BinOp,
                     FieldPattern(
                         "op",
-                        PredicatePattern(
-                            "binary-op",
-                            lambda op, context: type(op) in _EXPR_BINARY_KINDS,
-                        ),
+                        _expression_operator_pattern(ast.operator),
                     ),
                     CapturePattern(
                         "kind",
@@ -2367,12 +2457,7 @@ class BinaryExpressionPattern(ElementPattern):
                     ast.Compare,
                     FieldPattern(
                         "ops",
-                        SequencePattern(
-                            PredicatePattern(
-                                "comparison-op",
-                                lambda op, context: type(op) in _EXPR_BINARY_KINDS,
-                            )
-                        ),
+                        SequencePattern(_expression_operator_pattern(ast.cmpop)),
                     ),
                     CapturePattern(
                         "kind",
@@ -2395,10 +2480,7 @@ class BinaryExpressionPattern(ElementPattern):
                     ast.BoolOp,
                     FieldPattern(
                         "op",
-                        PredicatePattern(
-                            "boolean-op",
-                            lambda op, context: type(op) in _EXPR_BINARY_KINDS,
-                        ),
+                        _expression_operator_pattern(ast.boolop),
                     ),
                     CapturePattern(
                         "kind",
@@ -2419,10 +2501,15 @@ class BinaryExpressionPattern(ElementPattern):
 
     @staticmethod
     def construct(match, children, context):
+        args = (children["left"], children["right"])
+        placeholder_type = next(
+            (arg.type for arg in args if getattr(arg, "type", None) is not None),
+            runtime.TensorType.scalar(runtime.DType.f32),
+        )
         return runtime.Call(
-            type=children["left"].type,
+            type=placeholder_type,
             target=runtime.Binary(kind=runtime.BinaryKind[match.captures["kind"]]),
-            args=(children["left"], children["right"]),
+            args=args,
         )
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = (
@@ -2462,9 +2549,10 @@ class UnaryExpressionPattern(ElementPattern):
     @staticmethod
     def construct(match, children, context):
         operand = children["operand"]
+        target = runtime.Unary(kind=runtime.UnaryKind[match.captures["kind"]])
         return runtime.Call(
             type=operand.type,
-            target=runtime.Unary(kind=runtime.UnaryKind[match.captures["kind"]]),
+            target=target,
             args=(operand,),
         )
 
@@ -2573,9 +2661,7 @@ class IndexEndpointPattern(ElementPattern):
 
 @dataclass(frozen=True)
 class TileWindowSliceBoundRule:
-    STATEMENT: ClassVar[str] = (
-        "A tile window cannot be used as a slice bound."
-    )
+    STATEMENT: ClassVar[str] = "A tile window cannot be used as a slice bound."
 
     def apply(self, value, *, match, context):
         for authored_name, value_name in (
@@ -2789,7 +2875,9 @@ class MeshCoordinatePattern(ElementPattern):
     )
 
     @staticmethod
-    def _bind(node: object, context: MatchContext, matched: AstMatch[Any]) -> AstMatch[Any] | None:
+    def _bind(
+        node: object, context: MatchContext, matched: AstMatch[Any]
+    ) -> AstMatch[Any] | MatchFailure | None:
         assert isinstance(node, ast.Attribute)
         assert isinstance(node.value, ast.Name)
         if context.function is None:
@@ -2806,7 +2894,12 @@ class MeshCoordinatePattern(ElementPattern):
             if candidate < len(mesh.layout.shape):
                 axis = candidate
         if axis is None:
-            return None
+            named = ", ".join(mesh.names)
+            return PatternFailure(
+                "mesh_coordinate",
+                node,
+                f"mesh {node.value.id!r} has no axis {node.attr!r}; its axes are: {named}",
+            )
         return dataclasses.replace(
             matched,
             pattern_id="expression.mesh_coordinate",
@@ -2865,6 +2958,7 @@ class ExpressionPattern(ElementPattern):
             CallPattern(),
             LaunchPattern(),
             SubscriptExpressionPattern(),
+            MatMulExpressionPattern(),
             BinaryExpressionPattern(),
             UnaryExpressionPattern(),
             MeshCoordinatePattern(),
@@ -2954,7 +3048,9 @@ class MeshContextPattern(ElementPattern):
     )
 
     @staticmethod
-    def _bind(node: object, context: MatchContext, matched: AstMatch[Any]) -> AstMatch[Any] | None:
+    def _bind(
+        node: object, context: MatchContext, matched: AstMatch[Any]
+    ) -> AstMatch[Any] | MatchFailure | None:
         assert isinstance(node, ast.Call)
         if not node.args or not isinstance(node.args[0], ast.Tuple):
             return None
@@ -2964,14 +3060,25 @@ class MeshContextPattern(ElementPattern):
         names_node = keywords.get("names")
         if positional:
             if layout_node is not None:
-                return None
+                return PatternFailure(
+                    "mesh", node, "`layout` is already bound by a positional argument"
+                )
             layout_node = positional.pop(0)
         if positional:
             if names_node is not None:
-                return None
+                return PatternFailure(
+                    "mesh", node, "`names` is already bound by a positional argument"
+                )
             names_node = positional.pop(0)
-        if positional or layout_node is None:
-            return None
+        if positional:
+            return PatternFailure(
+                "mesh",
+                node,
+                f"a mesh takes topologies, layout, and names; got "
+                f"{len(node.args)} positional arguments",
+            )
+        if layout_node is None:
+            return PatternFailure("mesh", node, "a mesh requires a `layout`")
         children = [
             AstChild(
                 "topology_names",
@@ -3155,14 +3262,28 @@ class LaunchPattern(ElementPattern):
         if not isinstance(node.func, ast.Name) or node.func.id != "launch":
             return None
         if not node.args:
-            return None
+            return PatternFailure("launch", node, "launch(...) requires a callee")
         keywords = {keyword.arg: keyword.value for keyword in node.keywords}
         if any(name is None for name in keywords):
-            return None
-        if "grid" not in keywords or "block" not in keywords:
-            return None
-        if set(keywords) - {"grid", "block", "cluster", "dynamic_smem", "stream", "attrs"}:
-            return None
+            return PatternFailure("launch", node, "`**` unpacking is not an authored launch form")
+        missing = [name for name in ("grid", "block") if name not in keywords]
+        if missing:
+            return PatternFailure("launch", node, f"launch(...) requires {' and '.join(missing)}")
+        unknown = set(keywords) - {
+            "grid",
+            "block",
+            "cluster",
+            "dynamic_smem",
+            "stream",
+            "attrs",
+        }
+        if unknown:
+            return PatternFailure(
+                "launch",
+                node,
+                f"launch(...) has no option {sorted(unknown)!r}; it takes grid, block, "
+                f"cluster, dynamic_smem, stream, attrs",
+            )
         children = [
             AstChild("callee", StaticValuePattern(), node.args[0], "launch_callee"),
             *(
@@ -3305,16 +3426,40 @@ class LoopIteratorPattern(ElementPattern):
             BranchPattern(
                 "tile",
                 AstNodePattern(
-                    ast.Name,
-                    FieldPattern("id", LiteralPattern("tile")),
+                    ast.Call,
+                    FieldPattern(
+                        "func",
+                        AstNodePattern(ast.Name, FieldPattern("id", LiteralPattern("tile"))),
+                    ),
+                    FieldPattern("keywords", SequencePattern()),
+                    FieldPattern(
+                        "args",
+                        SequencePattern(AstNodePattern(ast.expr), AstNodePattern(ast.expr)),
+                    ),
                 ),
                 pattern_id="loop.iterator.tile",
             ),
             BranchPattern(
                 "range",
                 AstNodePattern(
-                    ast.Name,
-                    FieldPattern("id", LiteralPattern("range")),
+                    ast.Call,
+                    FieldPattern(
+                        "func",
+                        AstNodePattern(ast.Name, FieldPattern("id", LiteralPattern("range"))),
+                    ),
+                    FieldPattern("keywords", SequencePattern()),
+                    FieldPattern(
+                        "args",
+                        ChoicePattern(
+                            SequencePattern(AstNodePattern(ast.expr)),
+                            SequencePattern(AstNodePattern(ast.expr), AstNodePattern(ast.expr)),
+                            SequencePattern(
+                                AstNodePattern(ast.expr),
+                                AstNodePattern(ast.expr),
+                                AstNodePattern(ast.expr),
+                            ),
+                        ),
+                    ),
                 ),
                 pattern_id="loop.iterator.range",
             ),
@@ -3335,18 +3480,7 @@ class LoopHeaderPattern(ElementPattern):
             AstNodePattern(
                 ast.For,
                 FieldPattern("target", AstNodePattern(ast.Name)),
-                FieldPattern(
-                    "iter",
-                    AstNodePattern(
-                        ast.Call,
-                        FieldPattern(
-                            "func",
-                            LoopIteratorPattern(),
-                        ),
-                        FieldPattern("keywords", RepeatPattern(AstNodePattern(ast.keyword))),
-                        FieldPattern("args", RepeatPattern(AstNodePattern(ast.expr), minimum=1)),
-                    ),
-                ),
+                FieldPattern("iter", LoopIteratorPattern()),
                 FieldPattern(
                     "body",
                     ChildPattern(
@@ -3361,10 +3495,46 @@ class LoopHeaderPattern(ElementPattern):
         )
     )
 
+    def match(self, node: object, context: MatchContext) -> AstMatch[Any] | MatchFailure | None:
+        """Name the invalid iterator before the shape-exact syntax rejects it.
+
+        The syntax encodes each iterator's arity so the generated grammar shows
+        what the parser accepts. A shape mismatch alone would report only that
+        the pattern did not match, so the specific reason is stated here first.
+        """
+        if (
+            isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and isinstance(node.iter.func, ast.Name)
+        ):
+            kind = node.iter.func.id
+            count = len(node.iter.args)
+            if kind not in {"tile", "range"}:
+                return PatternFailure(
+                    "loop_header",
+                    node.iter.func,
+                    "loop iterator must be tile(...) or range(...)",
+                )
+            if node.iter.keywords:
+                return PatternFailure(
+                    "loop_header",
+                    node.iter,
+                    "tile()/range() does not accept keyword args (positional-only at the IR level)",
+                )
+            if (kind == "tile" and count != 2) or (kind == "range" and count not in {1, 2, 3}):
+                if kind == "tile" and count == 1:
+                    detail = "tile(extent) is not supported; use range(extent)"
+                elif kind == "tile":
+                    detail = f"tile() takes 2 arguments (extent, step), got {count}"
+                else:
+                    detail = f"range() takes 1 to 3 arguments, got {count}"
+                return PatternFailure("loop_header", node.iter, detail)
+        return super().match(node, context)
+
     @staticmethod
     def _bind(
         node: object, context: MatchContext, matched: AstMatch[Any]
-    ) -> AstMatch[Any] | PatternFailure | None:
+    ) -> AstMatch[Any] | MatchFailure | None:
         assert isinstance(node, ast.For)
         assert isinstance(node.target, ast.Name)
         assert isinstance(node.iter, ast.Call)
@@ -3633,7 +3803,11 @@ class TupleAssignmentPattern(ElementPattern):
             raise ParseError.from_node(
                 match.node, context, "tuple assignment arity does not match TupleType"
             )
-        schema = getattr(type(value.target), "_op_schema", None) if isinstance(value, runtime.Call) else None
+        schema = (
+            getattr(type(value.target), "_op_schema", None)
+            if isinstance(value, runtime.Call)
+            else None
+        )
         parent_name = getattr(schema, "name", None) or ", ".join(names)
         value = replace_metadata(value, BindingMetadata(parent_name))
         for index, name in enumerate(names):
@@ -3874,7 +4048,6 @@ class BlockPattern(ElementPattern):
             if context.role == "with_body":
                 return None
             raise ParseError.from_node(match.node, context, "HIR body must end with return")
-
 
         def fold(index: int) -> list[object]:
             output: list[object] = []

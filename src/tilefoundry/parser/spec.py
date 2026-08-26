@@ -129,10 +129,7 @@ def _collect_rule_rows(root: ElementPattern[Any]) -> tuple[RuleRow, ...]:
 
 
 def _collect_module_rule_rows() -> tuple[RuleRow, ...]:
-    rows = [
-        _row("module", "module_function", rule)
-        for rule in ModuleBuildContext.FUNCTION_RULES
-    ]
+    rows = [_row("module", "module_function", rule) for rule in ModuleBuildContext.FUNCTION_RULES]
     rows.extend(
         _row("module", "module_finalization", rule)
         for rule in ModuleBuildContext.FINALIZATION_RULES
@@ -141,21 +138,28 @@ def _collect_module_rule_rows() -> tuple[RuleRow, ...]:
 
 
 def _merge_rule_rows(rows: tuple[RuleRow, ...]) -> tuple[RuleRow, ...]:
-    """Render one row per owning element and rule, retaining every situation."""
-    situations: dict[tuple[str, str, str, str], set[str]] = {}
+    """Render one row per rule, listing every element and situation it governs.
+
+    A rule shared by several elements states one thing, so it reads as one row.
+    Repeating it once per owner says nothing new and buries the rules that are
+    actually distinct.
+    """
+    owners: dict[tuple[str, str, str], set[str]] = {}
+    situations: dict[tuple[str, str, str], set[str]] = {}
     for row in rows:
-        key = (row.owner, row.rule, row.statement, row.source)
+        key = (row.rule, row.statement, row.source)
+        owners.setdefault(key, set()).add(row.owner)
         situations.setdefault(key, set()).add(row.situation)
     return tuple(
         sorted(
             RuleRow(
-                owner=owner,
-                situation=", ".join(sorted(rule_situations)),
-                rule=rule,
-                statement=statement,
-                source=source,
+                owner=", ".join(sorted(owners[key])),
+                situation=", ".join(sorted(situations[key])),
+                rule=key[0],
+                statement=key[1],
+                source=key[2],
             )
-            for (owner, rule, statement, source), rule_situations in situations.items()
+            for key in owners
         )
     )
 

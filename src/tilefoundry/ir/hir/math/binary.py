@@ -131,10 +131,10 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         ctx.error(
             call,
             f"Binary {op.kind.name}: dtype mismatch "
-            f"({lhs_ty.dtype.name} vs {rhs_ty.dtype.name}); tensor "
-            f"operands are never promoted for you. A number you wrote is "
-            f"f32 -- tf.full_like(x, value=...) gives it x's dtype; "
-            f"otherwise tf.cast one side explicitly. "
+            f"({lhs_ty.dtype.name} vs {rhs_ty.dtype.name}); operands are never "
+            f"promoted, and a Python literal is f32 or i64 like any other. "
+            f"Write the dtype you want: "
+            f"tf.cast(<operand>, dtype={lhs_ty.dtype.name!r}). "
             f"See `tilefoundry spec dsl binary`",
         )
     if op.kind in _LOGICAL_KINDS and lhs_ty.dtype != DType.bool:

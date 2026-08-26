@@ -100,14 +100,14 @@ type-annotation       ::= tensor
                           | scalar-type
 signature             ::= (name ':' type-annotation (',' name ':' type-annotation)*)?
 return-type           ::= type-annotation
-loop-iterator         ::= 'tile'
-                          | 'range'
+loop-iterator         ::= 'tile' '(' expression ',' expression ')'
+                          | 'range' '(' (expression | expression ',' expression | expression ','
+                            expression ',' expression) ')'
 loop-carry-statement  ::= expression '=' expression
                           | 'for' name 'in' expression ':' loop-carry
                           | statement
 loop-carry            ::= (loop-carry-statement (newline loop-carry-statement)*)?
-loop-header           ::= 'for' identifier 'in' loop-iterator '(' (expression | name '=' expression)
-                          (',' (expression | name '=' expression))* ')' ':' loop-carry
+loop-header           ::= 'for' identifier 'in' loop-iterator ':' loop-carry
 loop-body             ::= (statement (newline statement)*)?
 for                   ::= 'for' name 'in' expression ':' loop-body
 mesh-context          ::= ('Mesh' | primary '.' identifier) '(' (expression | ('layout' | 'names')
@@ -132,9 +132,11 @@ subscript-index       ::= '(' ((index-slice | index-endpoint) (',' (index-slice 
                           | index-slice
                           | index-endpoint
 subscript-expression  ::= runtime-expression '[' subscript-index ']'
-binary-expression     ::= runtime-expression binary-op runtime-expression
-                          | runtime-expression comparison-op runtime-expression
-                          | runtime-expression boolean-op runtime-expression
+matmul-expression     ::= runtime-expression '@' runtime-expression
+binary-expression     ::= runtime-expression ('+' | '-' | '*' | '/' | '//' | '%') runtime-expression
+                          | runtime-expression ('==' | '!=' | '<' | '<=' | '>' | '>=')
+                            runtime-expression
+                          | runtime-expression ('and' | 'or') runtime-expression
 unary-expression      ::= unary-op runtime-expression
 name                  ::= identifier
 constant              ::= boolean-literal
@@ -144,6 +146,7 @@ tuple-expression      ::= '(' (runtime-expression (',' runtime-expression)*)? ')
 runtime-expression    ::= op-call
                           | launch
                           | subscript-expression
+                          | matmul-expression
                           | binary-expression
                           | unary-expression
                           | mesh-coordinate
@@ -173,39 +176,27 @@ function              ::= 'def' name '(' signature ')' ('->' return-type)? ':' b
 <!-- parser-constraints:start -->
 | Owner | Situation | Rule | Statement | Source |
 | --- | --- | --- | --- | --- |
-| binary_expression | expression, slice_endpoint, subscript_index | CallBindingRule | A call must bind its arguments into a Call tuple. | src/tilefoundry/parser/pattern_nodes.py |
-| binary_expression | expression, slice_endpoint, subscript_index | CallExpectedTypeRule | A call's inferred type must satisfy the expected expression type. | src/tilefoundry/parser/pattern_nodes.py |
-| binary_expression | expression, slice_endpoint, subscript_index | CallTypeInferenceRule | A call's result type must be inferred from its binding. | src/tilefoundry/parser/pattern_nodes.py |
+| binary_expression, matmul_expression, op_call, unary_expression | expression, slice_endpoint, subscript_index | CallBindingRule | A call must bind its arguments into a Call tuple. | src/tilefoundry/parser/pattern_nodes.py |
+| binary_expression, matmul_expression, op_call, unary_expression | expression, slice_endpoint, subscript_index | CallExpectedTypeRule | A call's inferred type must satisfy the expected expression type. | src/tilefoundry/parser/pattern_nodes.py |
+| binary_expression, matmul_expression, op_call, unary_expression | expression, slice_endpoint, subscript_index | CallTypeInferenceRule | A call's result type must be inferred from its binding. | src/tilefoundry/parser/pattern_nodes.py |
 | dim_expr | dim_expr, layout_extent, layout_shape, tensor_dim_expr, tensor_optional_slot, tensor_shape | ShapeDimRule | A shape dimension must be an integer, DimVar, or expression. | src/tilefoundry/parser/ast_pattern.py |
 | dtype | tensor_dtype | CanonicalDTypeRule | A dtype must resolve to a canonical DType. | src/tilefoundry/parser/ast_pattern.py |
-| explicit_layout | tensor_optional_slot | LayoutPositionRule | A layout must be legal for its parser position. | src/tilefoundry/parser/ast_pattern.py |
-| explicit_layout | tensor_optional_slot | LayoutShapeRule | A layout must have a valid non-boolean shape. | src/tilefoundry/parser/ast_pattern.py |
+| explicit_layout, layout, placed_layout, plain_layout | layout_shape, tensor_optional_slot, tensor_shape | LayoutPositionRule | A layout must be legal for its parser position. | src/tilefoundry/parser/ast_pattern.py |
+| explicit_layout, layout, placed_layout, plain_layout | layout_shape, tensor_optional_slot, tensor_shape | LayoutShapeRule | A layout must have a valid non-boolean shape. | src/tilefoundry/parser/ast_pattern.py |
 | function | function | FunctionDialectRule | A function kind and constructed value must agree with the active dialect. | src/tilefoundry/parser/pattern_nodes.py |
 | function | function | FunctionRegistrationRule | A validated function must be registered exactly once in its owning scope. | src/tilefoundry/parser/pattern_nodes.py |
 | function | function | FunctionReturnRule | A HIR function body's inferred type must match its return type. | src/tilefoundry/parser/pattern_nodes.py |
 | function | function | FunctionRoleValidationRule | A root, variant, or converter must satisfy its role before registration. | src/tilefoundry/parser/pattern_nodes.py |
 | function | function | FunctionSignatureRule | A function must construct an ordered parameter tuple. | src/tilefoundry/parser/pattern_nodes.py |
 | index_slice | subscript_index | TileWindowSliceBoundRule | A tile window cannot be used as a slice bound. | src/tilefoundry/parser/pattern_nodes.py |
-| layout | tensor_optional_slot | LayoutPositionRule | A layout must be legal for its parser position. | src/tilefoundry/parser/ast_pattern.py |
-| layout | tensor_optional_slot | LayoutShapeRule | A layout must have a valid non-boolean shape. | src/tilefoundry/parser/ast_pattern.py |
 | module | module_finalization | ModuleFinalizationRule | A module declaration must contain valid unique members and a resolvable entry. | src/tilefoundry/parser/ast_pattern.py |
 | module | module_function | ModuleFunctionRegistrationRule | A validated module function must be recorded in declaration order. | src/tilefoundry/parser/ast_pattern.py |
 | module | module_function | ModuleFunctionValidationRule | A module function must satisfy its root, variant, or converter role before mutation. | src/tilefoundry/parser/ast_pattern.py |
-| op_call | expression, slice_endpoint, subscript_index | CallBindingRule | A call must bind its arguments into a Call tuple. | src/tilefoundry/parser/pattern_nodes.py |
-| op_call | expression, slice_endpoint, subscript_index | CallExpectedTypeRule | A call's inferred type must satisfy the expected expression type. | src/tilefoundry/parser/pattern_nodes.py |
-| op_call | expression, slice_endpoint, subscript_index | CallTypeInferenceRule | A call's result type must be inferred from its binding. | src/tilefoundry/parser/pattern_nodes.py |
 | op_call | expression, slice_endpoint, subscript_index | CallVariadicInputFormRule | A variadic call must use one explicit list, tuple, or supported static list comprehension. | src/tilefoundry/parser/pattern_nodes.py |
-| placed_layout | layout_shape, tensor_optional_slot, tensor_shape | LayoutPositionRule | A layout must be legal for its parser position. | src/tilefoundry/parser/ast_pattern.py |
-| placed_layout | layout_shape, tensor_optional_slot, tensor_shape | LayoutShapeRule | A layout must have a valid non-boolean shape. | src/tilefoundry/parser/ast_pattern.py |
-| plain_layout | tensor_optional_slot | LayoutPositionRule | A layout must be legal for its parser position. | src/tilefoundry/parser/ast_pattern.py |
-| plain_layout | tensor_optional_slot | LayoutShapeRule | A layout must have a valid non-boolean shape. | src/tilefoundry/parser/ast_pattern.py |
 | shape | layout_shape, layout_strides, tensor_shape | ShapeTupleRule | A shape must construct a tuple of dimensions. | src/tilefoundry/parser/ast_pattern.py |
 | storage | tensor_optional_slot | StorageValueRule | Storage must resolve to a StorageKind. | src/tilefoundry/parser/ast_pattern.py |
 | tensor | annotation, expression, slice_endpoint, subscript_index, type_annotation | TensorLayoutStorageRule | A tensor type must contain compatible layout and storage values. | src/tilefoundry/parser/ast_pattern.py |
 | tensor | annotation, expression, slice_endpoint, subscript_index, type_annotation | TensorPositionRule | A tensor type's storage must be legal for its dialect and position. | src/tilefoundry/parser/ast_pattern.py |
-| unary_expression | expression, slice_endpoint, subscript_index | CallBindingRule | A call must bind its arguments into a Call tuple. | src/tilefoundry/parser/pattern_nodes.py |
-| unary_expression | expression, slice_endpoint, subscript_index | CallExpectedTypeRule | A call's inferred type must satisfy the expected expression type. | src/tilefoundry/parser/pattern_nodes.py |
-| unary_expression | expression, slice_endpoint, subscript_index | CallTypeInferenceRule | A call's result type must be inferred from its binding. | src/tilefoundry/parser/pattern_nodes.py |
 <!-- parser-constraints:end -->
 
 ## 3. Implementation Overview
@@ -218,6 +209,7 @@ function              ::= 'def' name '(' signature ')' ('->' return-type)? ':' b
 | Ordered Rules | Validates and normalizes each owner value after construction. |
 | Module Build | Lets Python execute the class body, collects declarations, resolves child Modules first, then parses Functions in source order and finalizes the Module. |
 | Pattern Visitor | Traverses the same graph to render this section's generated grammar and constraints. |
+| Refusal | Carries the reason from the pattern that claimed a node and then refused it, so a report names a cause rather than the absence of a match. |
 
 ```mermaid
 classDiagram
@@ -227,6 +219,11 @@ classDiagram
     Element o-- AstPattern
     Element o-- AstRule
     AstPattern --> AstMatch
+    AstPattern --> MatchFailure
+    MatchFailure <|.. PatternFailure
+    MatchFailure <|.. ChoiceFailure
+    ChoiceFailure o-- MatchFailure : causes
+    ParseError <.. MatchFailure
     PatternVisitor ..> AstPattern
     ParserAPI ..> ModuleBuild
 ```
@@ -246,6 +243,45 @@ flowchart TD
     BUILT --> RETURN
     MODULE -->|no| RETURN["return standalone result"]
 ```
+
+```mermaid
+flowchart TD
+    TRY["alternative.match(node)"] --> OUT{"outcome"}
+    OUT -->|"AstMatch"| WIN["choice accepts it; pending refusals are discarded"]
+    OUT -->|"MatchFailure"| CLAIM["claimed the node and refused: reason recorded"]
+    OUT -->|"None"| PASS["did not recognize the node: nothing recorded"]
+    PASS --> NEXT["try the next alternative"]
+    CLAIM --> NEXT
+    NEXT --> DONE{"any refusal recorded?"}
+    DONE -->|no| SILENT["return None: no alternative recognized this node"]
+    DONE -->|yes| COLLECT["ChoiceFailure over the claimants"]
+    COLLECT --> UP["travels up unchanged; combinators add no wrapping"]
+    UP --> RENDER["render(): a sole claimant is the whole report"]
+    RENDER --> RAISE["ParseError with source location"]
+    SILENT --> RAISE
+```
+
+A pattern MUST establish that a node is its own before it refuses with a reason. That claim is
+what makes the reason trustworthy: it says no remaining alternative can accept this node, so
+the refusal is the author's mistake and not another pattern's turn. A callee resolving to an op
+schema is such a claim, and a wrong argument count after it is an error. A callee that does not
+resolve is not a claim: it may be a bare name or a foreign namespace that another alternative
+owns, so the pattern returns `None` and says nothing. Reasons are never reconstructed from the
+AST after the fact; an inspection outside the refusing pattern cannot see which step it failed
+at, and becomes a second, divergent copy of that knowledge.
+
+Being last in one choice is not a claim either, because that choice may itself be an
+alternative in another. `parse_node` is the single place where no alternative remains, so it
+is the only place that MAY describe a node from its shape rather than from a pattern's
+statement, and it does so only when the shape says something worth reading.
+
+`None` and a `MatchFailure` differ only for a choice; every other combinator returns either one
+unchanged, so a refusal keeps the identity and the wording of the pattern that produced it all
+the way to `parse_node`. Nothing is wrapped, filtered, or re-described on the way up. A
+`ChoiceFailure` records only the alternatives that claimed the node, which is normally one, and
+it renders as that sole claimant. Two claimants mean two patterns claim overlapping shapes; the
+report states both rather than choosing between them, because the ambiguity is in the grammar
+and not in the report.
 
 Pattern combinators serve both runtime matching and Spec traversal. `AstMatch` separates syntax
 matching from object construction, while each Rule reads the recursive context after its owner
