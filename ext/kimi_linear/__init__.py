@@ -20,4 +20,16 @@ Milestone 2 (TP2): `ops.py` registers the external HIR op `tf.all_reduce`
 NCCL all-reduce per mixer/FFN output -- and its `SessionTP2` driver;
 `run.py --tp 2` runs them under torchrun. `check_allreduce_op.py` and
 `check_tp2_shards.py` are their validations.
+
+Milestone 3 (prefill): `model_prefill.py` is the S-symbolic prefill shell,
+authored beside the untouched decode one -- MLA as one masked-softmax pass
+(MHA form, causal `arange`/`where` mask, NoPE so no rotary), KDA as the
+decode recurrence looped in orchestration (the chunked-rule twin's semantic
+reference), the position-wise blocks re-stated over `DimVar("seq_len")`, and
+the head over the last position only. `forward` returns the per-layer caches
+in the decode shell's layout, so decode continues from a prefill.
+`check_prefill.py` validates: CLI self-consistency, prefill-vs-decode at
+S=8 (module level, real dims; whole reduced shells, with the cache handoff
+exercised), and the MLA prefill against the checkpoint's own
+`KimiMLAAttention`.
 """
