@@ -100,3 +100,143 @@ def _eval_all_reduce(ctx):
 
 
 __all__ = ["AllReduce"]
+
+
+# ---------------------------------------------------------------------------
+# The external HIR op `tf.paged_mla_prefill`: causal MHA over a paged KV cache.
+# ---------------------------------------------------------------------------
+#
+# The prefill counterpart of the decode attention: one call attends an S-row
+# query block to S keys/values held in fixed-size pages, addressed indirectly
+# through a block table. Page layout is vllm_flash_attn's:
+# `k_pages [num_pages, page_size, H, head_dim_qk]`,
+# `v_pages [num_pages, page_size, H, head_dim_v]` (head_dim_v may differ from
+# head_dim_qk -- 128 vs 192 here), `block_table [num_live_pages]` the physical
+# page ids in logical order. The op is HIR-only: nothing in TileFoundry lowers
+# it; the runtime counterpart is the FA3 `flash_attn_varlen_func` call in
+# `prefill.py`, and `eval` below is its stated semantics (gather the pages in
+# block-table order, causal softmax attention in f32, land in the input
+# dtype), which `check_paged_prefill.py` scores against that kernel.
+
+import torch  # noqa: E402
+
+from tilefoundry.ir.types import DType, TensorType  # noqa: E402
+from tilefoundry.visitor_registry.access_relation import (  # noqa: E402
+    AccessRelations,
+    BoundaryRelation,
+    identity_access,
+    iterating,
+    reached_at,
+)
+
+
+@register_op(dialect="tf", category="nn", name="paged_mla_prefill")
+class PagedMlaPrefill(Op):
+    """Causal prefill attention over a paged KV cache.
+
+    `out[s, h, :]` attends `q[s, h, :]` to the first
+    `s + 1` key/value rows of the paged cache of the paged cache, `scale * q . k` per score.
+
+    `scale <= 0` means the default `head_dim_qk ** -0.5`.
+    """
+
+    q = ParamDef(kind="input", pattern=Tensor)
+    k_pages = ParamDef(kind="input", pattern=Tensor)
+    v_pages = ParamDef(kind="input", pattern=Tensor)
+    block_table = ParamDef(kind="input", pattern=Tensor)
+    scale = ParamDef(kind="attribute", annotation=float, default=-1.0)
+
+
+@register_typeinfer(PagedMlaPrefill)
+def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+    q_ty, k_ty, v_ty, bt_ty = (ctx.type_of(call.args[i]) for i in range(4))
+    if len(q_ty.shape) != 3:
+        ctx.error(call, f"q must be [S, H, Dqk], got shape {q_ty.shape}")
+    if len(k_ty.shape) != 4 or len(v_ty.shape) != 4:
+        ctx.error(
+            call,
+            f"k_pages/v_pages must be [pages, page_size, H, D], got "
+            f"{k_ty.shape} and {v_ty.shape}",
+        )
+    if len(bt_ty.shape) != 1:
+        ctx.error(call, f"block_table must be 1-D, got shape {bt_ty.shape}")
+    if bt_ty.dtype not in (DType.i32, DType.i64):
+        ctx.error(call, f"block_table must be i32 or i64, got {bt_ty.dtype}")
+    s, h, qk = q_ty.shape
+    if k_ty.shape[2] != h or v_ty.shape[2] != h:
+        ctx.error(
+            call,
+            f"head counts differ: q has {h}, k_pages {k_ty.shape[2]}, "
+            f"v_pages {v_ty.shape[2]}",
+        )
+    if k_ty.shape[3] != qk:
+        ctx.error(
+            call, f"key head_dim {k_ty.shape[3]} != query head_dim {qk}"
+        )
+    if k_ty.shape[1] != v_ty.shape[1] or k_ty.shape[0] != v_ty.shape[0]:
+        ctx.error(call, "k_pages and v_pages must share the page grid")
+    return TensorType(
+        shape=(s, h, v_ty.shape[3]),
+        dtype=q_ty.dtype,
+        layout=None,
+        storage=q_ty.storage,
+    )
+
+
+@register_access_relation(PagedMlaPrefill)
+def _paged_mla_prefill_access(call: "Call", ctx) -> AccessRelations:
+    """The access relation at the GLOBAL level.
+
+    The output space is walked; pages are reached through the
+    block table, so the page axis (and the within-page position, a causal
+    range) is `free` -- the deciding value lives in `block_table`, exactly as
+    `index_select`'s index axis is free.
+    """
+    q_ty, k_ty, v_ty, bt_ty = (ctx.type_of(call.args[i]) for i in range(4))
+    out_ty = TensorType(
+        shape=(q_ty.shape[0], q_ty.shape[1], v_ty.shape[3]),
+        dtype=q_ty.dtype,
+        layout=None,
+    )
+    return iterating(
+        out_ty.shape,
+        AccessRelations(
+            inputs=(
+                BoundaryRelation(
+                    reached_at(3, q_ty, q_ty, {0: "d0", 1: "d1"}, free=(2,))
+                ),
+                BoundaryRelation(
+                    reached_at(3, k_ty, k_ty, {2: "d1"}, free=(0, 1, 3))
+                ),
+                BoundaryRelation(
+                    reached_at(3, v_ty, v_ty, {2: "d1", 3: "d2"}, free=(0, 1))
+                ),
+                BoundaryRelation(reached_at(3, bt_ty, bt_ty, {}, free=(0,))),
+            ),
+            outputs=(BoundaryRelation(identity_access(3)),),
+        ),
+    )
+
+
+@register_eval(PagedMlaPrefill)
+def _eval_paged_mla_prefill(ctx):
+    """The op's stated semantics: gather, then causal attention in f32."""
+    q, k_pages, v_pages, block_table = (ctx.args[i].data for i in range(4))
+    s, h, qk = q.shape
+    v_dim = v_pages.shape[-1]
+    k = k_pages.index_select(0, block_table.long()).reshape(-1, h, qk)[:s]
+    v = v_pages.index_select(0, block_table.long()).reshape(-1, h, v_dim)[:s]
+    scale = ctx.op.scale if ctx.op.scale > 0 else qk ** -0.5
+    qf = q.float().permute(1, 0, 2)                       # [H, S, QK]
+    kf = k.float().permute(1, 0, 2)                       # [H, S, QK]
+    vf = v.float().permute(1, 0, 2)                       # [H, S, V]
+    scores = torch.matmul(qf, kf.transpose(-1, -2)) * scale
+    mask = torch.full(
+        (s, s), float("-inf"), device=q.device
+    ).triu(1)
+    probs = torch.softmax(scores + mask, dim=-1)
+    out = torch.matmul(probs, vf).permute(1, 0, 2)        # [S, H, V]
+    return TensorValue(data=out.to(q.dtype), type=ctx.result_type)
+
+
+__all__ = ["AllReduce", "PagedMlaPrefill"]

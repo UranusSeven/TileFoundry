@@ -9,6 +9,8 @@ Switches:
     --sample     sample (temperature/top-k/top-p) instead of argmax; the
                  published generation_config.json sets no sampling, so greedy
                  is the default and is what two runs get compared through
+    --prefill X  'loop' (default): the decode step per prompt token;
+                 'paged': the M3-B paged prefill (prefill.py), then decode
     --check [N]  before the run, replay N steps through the authored
                  evaluator over the same weights and diff the logits
     --tp 2       tensor-parallel over two GPUs; run under
@@ -56,6 +58,13 @@ def parse_args(argv=None):
         "--ckpt", default=None,
         help="the checkpoint directory (default: $KIMI_LINEAR_CKPT or the "
         "container's /models path)",
+    )
+    p.add_argument(
+        "--prefill", choices=["loop", "paged"], default="loop",
+        help="how the prompt is consumed: 'loop' runs the decode step per "
+        "prompt token (the S=1 kernels); 'paged' runs the M3-B prefill path "
+        "(paged FA3 MLA + fla chunk_kda, see prefill.py) and hands its state "
+        "over to the same decode driver",
     )
     p.add_argument(
         "--check", type=int, nargs="?", const=8, default=None, metavar="N",
@@ -251,12 +260,27 @@ def main(argv=None) -> int:
         top_p=args.top_p, generator=generator,
     )
 
-    # -- prefill: one step per prompt token, because the step is one token ----
+    # -- prefill -------------------------------------------------------------
+    if args.prefill == "paged":
+        import prefill as pf  # noqa: PLC0415
+
+        # Warm-up: the prefill kernels (FA3, fla chunk_kda) and the decode
+        # kernels alike pay a one-time compilation/module load on first use.
+        # Loop prefill absorbs the decode half inside its own timed loop; a
+        # server pays all of it once at startup, so the timed sections below
+        # run warm.
+        warm_logits = pf.prefill(session, prompt_ids)
+        session.step(int(warm_logits.argmax()))
+        session.reset()
     torch.cuda.synchronize()
     t0 = time.perf_counter()
-    logits = None
-    for token in prompt_ids:
-        logits = session.step(token)
+    if args.prefill == "paged":
+        logits = pf.prefill(session, prompt_ids)
+    else:
+        # one step per prompt token, because the decode step is one token
+        logits = None
+        for token in prompt_ids:
+            logits = session.step(token)
     torch.cuda.synchronize()
     prefill_s = time.perf_counter() - t0
 
