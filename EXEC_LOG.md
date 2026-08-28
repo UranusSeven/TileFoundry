@@ -11,3 +11,34 @@ Focused deterministic CUDA comparison on GPU 2, E=4/I=32/H=64/top-8, against a f
 
 The test exercised `grouped_routed` and compiled the TileLang grouped kernel; no per-token weight-gather fallback is called.
 
+
+## 2026-08-28 grouped MoE follow-up verification
+
+All commands below ran inside pod `dev-yingshan-7cf9dbcf45-xtm8p` in namespace `default`, using GPU 2 (`CUDA_VISIBLE_DEVICES=2`), on branch `kimi-linear-run` at commit `029c7d4`.
+
+### 1. Real-size grouped kernel CUDA comparison
+
+Deterministic float32 per-assignment Torch reference versus `grouped_routed` with `E=256`, `I=1024`, `H=2304`, `topk=8`; output showed TileLang compilation of `_kernel` and the call completed through the grouped implementation.
+
+- `S=8`: `max_abs=1.557891e+02`, `rel_l2=1.673228e-03`, `argmax=True` (`8/8`)
+- `S=32`: `max_abs=1.874062e+02`, `rel_l2=1.680781e-03`, `argmax=True` (`32/32`)
+
+The comparison directly called `grouped_routed`; no per-token weight-gather fallback was used.
+
+### 2. Paged prefill check
+
+`CUDA_VISIBLE_DEVICES=2 python3 ext/kimi_linear/check_paged_prefill.py`: **PASS**. FA3 comparison reported `max|d|=1.562e-02`, `rel_l2=1.895e-03`.
+
+### 3. Paged generation and loop reference
+
+The requested paged run generated 32 tokens and printed coherent matrix-multiplication explanation text, with no repeated garbage. Its output showed repeated `TileLang begins/completes to compile kernel main` messages. The same prompt and token budget with `--prefill loop` produced identical ids: `TOKEN_EQUALITY True`, `32/32`, `mismatches=0`.
+
+Artifacts: `/tmp/grouped_paged.json` and `/tmp/grouped_loop.json` (container-local).
+
+### 4. S=1024 profile status
+
+A CUDA profiler run was attempted after warmup, but the generated prompt contained `S=961` rather than requested `S=1024`; this is incomplete and must not be treated as the requested S=1024 result. The measured S=961 trace reported `Self CUDA time total: 67.483ms`; grouped TileLang entries were `main_kernel_1` `14.068ms` (20.85%) and `main_kernel` `13.085ms` (19.39%), 26 calls each.
+
+The trace **did contain** old `void at::native::vectorized_gather_kernel<16, long>(...)` (`1.823ms`, 67 calls), so the required no-old-kernel condition failed. Because step 4 did not pass, S=4096 was not attempted.
+
+**Overall:** steps 1--3 passed; the final profile gate failed due to both the accidental `S=961` length and the presence of `vectorized_gather_kernel` in the trace.
