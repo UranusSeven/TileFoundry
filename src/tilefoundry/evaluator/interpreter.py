@@ -113,7 +113,9 @@ class EvaluatorVisitor(ExprVisitor):
         self, callee: Function, arg_values, ctx: EvaluateContext
     ) -> Value:
         child = child_module_instance(ctx.loaded_module, callee)
-        supplied = [p for p in callee.params if not (child is not None and p.is_const)]
+        supplied = [
+            param for param in callee.params if not (child is not None and param.is_const)
+        ]
         if len(arg_values) != len(supplied):
             kind = "activation(s)" if child is not None else "args"
             raise EvalError(

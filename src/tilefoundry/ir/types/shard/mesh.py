@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from tilefoundry.ir.types.shape_dim import ShapeDim
 from tilefoundry.ir.types.shard.int_tuple import flatten
 from tilefoundry.ir.types.shard.layout import ComposedLayout, Layout
+from tilefoundry.ir.types.shard.layout_algebra import c_order_strides
 
 
 @dataclass(frozen=True)
@@ -35,11 +36,16 @@ class Mesh:
     See [shard §5](docs/spec/shard.md#5-mesh).
     """
 
-    topologies: tuple[Topology, ...]
+    topologies: tuple[Topology | str, ...]
     layout: "Layout | ComposedLayout"
     names: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        layout = self.layout
+        if isinstance(layout, tuple):
+            layout = Layout(shape=layout, strides=c_order_strides(layout))
+            object.__setattr__(self, "layout", layout)
+
         for axis, extent in enumerate(flatten(self.layout.shape)):
             if extent is None:
                 raise ValueError(
@@ -105,7 +111,6 @@ class Mesh:
             layout=sliced,
             names=self.names,
         )
-
 
 
 def level_axes(mesh: "Mesh") -> tuple[tuple[int, ...], ...]:

@@ -6,11 +6,69 @@ import re
 
 import pytest
 
-from tilefoundry import func
+from tilefoundry import func, module
 from tilefoundry.dsl import Mesh, Tensor, Topology, tf
 from tilefoundry.inspection import as_script
+from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.parser import ParseError
 from tilefoundry.target import CudaTarget
+
+
+def test_a_lying_return_annotation_is_ignored_not_rejected() -> None:
+    @func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+    def annotated(
+        x: Tensor[(8, 16), "f32"],
+    ) -> Tensor[(8, 16), "f32", None, "smem"]:
+        return tf.mul(x, x)
+
+    fn = annotated.entry_function()
+    assert fn.return_type == fn.body.type
+    assert fn.return_type.storage is StorageKind.GMEM
+
+
+def test_a_dispatch_prototype_still_requires_a_return_annotation() -> None:
+    with pytest.raises(ParseError, match="prototype requires a return annotation"):
+
+        @module(
+            entry="root",
+            target=CudaTarget("nvidia.h200_sxm"),
+            topologies=(Topology("cta", 1),),
+        )
+        class NoReturn:
+            @func
+            def root(x: Tensor[(8, 16), "f32"]):
+                pass
+
+
+def test_a_storage_the_target_does_not_have_is_refused() -> None:
+    refusal = re.escape(
+        "storage tmem is not allowed by hardware context ('gmem', 'smem', 'rmem', 'umat')"
+    )
+    with pytest.raises(ParseError, match=refusal):
+
+        @func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+        def wrong(x: Tensor[(4,), "f32", None, "tmem"]):
+            return x
+
+    with pytest.raises(ParseError, match=refusal):
+
+        @func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+        def wrong_body(x: Tensor[(4,), "f32"]):
+            return tf.zeros(Tensor[(4,), "f32", None, "tmem"])
+
+
+def test_a_storage_the_target_has_is_accepted() -> None:
+    @func(target=CudaTarget("nvidia.h200_sxm"), topologies=(Topology("cta", 1),))
+    def fine(x: Tensor[(4,), "f32", None, "smem"]):
+        return x
+
+    assert fine.entry_function().params[0].annotation.storage is StorageKind.SMEM
+
+    @func(target=CudaTarget("nvidia.b200_sxm"), topologies=(Topology("cta", 1),))
+    def blackwell(x: Tensor[(4,), "f32", None, "tmem"]):
+        return x
+
+    assert blackwell.entry_function().params[0].annotation.storage is StorageKind.TMEM
 
 
 def test_a_function_may_have_a_leading_docstring() -> None:

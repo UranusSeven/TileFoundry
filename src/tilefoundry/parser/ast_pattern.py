@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import FrameType, SimpleNamespace
-from typing import Any, ClassVar, Generic, Protocol, TypeVar
+from typing import Any, ClassVar, Generic, Protocol, TypeVar, cast
 from typing import Literal as TypingLiteral
 
 from tilefoundry.ir.core import (
@@ -65,18 +65,42 @@ from tilefoundry.ir.types.shard import (
     Mesh,
     ShardLayout,
     Split,
+    Topology,
     c_order_strides,
     canonical_shard_layout,
     composed,
 )
 from tilefoundry.ir.types.shard.layout import LayoutBase
 from tilefoundry.ir.types.storage import StorageKind, resolve_storage
+from tilefoundry.target import MemoryHierarchyFacts, Target, UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 from tilefoundry.visitor_registry.visitors import TypeInferVisitor
 
 T = TypeVar("T")
-_RETURN_TYPE = "<return_type>"
 _TYPE_INFER_CONTEXT = "<type_infer_context>"
+
+
+def _hardware_context(target: Target | None) -> dict[str, object]:
+    if target is None:
+        return {}
+    try:
+        facts = target.get_facts(MemoryHierarchyFacts)
+    except UnsupportedCapabilityError:
+        return {}
+    allowed = tuple(resolve_storage(level.name) for level in facts.explicit_levels)
+    return {"allowed_storage": (*allowed, StorageKind.UMAT)}
+
+
+def _resolve_mesh_topologies(
+    topologies: tuple[Topology | str, ...],
+    declared: Mapping[str, Topology],
+) -> tuple[Topology, ...]:
+    """Resolve string topology names against one function's declared hierarchy."""
+    if all(isinstance(topology, str) for topology in topologies):
+        return tuple(declared[topology] for topology in topologies)
+    if all(hasattr(topology, "name") for topology in topologies):
+        return cast(tuple[Topology, ...], topologies)
+    raise TypeError("Mesh topologies must be names or Topology objects")
 
 
 class MatchFailure:
@@ -211,6 +235,7 @@ runtime = SimpleNamespace(
     slice_size=slice_size,
     simplify_dim=simplify_dim,
     resolve_storage=resolve_storage,
+    resolve_mesh_topologies=_resolve_mesh_topologies,
 )
 
 
@@ -572,7 +597,6 @@ class ChildPattern(CombinatorPattern):
         situation: str,
         role: str | None = None,
         *,
-        expected_type: object | Callable[[object, MatchContext], object] | None = None,
         values: Mapping[str, object]
         | Callable[[object, MatchContext], Mapping[str, object]]
         | None = None,
@@ -583,7 +607,6 @@ class ChildPattern(CombinatorPattern):
         self._pattern = pattern
         self.situation = situation
         self.role = role
-        self.expected_type = expected_type
         self.values = values
         self.isolated_scope = isolated_scope
         self.transform = transform
@@ -601,18 +624,12 @@ class ChildPattern(CombinatorPattern):
         if not isinstance(value, ast.AST):
             return None
         values = self.values(value, context) if callable(self.values) else self.values or {}
-        expected_type = (
-            self.expected_type(value, context)
-            if callable(self.expected_type)
-            else self.expected_type
-        )
         child = AstChild(
             self.name,
             self.pattern,
             value,
             self.situation,
             self.role,
-            expected_type=expected_type,
             values=values,
             isolated_scope=self.isolated_scope,
         )
@@ -736,6 +753,7 @@ class FuncParserContext:
     base: object | None = None
     key: object | None = None
     target: object | None = None
+    mesh: object | None = None
     output_count: int = 1
     hardware_context: Mapping[str, object] = field(default_factory=dict)
     binding_name: str | None = None
@@ -882,6 +900,7 @@ class ModuleBuildContext:
         closure: Mapping[str, object] | None = None,
         base: object | None = None,
         key: object | None = None,
+        mesh: object | None = None,
     ) -> FuncParserContext:
         topology_scope = {
             getattr(topology, "name", str(index)): topology
@@ -897,7 +916,9 @@ class ModuleBuildContext:
             module=self,
             base=base,
             key=key,
-            target=self.target if dialect == "tir" else None,
+            target=self.target,
+            mesh=mesh,
+            hardware_context=_hardware_context(self.target),
             binding_name=binding_name,
         )
 
@@ -1149,7 +1170,6 @@ class MatchContext:
     situation: str
     role: str | None = None
     binding_name: str | None = None
-    expected_type: object | None = None
     lexical_scope: LexicalScope = field(default_factory=LexicalScope)
     parent: MatchContext | None = None
     values: Mapping[str, object] = field(default_factory=dict)
@@ -1166,7 +1186,7 @@ class MatchContext:
             _TYPE_INFER_CONTEXT,
             ParserTypeInferContext(child_resolver=provider),
         )
-        return cls(
+        context = cls(
             function=function,
             module=None,
             situation="function",
@@ -1174,6 +1194,25 @@ class MatchContext:
             lexical_scope=scope,
             values=function.hardware_context,
         )
+        if function.mesh is not None:
+            try:
+                topologies = _resolve_mesh_topologies(
+                    function.mesh.topologies, function.topologies
+                )
+            except KeyError as error:
+                raise ParseError.from_node(
+                    ast.Name(id=error.args[0]),
+                    context,
+                    f"topology {error.args[0]!r} not declared by @module",
+                ) from error
+            except TypeError as error:
+                raise ParseError.from_node(
+                    ast.Name(id="mesh"), context, str(error)
+                ) from error
+            mesh = dataclasses.replace(function.mesh, topologies=topologies)
+            scope.define("mesh", mesh)
+            function.state.mesh_stack.append(mesh)
+        return context
 
     def child(
         self,
@@ -1181,7 +1220,6 @@ class MatchContext:
         situation: str,
         role: str | None = None,
         binding_name: str | None = None,
-        expected_type: object | None = None,
         values: Mapping[str, object] | None = None,
         lexical_bindings: Mapping[str, object] | None = None,
         isolated_scope: bool = False,
@@ -1208,15 +1246,12 @@ class MatchContext:
         if lexical_bindings:
             for name, value in lexical_bindings.items():
                 scope.define(name, value)
-        if expected_type is None and role == "return_value":
-            expected_type = scope.lookup(_RETURN_TYPE)
         return MatchContext(
             function=function or self.function,
             module=module or self.module,
             situation=situation,
             role=role,
             binding_name=binding_name,
-            expected_type=expected_type,
             lexical_scope=scope,
             parent=self,
             values=merged,
@@ -1253,7 +1288,6 @@ class AstChild:
     node: ast.AST
     situation: str
     role: str | None = None
-    expected_type: object | None = None
     values: Mapping[str, object] = field(default_factory=dict)
     isolated_scope: bool = False
     function_context: FuncParserContext | None = None
@@ -1357,7 +1391,6 @@ def parse_node(pattern: AstPattern[T], node: ast.AST, context: MatchContext) -> 
             situation=child.situation,
             role=child.role,
             binding_name=binding_name,
-            expected_type=child.expected_type,
             values=child.values,
             lexical_bindings=child.lexical_bindings,
             isolated_scope=child.isolated_scope,

@@ -19,7 +19,7 @@ from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.tir.stmts import Evaluate, MeshScope
 from tilefoundry.ir.types.substitute import canonicalize_dims
-from tilefoundry.ir.types.tensor_type import TensorType, TupleType, Type, UnitType
+from tilefoundry.ir.types.tensor_type import TupleType, Type, UnitType
 from tilefoundry.ir.types.utils import types_compatible
 from tilefoundry.ir.visitor import ExprVisitor, ExprWalker, StmtVisitor
 
@@ -108,23 +108,13 @@ class TypeInferVisitor(ExprVisitor[Type]):
                 continue
             index, arg_type = next(given)
             declared = param.annotation
-            wildcard = isinstance(declared, TensorType) and declared.layout is None
             if not types_compatible(declared, arg_type):
-                if wildcard and isinstance(arg_type, TensorType):
-                    message = (
-                        f"hir Function call {callee.name!r}: arg {index} shape/dtype "
-                        f"mismatch — callee param {param.name!r} expects logical "
-                        f"{declared.shape} {declared.dtype.name}, got "
-                        f"{arg_type.shape} {arg_type.dtype.name}"
-                    )
-                else:
-                    message = (
-                        f"hir Function call {callee.name!r}: arg {index} type mismatch — "
-                        f"callee param {param.name!r} expects {declared!r}, got {arg_type!r}"
-                    )
-                ctx.error(call, message)
-            bound = arg_type if wildcard else declared
-            memo[id(param)] = (param, bound)
+                ctx.error(
+                    call,
+                    f"hir Function call {callee.name!r}: arg {index} type mismatch — "
+                    f"callee param {param.name!r} expects {declared!r}, got {arg_type!r}",
+                )
+            memo[id(param)] = (param, arg_type)
 
         if callee.body is None or callee.variants:
             return callee.return_type
