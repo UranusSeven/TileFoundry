@@ -109,3 +109,18 @@ Benchmark contract, S=32, one warmup and three repeats: logits shape `[1, 163840
 Validation passed: Python compilation for all retained extension files, 27-layer model forest and packed-weight ABI, `check_kda_prefill_op.py`, rewritten fast checks, HF/runtime real-checkpoint comparisons at S=8/32/100, Ruff on changed files, comment/English/forward-reference/machine-path hygiene lints, and `git diff --check`.
 
 Phase 3 remains intentionally out of scope: TP2 prefill and the broader performance sweep/tuning.
+
+
+## Prefill-only TP2 与 vLLM baseline
+
+Phase 3 ran in the fixed chengfeng container with `torchrun`, NCCL, GPUs 0+1, BF16, batch 1, `max_tokens=1`, fixed baseline token IDs, and three repeats after one same-shape warmup. The runtime directly slices safetensors during checkpoint loading: KDA/MLA heads 32→16 per rank, all 256 routed experts retained with intermediate 1024→512, shared experts and layer-0 dense MLP similarly split, output projections row-split, and each mixer/FFN output all-reduced. Embedding and LM head remain replicated. Rank-local resident and load peak were both 47.213 GiB, confirming no transient full 98 GB model was loaded before slicing.
+
+Correctness on fixed IDs:
+- S=8: TP2/TP1 argmax 3971/3971, rel-L2 1.7015e-2; TP2/HF argmax 3971/3971, rel-L2 3.6607e-2.
+- S=32: TP2/TP1 argmax 1/1, rel-L2 4.8300e-2; TP2/HF argmax 1/1, rel-L2 4.6144e-2.
+- S=100: TP2/TP1 argmax 295/295, rel-L2 4.5029e-2; TP2/HF argmax 295/295, rel-L2 4.8565e-2.
+- Rank-0/rank-1 logits were bit-identical at all lengths. HF gates passed; TP1 differences are BF16 collective-order noise with exact argmax.
+
+Quick gate medians: S=512 57.925 ms / 23.7 ms = 2.444x; S=1024 59.498 ms / 50.8 ms = 1.171x; S=4096 98.795 ms / 58.0 ms = 1.703x. The full sweep was skipped because 512 and 4096 miss 1.5x.
+
+Exact traces are `/root/develop/yingshan/traces/prefill_tp2_phase3_s1024_rank0.json` and `/root/develop/yingshan/traces/prefill_tp2_phase3_s4096_rank0.json`, with rank-1 siblings. S=1024 profiler wall/summed GPU events were 196.037/221.033 ms: MoE 41.048 ms, KDA 36.684 ms, NCCL 25.709 ms, MLA 5.010 ms. S=4096 was 181.115/257.545 ms: KDA 43.386 ms, MoE 35.282 ms, MLA 6.044 ms, NCCL 4.793 ms. The dominant residual bottleneck at the failing long shape is the 20-layer KDA path, not communication. Next action: fuse its projection-conv-gate elementwise path or use a TP-aware fused KDA prefill kernel; then revisit fixed 54-collective latency at S=512.

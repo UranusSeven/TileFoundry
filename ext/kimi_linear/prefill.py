@@ -7,6 +7,7 @@ last-position LM head. MLA uses request-local FA3 pages, KDA uses FLA
 experts with the checkpoint's packed ``gate_up`` ABI. No decode state, cache
 handoff, or generation resource is part of this module.
 """
+
 from __future__ import annotations
 
 import time
@@ -42,8 +43,8 @@ _LAT = 512
 _KVB = _NOPE + _V
 _TOPK = 8
 _EPS = 1e-5
-_W = 4                    # short conv kernel size
-_WS = _W - 1              # stored conv positions
+_W = 4  # short conv kernel size
+_WS = _W - 1  # stored conv positions
 _BF16 = torch.bfloat16
 
 #: The page size the MLA pages are laid out at (vllm_flash_attn's own).
@@ -81,12 +82,20 @@ class BlockManager:
         if layer not in self._pages:
             self._pages[layer] = (
                 torch.zeros(
-                    self.num_pages, PAGE_SIZE, self.nh, _QK,
-                    dtype=_BF16, device=self.device,
+                    self.num_pages,
+                    PAGE_SIZE,
+                    self.nh,
+                    _QK,
+                    dtype=_BF16,
+                    device=self.device,
                 ),
                 torch.zeros(
-                    self.num_pages, PAGE_SIZE, self.nh, _V,
-                    dtype=_BF16, device=self.device,
+                    self.num_pages,
+                    PAGE_SIZE,
+                    self.nh,
+                    _V,
+                    dtype=_BF16,
+                    device=self.device,
                 ),
             )
         return self._pages[layer]
@@ -97,13 +106,9 @@ class BlockManager:
             raise RuntimeError("a sequence is live; free it before allocating")
         n = (length + PAGE_SIZE - 1) // PAGE_SIZE
         if n > len(self._free):
-            raise RuntimeError(
-                f"page pool exhausted: need {n}, have {len(self._free)}"
-            )
+            raise RuntimeError(f"page pool exhausted: need {n}, have {len(self._free)}")
         taken, self._free = self._free[:n], self._free[n:]
-        self.block_table = torch.tensor(
-            taken, dtype=torch.int32, device=self.device
-        ).reshape(1, n)
+        self.block_table = torch.tensor(taken, dtype=torch.int32, device=self.device).reshape(1, n)
         return self.block_table
 
     def free(self) -> None:
@@ -115,9 +120,7 @@ class BlockManager:
         """The flat page-pool slot each position occupies, by the block table."""
         idx = torch.arange(length, device=self.device)
         pages = self.block_table.reshape(-1)
-        return (
-            pages[idx // PAGE_SIZE].long() * PAGE_SIZE + idx % PAGE_SIZE
-        )
+        return pages[idx // PAGE_SIZE].long() * PAGE_SIZE + idx % PAGE_SIZE
 
 
 def mla_prefill(hidden, w, mgr: BlockManager, layer: int, length: int):
@@ -171,7 +174,7 @@ def flash_paged(q, k_pages, v_pages, block_table, length: int):
         max_seqlen_q=length,
         seqused_k=seqused,
         max_seqlen_k=length,
-        softmax_scale=_QK ** -0.5,
+        softmax_scale=_QK**-0.5,
         causal=True,
         block_table=block_table,
         fa_version=3,
@@ -187,13 +190,12 @@ def _conv_prefill(x_raw, conv_w):
     against the unfolded window's channel-major layout.)
     """
     xp = torch.cat(
-        [torch.zeros(1, _WS, _KP, dtype=x_raw.dtype, device=x_raw.device), x_raw],
+        [torch.zeros(1, _WS, x_raw.shape[-1], dtype=x_raw.dtype, device=x_raw.device), x_raw],
         dim=1,
     )
     win = xp.unfold(1, _W, 1)  # [1, S, KP, W], windows [t-3 .. t]
     acc = (win.float() * conv_w.float().permute(1, 0).unsqueeze(0).unsqueeze(0)).sum(-1)
     return F.silu(acc).to(x_raw.dtype)
-
 
 
 def kda_prefill(hidden, w, length: int):
@@ -203,6 +205,8 @@ def kda_prefill(hidden, w, length: int):
     zero and its final state is intentionally discarded.
     """
     hn = _rms(hidden, w["gamma_in"])
+    kp = w["w_q"].shape[-1]
+    nh = kp // _DK
     q_raw = torch.matmul(hn, w["w_q"])
     k_raw = torch.matmul(hn, w["w_k"])
     v_raw = torch.matmul(hn, w["w_v"])
@@ -213,20 +217,18 @@ def kda_prefill(hidden, w, length: int):
     # The per-channel forget gate: the softplus input rounds through bf16
     # (the authored placement), the activation runs in f32.
     g_raw = torch.matmul(torch.matmul(hn, w["w_f_a"]), w["w_f_b"]) + w["dt_bias"]
-    g = -w["a_log"].float().exp().reshape(1, 1, _NH, 1) * F.softplus(
-        g_raw.view(1, length, _NH, _DK).float()
+    g = -w["a_log"].float().exp().reshape(1, 1, nh, 1) * F.softplus(
+        g_raw.view(1, length, nh, _DK).float()
     )
-    beta = torch.sigmoid(torch.matmul(hn, w["w_b"]).float()).reshape(
-        1, length, _NH
-    )
+    beta = torch.sigmoid(torch.matmul(hn, w["w_b"]).float()).reshape(1, length, nh)
 
     o, _ = chunk_kda(
-        q=q_c.view(1, length, _NH, _DK),
-        k=k_c.view(1, length, _NH, _DK),
-        v=v_c.view(1, length, _NH, _DK),
+        q=q_c.view(1, length, nh, _DK),
+        k=k_c.view(1, length, nh, _DK),
+        v=v_c.view(1, length, nh, _DK),
         g=g,
         beta=beta,
-        scale=_DK ** -0.5,
+        scale=_DK**-0.5,
         initial_state=None,
         output_final_state=False,
         use_qk_l2norm_in_kernel=True,
@@ -234,13 +236,11 @@ def kda_prefill(hidden, w, length: int):
 
     # Gated output norm: rms_norm(o) * gamma * sigmoid(g2), in f32, landed
     # once into bf16 for the output projection.
-    g2 = torch.matmul(torch.matmul(hn, w["w_g_a"]), w["w_g_b"]).view(
-        1, length, _NH, _DK
-    ).float()
+    g2 = torch.matmul(torch.matmul(hn, w["w_g_a"]), w["w_g_b"]).view(1, length, nh, _DK).float()
     of = o.float()
     on = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + _EPS)
     on = on * w["gamma_o"].float() * torch.sigmoid(g2)
-    out = torch.matmul(on.reshape(1, length, _KP).to(_BF16), w["w_o"])
+    out = torch.matmul(on.reshape(1, length, kp).to(_BF16), w["w_o"])
 
     return out
 
@@ -257,9 +257,7 @@ def _router(tokens, w_router, bias, routed_scale):
     top_biased, indices = torch.topk(biased, _TOPK, dim=-1)
     selected_bias = bias.float().reshape(-1)[indices.reshape(-1)].view_as(top_biased)
     unbiased = top_biased - selected_bias
-    weights = (
-        unbiased / unbiased.sum(-1, keepdim=True) * routed_scale.float().reshape(())
-    )
+    weights = unbiased / unbiased.sum(-1, keepdim=True) * routed_scale.float().reshape(())
     return weights.to(_BF16), indices
 
 
@@ -274,7 +272,9 @@ def moe_prefill(hidden, w, routed_scale):
     else:
         intermediate = w["w_gate_up"].shape[1] // 2
         routed = grouped_routed(
-            tokens, weights, indices,
+            tokens,
+            weights,
+            indices,
             w["w_gate_up"][:, :intermediate],
             w["w_gate_up"][:, intermediate:],
             w["w_down"],
@@ -328,8 +328,7 @@ class PrefillRunner:
         length = ids.numel()
         if length > self.config.model_max_length:
             raise ValueError(
-                f"prompt length {length} exceeds model_max_length "
-                f"{self.config.model_max_length}"
+                f"prompt length {length} exceeds model_max_length {self.config.model_max_length}"
             )
 
         hidden = self.weights.constants["table"][ids].reshape(1, length, _HID)

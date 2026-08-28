@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Benchmark one Kimi prefill and report last-position logits and TTFT."""
+
 from __future__ import annotations
 
 import argparse
@@ -25,6 +26,7 @@ def parse_args(argv=None):
     parser.add_argument("--repeat", type=int, default=5)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=1, choices=[1])
+    parser.add_argument("--tp", type=int, default=1, choices=[1, 2])
     parser.add_argument("--out", help="write the report as JSON")
     return parser.parse_args(argv)
 
@@ -37,7 +39,9 @@ def input_ids(args):
         return ids
     if args.length < 1:
         raise ValueError("--length must be positive")
-    return (_DEFAULT_IDS * ((args.length + len(_DEFAULT_IDS) - 1) // len(_DEFAULT_IDS)))[: args.length]
+    return (_DEFAULT_IDS * ((args.length + len(_DEFAULT_IDS) - 1) // len(_DEFAULT_IDS)))[
+        : args.length
+    ]
 
 
 def main(argv=None) -> int:
@@ -46,9 +50,14 @@ def main(argv=None) -> int:
         raise ValueError("--repeat must be positive and --warmup non-negative")
     ids = input_ids(args)
 
-    from prefill import PrefillRunner  # noqa: PLC0415
+    if args.tp == 2:
+        from runtime_tp2 import PrefillRunnerTP2  # noqa: PLC0415
 
-    runner = PrefillRunner()
+        runner = PrefillRunnerTP2()
+    else:
+        from prefill import PrefillRunner  # noqa: PLC0415
+
+        runner = PrefillRunner()
     for _ in range(args.warmup):
         runner(ids)
     torch.cuda.synchronize()
@@ -77,8 +86,19 @@ def main(argv=None) -> int:
         "repeat": args.repeat,
         "warmup": args.warmup,
     }
-    print(json.dumps(report, indent=2))
-    if args.out:
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if args.tp == 2:
+        report.update(
+            {
+                "tp": 2,
+                "rank": rank,
+                "resident_weight_gib": runner.resident_bytes / 2**30,
+                "load_peak_gib": runner.load_peak_bytes / 2**30,
+            }
+        )
+    if rank == 0:
+        print(json.dumps(report, indent=2))
+    if args.out and rank == 0:
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2)
             handle.write("\n")
