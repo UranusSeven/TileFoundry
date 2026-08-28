@@ -13,7 +13,7 @@ M3-B. Three pieces:
   causal depthwise convolutions and the forget gate computed batched in
   torch. MoE uses vLLM's fused experts with GPU-only dispatch by default; the
   corrected TileLang grouped kernel remains an explicit fallback. Dense MLP is
-  plain batched torch. Decode kernels remain S=1-shaped and unchanged.
+  plain batched torch. The runtime remains transitional and will be rewritten in the next phase.
 * `prefill(session, prompt_ids)` -- the driver: embed, walk the layers,
   closing norm and head on the last position, then install the state the
   decode driver continues from. The handoff is contract option (a): KDA
@@ -22,8 +22,7 @@ M3-B. Three pieces:
   transposed here), and the MLA pages are repacked once into the session's
   contiguous decode caches.
 
-Numerics follow the authored IR's rounding placements, as the decode torch
-transcriptions in `runtime_model.py` do: the rms norms round to bf16 before
+Numerics follow the authored IR's rounding placements: the rms norms round to bf16 before
 gamma multiplies, the KDA gate's softplus input rounds through bf16, and the
 attention / MoE reductions accumulate in f32.
 """
@@ -33,18 +32,21 @@ import torch
 import torch.nn.functional as F
 from fla.ops.kda import chunk_kda
 from vllm.vllm_flash_attn import flash_attn_varlen_func
+
 try:
     from .kernels.moe_prefill import grouped_routed
     from .kernels.moe_prefill_vllm import (
-        fused_routed, implementation, restore_decode_weights,
+        fused_routed,
+        implementation,
     )
 except ImportError:
     from kernels.moe_prefill import grouped_routed
     from kernels.moe_prefill_vllm import (
-        fused_routed, implementation, restore_decode_weights,
+        fused_routed,
+        implementation,
     )
 
-# The dims, spelled as runtime_model spells them (the published config's).
+# Published checkpoint dimensions used by this transitional runtime.
 _HID = 2304
 _NH = 32
 _DK = 128
@@ -308,8 +310,12 @@ def moe_prefill(hidden, w, routed_scale, chunk: int = 32):
     if implementation() == "vllm":
         routed = fused_routed(tokens, weights, indices, w["w_gate_up"], w["w_down"])
     else:
+        intermediate = w["w_gate_up"].shape[1] // 2
         routed = grouped_routed(
-            tokens, weights, indices, w["w_gate"], w["w_up"], w["w_down"]
+            tokens, weights, indices,
+            w["w_gate_up"][:, :intermediate],
+            w["w_gate_up"][:, intermediate:],
+            w["w_down"],
         )
     x = tokens.reshape(1, length, _HID)
     shared = torch.matmul(
@@ -368,8 +374,6 @@ def prefill(session, prompt_ids, moe_chunk: int = 32, *, prepare_decode: bool = 
                 hidden = hidden + moe_prefill(
                     hidden, ffn._bound, session.routed_scale, moe_chunk
                 )
-                if prepare_decode and implementation() == "vllm":
-                    restore_decode_weights(ffn._bound)
             else:
                 hidden = hidden + mlp_prefill(hidden, ffn._bound)
 

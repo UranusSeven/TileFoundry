@@ -21,8 +21,8 @@ Four pieces, as every op:
 - **access relation** is the identity: every element is read once and
   written once (the network movement is not an element access).
 
-The runtime counterpart -- what a `@runtime_func` twin actually calls -- is
-`torch.distributed.all_reduce`; see `runtime_tp2.py`.
+A future prefill runtime may lower the collective to
+`torch.distributed.all_reduce`; this file states only the logical HIR contract.
 """
 from __future__ import annotations
 
@@ -239,4 +239,133 @@ def _eval_paged_mla_prefill(ctx):
     return TensorValue(data=out.to(q.dtype), type=ctx.result_type)
 
 
-__all__ = ["AllReduce", "PagedMlaPrefill"]
+# ---------------------------------------------------------------------------
+# The external HIR op `tf.kda_prefill`: whole-sequence KDA recurrence.
+# ---------------------------------------------------------------------------
+
+
+@register_op(dialect="tf", category="nn", name="causal_depthwise_conv1d")
+class CausalDepthwiseConv1D(Op):
+    """Causal depthwise convolution for ``x[B, S, C]`` and ``weight[W, C]``."""
+
+    x = ParamDef(kind="input", pattern=Tensor)
+    weight = ParamDef(kind="input", pattern=Tensor)
+
+
+@register_typeinfer(CausalDepthwiseConv1D)
+def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+    x_ty, weight_ty = (ctx.type_of(arg) for arg in call.args)
+    if len(x_ty.shape) != 3 or len(weight_ty.shape) != 2:
+        ctx.error(call, f"expected x[B,S,C], weight[W,C], got {x_ty.shape}, {weight_ty.shape}")
+    if x_ty.shape[2] != weight_ty.shape[1] or x_ty.dtype != weight_ty.dtype:
+        ctx.error(call, "convolution channel counts and dtypes must match")
+    return TensorType(shape=x_ty.shape, dtype=x_ty.dtype, layout=None, storage=x_ty.storage)
+
+
+@register_access_relation(CausalDepthwiseConv1D)
+def _causal_conv_access(call: "Call", ctx) -> AccessRelations:
+    x_ty, weight_ty = (ctx.type_of(arg) for arg in call.args)
+    return iterating(
+        x_ty.shape,
+        AccessRelations(
+            inputs=(
+                BoundaryRelation(reached_at(3, x_ty, x_ty, {0: "d0", 2: "d2"}, free=(1,))),
+                BoundaryRelation(reached_at(3, weight_ty, weight_ty, {1: "d2"}, free=(0,))),
+            ),
+            outputs=(BoundaryRelation(identity_access(3)),),
+        ),
+    )
+
+
+@register_eval(CausalDepthwiseConv1D)
+def _eval_causal_conv(ctx):
+    x, weight = (arg.data for arg in ctx.args)
+    width = weight.shape[0]
+    padded = torch.nn.functional.pad(x.transpose(1, 2), (width - 1, 0))
+    out = torch.nn.functional.conv1d(
+        padded.float(), weight.transpose(0, 1).float().unsqueeze(1), groups=x.shape[2]
+    ).transpose(1, 2)
+    return TensorValue(data=torch.nn.functional.silu(out).to(x.dtype), type=ctx.result_type)
+
+
+@register_op(dialect="tf", category="nn", name="kda_prefill")
+class KdaPrefill(Op):
+    """Apply the zero-initialized KDA delta-rule recurrence to a sequence.
+
+    Inputs use ``[batch, sequence, heads, dim]`` except ``beta``, which is
+    ``[batch, sequence, heads]``. ``g`` is the logarithmic per-key-channel
+    decay. The result is the output at every sequence position; no final state
+    is exposed because this model is prefill-only.
+    """
+
+    q = ParamDef(kind="input", pattern=Tensor)
+    k = ParamDef(kind="input", pattern=Tensor)
+    v = ParamDef(kind="input", pattern=Tensor)
+    g = ParamDef(kind="input", pattern=Tensor)
+    beta = ParamDef(kind="input", pattern=Tensor)
+    scale = ParamDef(kind="attribute", annotation=float, default=-1.0)
+
+
+@register_typeinfer(KdaPrefill)
+def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+    q_ty, k_ty, v_ty, g_ty, beta_ty = (ctx.type_of(arg) for arg in call.args)
+    for name, ty in (("q", q_ty), ("k", k_ty), ("v", v_ty), ("g", g_ty)):
+        if len(ty.shape) != 4:
+            ctx.error(call, f"{name} must be [B, S, H, D], got {ty.shape}")
+    if len(beta_ty.shape) != 3:
+        ctx.error(call, f"beta must be [B, S, H], got {beta_ty.shape}")
+    if q_ty.shape != k_ty.shape or q_ty.shape != v_ty.shape or q_ty.shape != g_ty.shape:
+        ctx.error(call, "q, k, v, and g must have identical shapes")
+    if beta_ty.shape != q_ty.shape[:3]:
+        ctx.error(call, f"beta shape {beta_ty.shape} != {q_ty.shape[:3]}")
+    if any(ty.dtype != q_ty.dtype for ty in (k_ty, v_ty, g_ty, beta_ty)):
+        ctx.error(call, "q, k, v, g, and beta must have identical dtypes")
+    return TensorType(
+        shape=q_ty.shape, dtype=q_ty.dtype, layout=None, storage=q_ty.storage
+    )
+
+
+@register_access_relation(KdaPrefill)
+def _kda_prefill_access(call: "Call", ctx) -> AccessRelations:
+    """Every output may depend on all earlier sequence rows."""
+    types = tuple(ctx.type_of(arg) for arg in call.args)
+    out_ty = types[0]
+    relations = []
+    for ty in types:
+        fixed = {0: "d0", 2: "d2"}
+        free = tuple(axis for axis in range(len(ty.shape)) if axis not in fixed)
+        relations.append(BoundaryRelation(reached_at(4, ty, ty, fixed, free=free)))
+    return iterating(
+        out_ty.shape,
+        AccessRelations(
+            inputs=tuple(relations),
+            outputs=(BoundaryRelation(identity_access(4)),),
+        ),
+    )
+
+
+@register_eval(KdaPrefill)
+def _eval_kda_prefill(ctx):
+    """Sequential Torch reference for chunk-KDA's causal delta rule."""
+    q, k, v, g, beta = (arg.data for arg in ctx.args)
+    dim = q.shape[-1]
+    scale = ctx.op.scale if ctx.op.scale > 0 else dim ** -0.5
+    q32, k32 = q.float(), k.float()
+    qf = q32 * torch.rsqrt(torch.sum(q32 * q32, dim=-1, keepdim=True) + 1e-6) * scale
+    kf = k32 * torch.rsqrt(torch.sum(k32 * k32, dim=-1, keepdim=True) + 1e-6)
+    state = torch.zeros(
+        q.shape[0], q.shape[2], dim, dim, dtype=torch.float32, device=q.device
+    )
+    outputs = []
+    for position in range(q.shape[1]):
+        key = kf[:, position]
+        state = state * torch.exp(g[:, position].float()).unsqueeze(-2)
+        memory = torch.sum(state * key.unsqueeze(-2), dim=-1)
+        delta = (v[:, position].float() - memory) * beta[:, position].float().unsqueeze(-1)
+        state = state + delta.unsqueeze(-1) * key.unsqueeze(-2)
+        outputs.append(torch.sum(state * qf[:, position].unsqueeze(-2), dim=-1))
+    out = torch.stack(outputs, dim=1).to(q.dtype)
+    return TensorValue(data=out, type=ctx.result_type)
+
+
+__all__ = ["AllReduce", "CausalDepthwiseConv1D", "KdaPrefill", "PagedMlaPrefill"]

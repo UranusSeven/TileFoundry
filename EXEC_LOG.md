@@ -77,3 +77,13 @@ Exact-shape Torch/CUDA traces (`/root/develop/yingshan/traces/tf_vllm_moe/`), ea
 - Trace CPU-op search found no `.cpu()`, `bincount`, NumPy, argsort, or host sort operation in either trace. MoE metadata is produced by vLLM's CUDA `moe_align_block_size_kernel`.
 
 The remaining gap is not host MoE dispatch. At S=1024, GPU busy is 29.7 ms above the vLLM TP2 rank baseline and MoE alone is 23.3 ms; TP1 reads full expert weights while the baseline is TP2. At S=4096, GPU busy exceeds baseline by 83.5 ms while MoE is 37.6 ms, so KDA/MLA/dense TP1 work and the 26-layer Python launch span dominate the residual. The installed package has no tuned H200 config for E=256/N=1024 and emits the default-config warning, leaving additional fused-MoE tuning headroom.
+
+
+## Prefill-only HIR 收敛（阶段1）
+
+- Removed the decode shell, decode runtimes, decode kernels, decode checks, and HF greedy driver under `ext/kimi_linear/`.
+- Replaced `ext/kimi_linear/model.py` with an independent `DimVar("seq_len", 1, model_max_length)` prefill model containing the published 27-layer stack, KDA/MLA mixers, MoE/dense FFNs, embedding, final norm, and last-position LM head.
+- Added HIR-only `tf.kda_prefill(q, k, v, g, beta, scale=...) -> output` with whole-sequence inputs, zero initial recurrent state, no final-state handoff, type inference, access relation, and a sequential Torch evaluator matching causal chunk-KDA delta-rule semantics. `tf.causal_depthwise_conv1d` keeps KDA's causal projection convolution in HIR.
+- Unified routed-expert weights to packed `w_gate_up [E, 2I, H]` plus `w_down [E, H, I]`; authored HIR uses static slices for gate/up, and checkpoint loading packs per-expert `w1/w3` pairs directly.
+- Checks: all retained extension Python files compile; the authored model imports and has 27 layers; model forest/function counts and KDA evaluator/type inference were inspected; paged MLA smoke, Ruff, repository hygiene lints, and `git diff --check` were run before commit.
+- Limitation: this is phase-1 HIR convergence, not a complete runnable prefill pipeline. `run.py`, `prefill.py`, and legacy broad check drivers still contain decode-session assumptions and are deferred to the phase-2 runtime rewrite.

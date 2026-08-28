@@ -1,52 +1,9 @@
-"""Kimi-Linear-48B-A3B-Instruct's full decode shell: tokens in, logits out.
+"""Independent S-symbolic prefill HIR for Kimi-Linear-48B-A3B-Instruct.
 
-The shipped authored model (``tests/models/kimi_linear_48b_a3b/model.py``)
-describes this model's three *kinds* of submodule -- KDA, MLA, and the MoE --
-and nothing around them: no embedding, no 27-layer walk, no closing norm, no
-head. This file is the shell. Its Module tree is the published stack in layer
-order -- layer 0 is KDA + dense MLP (``first_k_dense_replace: 1``), layers
-3/7/11/15/19/23/26 (0-based) are MLA + MoE, the remaining nineteen are
-KDA + MoE -- plus the step around it: ``embed``, the walk, ``final_rms_norm``,
-``lm_head``.
-
-Provenance
-----------
-The ``@func`` bodies for the three mixers and the MoE are the shipped source,
-copied verbatim in what they compute. Three things change, and nothing else:
-
-1. **Weights become ``ConstTensor``.** The shipped model declares every
-   parameter a plain ``Tensor`` because its harness (``reference.py``) passes
-   weights explicitly to ``evaluate``. A shell loads: ``ConstTensor`` lands in
-   ``Module.weights``, ``load`` binds it, and ``prepare`` validates it
-   (migrate.md step one). Activations and caches stay ``Tensor``.
-2. **Per-weight converters.** The checkpoint is ``nn.Linear``-shaped -- every
-   projection is stored ``(out, in)`` against the ``(1, in, out)`` the matmuls
-   here want. ``A_log`` and ``dt_bias`` are stored f32 against their declared
-   bf16. Every norm gamma is flat: ``KimiRMSNorm`` is ``weight * normed`` with
-   no ``1 +`` offset (unlike Qwen3.5), so no norm carries a converter.
-3. **The stack and the step.** Two layer kinds per mixer -- the dense-MLP
-   layer 0 and the MoE layers -- sharing one walk, which composes Modules and
-   so cannot be a ``@func``.
-
-Decode, one token per step. ``S`` is the literal 1 and ``ctx_len`` is the only
-range, exactly as the shipped model states it. The KV cache is explicit tensors
-in and out:
-
-- ``mla_attention`` reads ``ctx_len`` prior positions and returns this token's
-  own key and value. The caller **appends** (``append_cache`` below).
-- ``kda_attention`` reads a fixed-size recurrent state and three fixed-size
-  convolution windows and returns all four updated. The caller **replaces**.
-
-Kimi's MLA is NoPE (``mla_use_nope: true``): the 64 rotary-half dimensions are
-not rotated, which ``prepare_inputs_for_generation`` expresses by handing the
-mixer ``cos = 1, sin = 0`` -- the identity by the arithmetic of
-``apply_rotary_pos_emb``, as the shipped model's docstring records.
-
-Weight layout in the checkpoint (``model.safetensors.index.json``): experts are
-stored per-expert as ``block_sparse_moe.experts.{i}.w1/w2/w3.weight`` (w1 gate,
-w3 up, w2 down -- ``KimiBlockSparseMLP``), so ``w_gate``/``w_up``/``w_down``
-here are one-to-many alias groups that ``prepare`` stacks; every other weight
-is one tensor. ``hf_alias`` at the bottom is the {canonical: raw} table.
+This is the sole authored model: a whole prompt enters, 27 prefill layers run,
+and the last position produces logits. KDA recurrence is represented by the
+HIR-only ``tf.kda_prefill`` external op. No decode function or cache handoff is
+part of this tree.
 """
 from __future__ import annotations
 
@@ -54,6 +11,7 @@ import json
 from pathlib import Path
 from typing import Optional
 
+import ops  # noqa: F401 -- registers external tf ops
 from transformers.configuration_utils import PretrainedConfig
 
 from tilefoundry import DType, func, module
@@ -64,7 +22,6 @@ from tilefoundry.ir.types.dim import DimVar
 from tilefoundry.ir.types.shard import Topology
 from tilefoundry.runtime import Absolute
 from tilefoundry.target import CudaTarget
-
 
 # ── the checkpoint's own configuration class ─────────────────────────────────
 #
@@ -227,40 +184,45 @@ def published(path: Path | None = None) -> KimiLinearConfig:
     return KimiLinearConfig(**json.loads(path.read_text(encoding="utf-8")))
 
 
+
+
+def _layer_kinds(cfg: KimiLinearConfig) -> tuple:
+    """Each published layer's (mixer, FFN) kind in stack order."""
+    kinds = []
+    for index in range(cfg.num_hidden_layers):
+        mixer = "kda" if cfg.is_kda_layer(index) else "mla"
+        moe = (
+            cfg.num_experts is not None
+            and index >= cfg.first_k_dense_replace
+            and index % cfg.moe_layer_freq == 0
+        )
+        kinds.append((mixer, "moe" if moe else "dense"))
+    return tuple(kinds)
+
+
 def build(cfg: KimiLinearConfig):
-    """This model at *cfg*: the mixers, the two layer kinds each mixer heads,
-    and the root that walks them.
+    """This model's prefill shell at *cfg*, mirroring ``model.build``.
 
-    Public because the model is asked about at more than one structural
-    configuration -- ``published()``, or a reduced one a test builds to prepare
-    and load cheaply. Callers name the cfg they mean and get a tree that
-    shares no IR node with any other call's.
+    The prompt length is the one range this tree carries; everything else is
+    the published dimension. The layer-kind table and every function are built directly from the config.
     """
-    # The prior-cache length the MLA submodule reads: the only range this model
-    # carries. Zero is a first step, and the exclusive upper bound comes from
-    # the published configuration.
-    C = DimVar("ctx_len", 0, cfg.model_max_length)
-
-    # One token per step.
-    S = 1
+    # The prompt length: one token at minimum, the published horizon at most.
+    S = DimVar("seq_len", 1, cfg.model_max_length)
 
     _HID = cfg.hidden_size               # 2304
-    _H = cfg.num_attention_heads         # 32, MLA and KDA alike
+    _H = cfg.num_attention_heads         # 32
     _NOPE = cfg.qk_nope_head_dim         # 128
-    _ROPE = cfg.qk_rope_head_dim         # 64
+    _ROPE = cfg.qk_rope_head_dim         # 64, carried unrotated (NoPE)
     _QK = _NOPE + _ROPE                     # 192, the score dim and so the scaling one
     _V = cfg.v_head_dim                  # 128
     _KVB = _NOPE + _V                       # 256, kv_b_proj's per-head output
 
-    # KDA's dimensions are published nested, and its head_dim is not the top-level
-    # one: `head_dim: 72` is hidden_size // num_attention_heads and is read by
-    # neither path -- KDA uses 128 and MLA uses 192 (q/k) and 128 (v).
     _KDA = cfg.linear_attn_config
     _KH = _KDA["num_heads"]                 # 32
     _KD = _KDA["head_dim"]                  # 128
     _KP = _KH * _KD                         # 4096
-    _W = _KDA["short_conv_kernel_size"]     # 4
-    _WS = _W - 1                            # 3 stored positions
+    _W = _KDA["short_conv_kernel_size"]      # 4 convolution taps
+    _WS = _W - 1                              # 3 left-padding positions
 
     _E = cfg.num_experts
     _TOPK = cfg.num_experts_per_token
@@ -271,87 +233,18 @@ def build(cfg: KimiLinearConfig):
 
     _EPS = cfg.rms_norm_eps
 
-    # The published dtype as the DSL spells it. The checkpoint stores its weights
-    # at this precision, so it is what a kernel reading them consumes.
     _DT = {"bfloat16": "bf16", "float16": "f16", "float32": "f32"}[
         str(cfg.dtype).removeprefix("torch.")
     ]
 
-    @module(entry="kda_attention")
-    class KimiKda:
-        """A KDA layer's mixer: Kimi Delta Attention, decode step.
+    LAYER_KINDS = _layer_kinds(cfg)
 
-        A gated delta rule whose forget gate is **per channel**: ``g`` is a
-        128-wide vector per head and the state decays column by column, which is
-        what makes it KDA rather than the scalar-per-head gated delta net that
-        ships as ``Qwen3NextGatedDeltaNet``. Body transcribed from vLLM's
-        ``KimiDeltaAttention.forward`` and the ``fused_recurrent_kda`` kernel
-        body; see the shipped model for the full provenance.
-        """
+    @module(entry="kda_prefill")
+    class KimiKdaPrefill:
+        """KDA projections and gates over S, with one external recurrence."""
 
         @func
-        def short_conv(
-            x: Tensor[(1, S, _KP), _DT],
-            conv_w: Tensor[(_W, _KP), _DT],
-            conv_state: Tensor[(1, _WS, _KP), _DT],
-        ):
-            # Causal depthwise convolution of kernel 4 with a silu, evaluated for one
-            # token: the window is the three stored positions followed by this one, so
-            # the convolution is a weighted sum over the window's time axis rather
-            # than a sliding op. Returns the activation and the window to store next,
-            # which is this window with its oldest position dropped.
-            # `conv_w` stays a plain Tensor: a Module's weights are keyed by name,
-            # and the entry declares this weight three times (q/k/v), so the helper
-            # cannot share one ConstTensor name with it. Every call site passes the
-            # weight explicitly, which a plain Tensor requires anyway.
-            window = tf.concat([conv_state, x], axis=1)
-            acc = tf.reduce(
-                window
-                * tf.reshape(
-                    conv_w,
-                    new_shape=(1, _W, _KP),
-                ),
-                axes=(1,),
-                keepdim=True,
-                kind="sum",
-            )
-            out = tf.silu(acc)
-            state_next = window[:, 1 : _W, :]
-            return out, state_next
-
-        @func
-        def l2_normalize(
-            x: Tensor[(1, S, _KH, _KD), _DT],
-        ) -> Tensor[(1, S, _KH, _KD), _DT]:
-            # x / sqrt(sum(x*x) + 1e-6), per head. The epsilon sits inside the square
-            # root, matching the kernel; it is not an rms_norm, which would divide by
-            # the *mean* of the squares and carry a weight.
-            sq = tf.reduce(tf.square(x), axes=(-1,), keepdim=True, kind="sum")
-            return x * tf.rsqrt(sq + tf.full_like(sq, value=1e-6))
-
-        @func
-        def kda_gate(
-            hidden_norm: Tensor[(1, S, _HID), _DT],
-            w_f_a: ConstTensor[(1, _HID, _KD), _DT],
-            w_f_b: ConstTensor[(1, _KD, _KP), _DT],
-            dt_bias: ConstTensor[(_KP,), _DT],
-            a_log: ConstTensor[(_KH,), _DT],
-        ) -> Tensor[(1, S, _KH, _KD), _DT]:
-            # The per-channel forget gate: a low-rank projection through
-            # kda_head_dim, biased, softplus'd, and scaled by -exp(A_log) per head.
-            # softplus here is beta=1, which is what the kernel computes; the kernel's
-            # threshold=20 switch to the linear branch is a numerical guard on the
-            # same function, not a different one.
-            low = tf.matmul(hidden_norm, w_f_a)
-            g_raw = tf.reshape(
-                tf.matmul(low, w_f_b) + dt_bias,
-                new_shape=(1, S, _KH, _KD),
-            )
-            decay_rate = -tf.exp(tf.reshape(a_log, new_shape=(1, 1, _KH, 1)))
-            return decay_rate * tf.softplus(g_raw)
-
-        @func
-        def kda_attention(
+        def kda_prefill(
             hidden: Tensor[(1, S, _HID), _DT],
             gamma_in: ConstTensor[(_HID,), _DT],
             w_q: ConstTensor[(1, _HID, _KP), _DT],
@@ -360,9 +253,6 @@ def build(cfg: KimiLinearConfig):
             conv_w_q: ConstTensor[(_W, _KP), _DT],
             conv_w_k: ConstTensor[(_W, _KP), _DT],
             conv_w_v: ConstTensor[(_W, _KP), _DT],
-            conv_state_q: Tensor[(1, _WS, _KP), _DT],
-            conv_state_k: Tensor[(1, _WS, _KP), _DT],
-            conv_state_v: Tensor[(1, _WS, _KP), _DT],
             w_f_a: ConstTensor[(1, _HID, _KD), _DT],
             w_f_b: ConstTensor[(1, _KD, _KP), _DT],
             dt_bias: ConstTensor[(_KP,), _DT],
@@ -372,69 +262,23 @@ def build(cfg: KimiLinearConfig):
             w_g_b: ConstTensor[(1, _KD, _KP), _DT],
             gamma_o: ConstTensor[(_KD,), _DT],
             w_o: ConstTensor[(1, _KP, _HID), _DT],
-            state: Tensor[(1, _KH, _KD, _KD), _DT],
-            scale: Tensor[(1, 1, 1), _DT],
-        ):
-            # One decode step. Returns the output, the updated recurrent state, and
-            # the three updated convolution windows -- all fixed size, none carrying
-            # ctx_len. The caller replaces rather than appends.
-            # `KimiRMSNorm` ends `self.weight * hidden_states.to(input_dtype)`: the
-            # normalised value is rounded to the input dtype before the learned scale
-            # multiplies it. `tf.rms_norm` is the generic op and keeps f32 through
-            # that multiply.
+        ) -> Tensor[(1, S, _HID), _DT]:
             hn32 = tf.cast(hidden, dtype="f32")
             hn_var = tf.reduce(hn32 * hn32, axes=(-1,), keepdim=True, kind="mean")
-            hn = tf.cast(hn32 * tf.rsqrt(hn_var + _EPS), dtype="bf16") * gamma_in
+            hn = tf.cast(hn32 * tf.rsqrt(hn_var + _EPS), dtype=_DT) * gamma_in
+            q = tf.reshape(tf.causal_depthwise_conv1d(tf.matmul(hn, w_q), conv_w_q), new_shape=(1, S, _KH, _KD))
+            k = tf.reshape(tf.causal_depthwise_conv1d(tf.matmul(hn, w_k), conv_w_k), new_shape=(1, S, _KH, _KD))
+            v = tf.reshape(tf.causal_depthwise_conv1d(tf.matmul(hn, w_v), conv_w_v), new_shape=(1, S, _KH, _KD))
+            g_raw = tf.reshape(tf.matmul(tf.matmul(hn, w_f_a), w_f_b) + dt_bias, new_shape=(1, S, _KH, _KD))
+            decay_rate = -tf.exp(tf.reshape(a_log, new_shape=(1, 1, _KH, 1)))
+            g = decay_rate * tf.softplus(g_raw)
+            beta = tf.reshape(tf.sigmoid(tf.matmul(hn, w_b)), new_shape=(1, S, _KH))
+            recurrent = tf.kda_prefill(q, k, v, g, beta, scale=_KD ** -0.5)
+            g2 = tf.reshape(tf.matmul(tf.matmul(hn, w_g_a), w_g_b), new_shape=(1, S, _KH, _KD))
+            gated = tf.rms_norm(recurrent, gamma_o, eps=_EPS) * tf.sigmoid(g2)
+            return tf.matmul(tf.reshape(gated, new_shape=(1, S, _KP)), w_o)
 
-            q_c, conv_q_next = short_conv(tf.matmul(hn, w_q), conv_w_q, conv_state_q)
-            k_c, conv_k_next = short_conv(tf.matmul(hn, w_k), conv_w_k, conv_state_k)
-            v_c, conv_v_next = short_conv(tf.matmul(hn, w_v), conv_w_v, conv_state_v)
-
-            q_h = tf.reshape(q_c, new_shape=(1, S, _KH, _KD))
-            k_h = tf.reshape(k_c, new_shape=(1, S, _KH, _KD))
-            v_h = tf.reshape(v_c, new_shape=(1, S, _KH, _KD))
-
-            # l2 normalisation happens inside the kernel, before the scale.
-            q_n = l2_normalize(q_h)
-            k_n = l2_normalize(k_h)
-            q_s = tf.reshape(q_n, new_shape=(1, _KH, 1, _KD)) * scale
-
-            g = kda_gate(hn, w_f_a, w_f_b, dt_bias, a_log)
-            beta = tf.reshape(
-                tf.sigmoid(tf.matmul(hn, w_b)), new_shape=(1, _KH, 1)
-            )
-
-            # The delta rule, one token. The state is [heads, v_dim, k_dim]; the decay
-            # multiplies it column-wise along k_dim, which is the per-channel gate.
-            decay = tf.reshape(tf.exp(g), new_shape=(1, _KH, 1, _KD))
-            k_r = tf.reshape(k_n, new_shape=(1, _KH, 1, _KD))
-            h_decayed = state * decay
-            kv_mem = tf.reduce(h_decayed * k_r, axes=(-1,), keepdim=False, kind="sum")
-            delta = (tf.reshape(v_h, new_shape=(1, _KH, _KD)) - kv_mem) * beta
-            state_next = (
-                h_decayed + tf.reshape(delta, new_shape=(1, _KH, _KD, 1)) * k_r
-            )
-            attn = tf.reduce(state_next * q_s, axes=(-1,), keepdim=False, kind="sum")
-
-            # Gated output norm: rms_norm(attn) * sigmoid(g2), the "sigmoid" activation
-            # of the kernel's fused gated RMSNorm -- not a swish, which would be
-            # g2 * sigmoid(g2).
-            g2 = tf.reshape(
-                tf.matmul(tf.matmul(hn, w_g_a), w_g_b), new_shape=(1, _KH, _KD)
-            )
-            gated = tf.rms_norm(attn, gamma_o, eps=_EPS) * tf.sigmoid(g2)
-            out = tf.matmul(tf.reshape(gated, new_shape=(1, S, _KP)), w_o)
-            return out, state_next, conv_q_next, conv_k_next, conv_v_next
-
-        # ---- raw checkpoint -> declared weight ---------------------------
-        #
-        # Every projection is an `nn.Linear`, stored (out, in) against the
-        # (1, in, out) the matmuls above want. `gamma_in` and `gamma_o` are
-        # flat (`KimiRMSNorm` / the gated RMSNorm carry no `1 +` offset) and
-        # need no converter; `gamma_in` is the layer's `input_layernorm`, which
-        # the alias table addresses Absolutely.
-
-        @kda_attention.converter("w_q")
+        @kda_prefill.converter("w_q")
         def _(
             q_proj_weight: ConstTensor[(_KP, _HID), _DT],
         ) -> Tensor[(1, _HID, _KP), _DT]:
@@ -442,7 +286,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(q_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _KP)
             )
 
-        @kda_attention.converter("w_k")
+        @kda_prefill.converter("w_k")
         def _(
             k_proj_weight: ConstTensor[(_KP, _HID), _DT],
         ) -> Tensor[(1, _HID, _KP), _DT]:
@@ -450,7 +294,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(k_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _KP)
             )
 
-        @kda_attention.converter("w_v")
+        @kda_prefill.converter("w_v")
         def _(
             v_proj_weight: ConstTensor[(_KP, _HID), _DT],
         ) -> Tensor[(1, _HID, _KP), _DT]:
@@ -458,7 +302,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(v_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _KP)
             )
 
-        @kda_attention.converter("conv_w_q")
+        @kda_prefill.converter("conv_w_q")
         def _(
             q_conv1d_weight: ConstTensor[(_KP, 1, _W), _DT],
         ) -> Tensor[(_W, _KP), _DT]:
@@ -468,7 +312,7 @@ def build(cfg: KimiLinearConfig):
                 tf.reshape(q_conv1d_weight, new_shape=(_KP, _W)), perm=(1, 0)
             )
 
-        @kda_attention.converter("conv_w_k")
+        @kda_prefill.converter("conv_w_k")
         def _(
             k_conv1d_weight: ConstTensor[(_KP, 1, _W), _DT],
         ) -> Tensor[(_W, _KP), _DT]:
@@ -476,7 +320,7 @@ def build(cfg: KimiLinearConfig):
                 tf.reshape(k_conv1d_weight, new_shape=(_KP, _W)), perm=(1, 0)
             )
 
-        @kda_attention.converter("conv_w_v")
+        @kda_prefill.converter("conv_w_v")
         def _(
             v_conv1d_weight: ConstTensor[(_KP, 1, _W), _DT],
         ) -> Tensor[(_W, _KP), _DT]:
@@ -484,7 +328,7 @@ def build(cfg: KimiLinearConfig):
                 tf.reshape(v_conv1d_weight, new_shape=(_KP, _W)), perm=(1, 0)
             )
 
-        @kda_attention.converter("w_f_a")
+        @kda_prefill.converter("w_f_a")
         def _(
             f_a_proj_weight: ConstTensor[(_KD, _HID), _DT],
         ) -> Tensor[(1, _HID, _KD), _DT]:
@@ -492,7 +336,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(f_a_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _KD)
             )
 
-        @kda_attention.converter("w_f_b")
+        @kda_prefill.converter("w_f_b")
         def _(
             f_b_proj_weight: ConstTensor[(_KP, _KD), _DT],
         ) -> Tensor[(1, _KD, _KP), _DT]:
@@ -500,21 +344,21 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(f_b_proj_weight, perm=(1, 0)), new_shape=(1, _KD, _KP)
             )
 
-        @kda_attention.converter("dt_bias")
+        @kda_prefill.converter("dt_bias")
         def _(
             dt_bias_raw: ConstTensor[(_KP,), "f32"],
         ) -> Tensor[(_KP,), _DT]:
             # Stored f32; declared at the kernel's own dtype.
             return tf.cast(dt_bias_raw, dtype=_DT)
 
-        @kda_attention.converter("a_log")
+        @kda_prefill.converter("a_log")
         def _(
             a_log_raw: ConstTensor[(1, 1, _KH, 1), "f32"],
         ) -> Tensor[(_KH,), _DT]:
             # Stored f32 as (1, 1, heads, 1); declared bf16 (heads,).
             return tf.cast(tf.reshape(a_log_raw, new_shape=(_KH,)), dtype=_DT)
 
-        @kda_attention.converter("w_b")
+        @kda_prefill.converter("w_b")
         def _(
             b_proj_weight: ConstTensor[(_KH, _HID), _DT],
         ) -> Tensor[(1, _HID, _KH), _DT]:
@@ -522,7 +366,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(b_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _KH)
             )
 
-        @kda_attention.converter("w_g_a")
+        @kda_prefill.converter("w_g_a")
         def _(
             g_a_proj_weight: ConstTensor[(_KD, _HID), _DT],
         ) -> Tensor[(1, _HID, _KD), _DT]:
@@ -530,7 +374,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(g_a_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _KD)
             )
 
-        @kda_attention.converter("w_g_b")
+        @kda_prefill.converter("w_g_b")
         def _(
             g_b_proj_weight: ConstTensor[(_KP, _KD), _DT],
         ) -> Tensor[(1, _KD, _KP), _DT]:
@@ -538,7 +382,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(g_b_proj_weight, perm=(1, 0)), new_shape=(1, _KD, _KP)
             )
 
-        @kda_attention.converter("w_o")
+        @kda_prefill.converter("w_o")
         def _(
             o_proj_weight: ConstTensor[(_HID, _KP), _DT],
         ) -> Tensor[(1, _KP, _HID), _DT]:
@@ -546,47 +390,43 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(o_proj_weight, perm=(1, 0)), new_shape=(1, _KP, _HID)
             )
 
-    @module(entry="mla_attention")
-    class KimiMla:
-        """An MLA layer's mixer: multi-head latent attention, decode step.
 
-        Mirrors ``DeepseekV3Attention.forward`` at Kimi's ranks, which is the
-        same parameter set ``KimiMLAAttention`` builds: ``q_lora_rank`` null so
-        a plain ``q_proj``, ``kv_a_proj_with_mqa`` (512 + 64 out),
-        ``kv_a_layernorm``, ``kv_b_proj`` (32 * (128 + 128) out), ``o_proj``.
+    @module(entry="mla_prefill")
+    class KimiMlaPrefill:
+        """An MLA layer's mixer over a whole prompt.
+
+        The projection path is the decode step's, evaluated for S positions
+        in one pass; the attention is the textbook masked-softmax form the
+        HF eager reference (``eager_attention_forward`` reached from
+        ``KimiMLAAttention.forward``) computes. The cache this layer owns is
+        built, not read: prefill starts from no context.
         """
 
         @func
-        def mla_attention(
+        def mla_prefill(
             hidden: Tensor[(1, S, _HID), _DT],
             gamma_in: ConstTensor[(_HID,), _DT],
             w_q: ConstTensor[(1, _HID, (_H * _QK)), _DT],
             w_kv_a: ConstTensor[(1, _HID, (cfg.kv_lora_rank + _ROPE)), _DT],
             gamma_kv_a: ConstTensor[(cfg.kv_lora_rank,), _DT],
             w_kv_b: ConstTensor[(1, cfg.kv_lora_rank, (_H * _KVB)), _DT],
-            cos_cache: Tensor[(S, cfg.qk_rope_head_dim), _DT],
-            sin_cache: Tensor[(S, cfg.qk_rope_head_dim), _DT],
-            pos_ids: Tensor[(S,), "i32"],
-            k_cache: Tensor[(1, C, _H, _QK), _DT],
-            v_cache: Tensor[(1, C, _H, _V), _DT],
             scale: Tensor[(1, 1, 1, 1), _DT],
             w_o: ConstTensor[(1, (_H * _V), _HID), _DT],
         ):
-            # Fused input RMSNorm + MLA, no residual (the layer owns that). Returns
-            # the attention output with this token's key and value for the caller to
-            # append.
+            # Fused input RMSNorm (round-before-gamma, as KimiRMSNorm) + MLA
+            # over the prompt, no residual (the layer owns that). Returns the
+            # per-position output and the prompt's keys and values, which the
+            # caller adopts as the decode cache.
             hn32 = tf.cast(hidden, dtype="f32")
             hn_var = tf.reduce(hn32 * hn32, axes=(-1,), keepdim=True, kind="mean")
             hn = tf.cast(hn32 * tf.rsqrt(hn_var + _EPS), dtype="bf16") * gamma_in
 
-            # The query is a plain projection here: q_lora_rank is null, so there is
+            # The query is a plain projection: q_lora_rank is null, so there is
             # no q_a/q_b pair to fold.
             q = tf.reshape(tf.matmul(hn, w_q), new_shape=(1, S, _H, _QK))
-            q_pass = q[:, :, :, :_NOPE]
-            q_rot = q[:, :, :, _NOPE:_QK]
 
-            # One projection yields the latent and the rope part together, and the
-            # rope part is shared across heads -- that is the "MQA" in
+            # One projection yields the latent and the rope-width part together,
+            # and that part is shared across heads -- the "MQA" in
             # kv_a_proj_with_mqa.
             compressed = tf.matmul(hn, w_kv_a)
             latent = compressed[:, :, : cfg.kv_lora_rank]
@@ -600,52 +440,57 @@ def build(cfg: KimiLinearConfig):
                 new_shape=(1, S, _H, _KVB),
             )
             k_nope = kv[:, :, :, :_NOPE]
-            v_new = kv[:, :, :, _NOPE:_KVB]
+            v_all = kv[:, :, :, _NOPE:_KVB]
 
-            # Rotate the shared 64-wide part once, then broadcast it over the heads;
-            # repeat_interleave on a length-1 axis is that broadcast.
-            k_rot_1 = tf.reshape(k_rot_shared, new_shape=(1, S, 1, _ROPE))
-            _kq, k_rot = tf.rope(k_rot_1, k_rot_1, cos_cache, sin_cache, pos_ids)
-            k_rot_h = tf.repeat_interleave(k_rot, repeats=_H, axis=2)
-            q_rot_r, _kr = tf.rope(q_rot, q_rot, cos_cache, sin_cache, pos_ids)
+            # NoPE: the shared 64-wide part is broadcast over the heads
+            # *unrotated*. The checkpoint asserts mla_use_nope and the oracle's
+            # forward applies no rotary at all, so there are no cos/sin inputs
+            # here -- decode's cos = 1, sin = 0 identity is this same fact.
+            k_rot_h = tf.repeat_interleave(
+                tf.reshape(k_rot_shared, new_shape=(1, S, 1, _ROPE)), repeats=_H, axis=2
+            )
+            k_all = tf.concat([k_nope, k_rot_h], axis=-1)
 
-            q_full = tf.concat([q_pass, q_rot_r], axis=-1)
-            k_new = tf.concat([k_nope, k_rot_h], axis=-1)
+            # Heads-first for the batched score matmul. Every key head serves
+            # exactly one query head (num_key_value_heads == num_attention_heads),
+            # so there is no GQA expansion.
+            q_h = tf.transpose(q, perm=(0, 2, 1, 3))
+            k_h = tf.transpose(k_all, perm=(0, 2, 1, 3))
+            v_h = tf.transpose(v_all, perm=(0, 2, 1, 3))
 
-            # Online softmax over two differently shaped score groups: the cache and
-            # the token itself. No mask -- one query at the end of the context may
-            # attend every position there is. Every key/value head serves exactly one
-            # query head here (num_key_value_heads == num_attention_heads), so there
-            # is no GQA expansion.
-            q_s = q_full * scale
-            k_ctx = tf.reshape(
-                tf.transpose(k_cache, perm=(0, 2, 1, 3)), new_shape=(1, 1, _H, C, _QK)
-            )
-            v_ctx = tf.reshape(
-                tf.transpose(v_cache, perm=(0, 2, 1, 3)), new_shape=(1, 1, _H, C, _V)
-            )
-            q_e = tf.reshape(q_s, new_shape=(1, S, _H, 1, _QK))
-            score_ctx = tf.reduce(q_e * k_ctx, axes=(-1,), keepdim=True, kind="sum")
-            score_new = tf.reduce(q_s * k_new, axes=(-1,), keepdim=True, kind="sum")
+            # HF eager scales the scores after the matmul, by the scalar; the
+            # order is kept so the two agree at the same rounding points.
+            scores = tf.matmul(q_h, tf.transpose(k_h, perm=(0, 1, 3, 2))) * scale
 
-            peak = tf.max(
-                tf.reduce(score_ctx, axes=(-2,), keepdim=False, kind="max"), score_new
+            # The causal mask, stated as data: a position may attend itself and
+            # everything before it. -1e30 stands in for the additive
+            # torch.finfo(bf16).min mask HF builds; both vanish in the softmax.
+            pos = tf.arange(Tensor[(S,), "i64"])
+            keep = tf.cmp_ge(
+                tf.reshape(pos, new_shape=(S, 1)), tf.reshape(pos, new_shape=(1, S))
             )
-            peak_e = tf.reshape(peak, new_shape=(1, S, _H, 1, 1))
-            p_ctx = tf.exp(score_ctx - peak_e)
-            p_new = tf.exp(score_new - peak)
-            total = tf.reduce(p_ctx, axes=(-2,), keepdim=False, kind="sum") + p_new
-            weighted = (
-                tf.reduce(p_ctx * v_ctx, axes=(-2,), keepdim=False, kind="sum")
-                + p_new * v_new
+            masked = tf.where(keep, scores, tf.full_like(scores, value=-1e30))
+
+            # tf.softmax normalises in f32 and rounds back to bf16 -- precisely
+            # softmax(..., dtype=torch.float32).to(query.dtype).
+            probs = tf.softmax(masked, axis=-1)
+            attn = tf.matmul(probs, v_h)
+            out = tf.matmul(
+                tf.reshape(
+                    tf.transpose(attn, perm=(0, 2, 1, 3)), new_shape=(1, S, (_H * _V))
+                ),
+                w_o,
             )
-            attn = weighted / total
-            out = tf.matmul(tf.reshape(attn, new_shape=(1, S, (_H * _V))), w_o)
-            return out, k_new, v_new
+            return out, k_all, v_all
 
         # ---- raw checkpoint -> declared weight ---------------------------
+        #
+        # Identical to the decode mixer's: the projections are the same
+        # tensors, stored (out, in) against the (1, in, out) the matmuls want.
+        # `gamma_in` is the layer's `input_layernorm` (Absolutely addressed,
+        # no converter: `KimiRMSNorm` is flat).
 
-        @mla_attention.converter("w_q")
+        @mla_prefill.converter("w_q")
         def _(
             q_proj_weight: ConstTensor[((_H * _QK), _HID), _DT],
         ) -> Tensor[(1, _HID, (_H * _QK)), _DT]:
@@ -653,7 +498,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(q_proj_weight, perm=(1, 0)), new_shape=(1, _HID, (_H * _QK))
             )
 
-        @mla_attention.converter("w_kv_a")
+        @mla_prefill.converter("w_kv_a")
         def _(
             kv_a_proj_weight: ConstTensor[((cfg.kv_lora_rank + _ROPE), _HID), _DT],
         ) -> Tensor[(1, _HID, (cfg.kv_lora_rank + _ROPE)), _DT]:
@@ -662,7 +507,7 @@ def build(cfg: KimiLinearConfig):
                 new_shape=(1, _HID, (cfg.kv_lora_rank + _ROPE)),
             )
 
-        @mla_attention.converter("w_kv_b")
+        @mla_prefill.converter("w_kv_b")
         def _(
             kv_b_proj_weight: ConstTensor[((_H * _KVB), cfg.kv_lora_rank), _DT],
         ) -> Tensor[(1, cfg.kv_lora_rank, (_H * _KVB)), _DT]:
@@ -671,7 +516,7 @@ def build(cfg: KimiLinearConfig):
                 new_shape=(1, cfg.kv_lora_rank, (_H * _KVB)),
             )
 
-        @mla_attention.converter("w_o")
+        @mla_prefill.converter("w_o")
         def _(
             o_proj_weight: ConstTensor[(_HID, (_H * _V)), _DT],
         ) -> Tensor[(1, (_H * _V), _HID), _DT]:
@@ -679,28 +524,24 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(o_proj_weight, perm=(1, 0)), new_shape=(1, (_H * _V), _HID)
             )
 
-    @module(entry="moe")
-    class KimiMoe:
-        """The MoE every non-dense layer holds: sigmoid router, 256 experts,
-        top-8, one shared expert.
+    @module(entry="moe_prefill")
+    class KimiMoePrefill:
+        """The MoE over a whole prompt: the decode block with the token axis open.
 
-        Selection reads ``sigmoid(logits) + e_score_correction_bias``; the
-        routing weights are selected from the *unbiased* sigmoid scores. So the
-        bias moves *which* experts run without appearing in *how much* they
-        count. ``num_expert_group = topk_group = 1`` makes the published
-        grouped-top-k the identity -- one group holds every expert -- so there
-        is no group stage here.
+        The block is position-wise, so the body is the decode body's with S
+        the prompt length; selection, weighting, and the fused post-norm are
+        unchanged token by token.
         """
 
         @func
-        def router(
+        def router_prefill(
             tokens: Tensor[(S, _HID), _DT],
             w_router: ConstTensor[(_HID, _E), _DT],
             bias: ConstTensor[(_E,), _DT],
             routed_scale: Tensor[(1, 1), _DT],
         ):
-            # f32 throughout: selection has to agree with the oracle's, and a top-k
-            # over bf16 scores can tie differently.
+            # f32 throughout: selection has to agree with the oracle's, and a
+            # top-k over bf16 scores can tie differently.
             logits = tf.cast(tf.matmul(tokens, w_router), dtype="f32")
             scores = tf.sigmoid(logits)
             biased = scores + tf.cast(bias, dtype="f32")
@@ -717,23 +558,21 @@ def build(cfg: KimiLinearConfig):
             )
             unbiased = top_biased - tf.cast(selected_bias, dtype="f32")
             denom = tf.reduce(unbiased, axes=(-1,), keepdim=True, kind="sum")
-            # normalise, *then* scale: moe_renormalize is true and the scaling factor
-            # is applied to the normalised weights, not folded into the denominator.
+            # normalise, *then* scale: moe_renormalize is true and the scaling
+            # factor is applied to the normalised weights, not folded into the
+            # denominator.
             weights = unbiased / denom * tf.cast(routed_scale, dtype="f32")
             return tf.cast(weights, dtype=_DT), indices
 
         @func
-        def shared_expert(
+        def shared_expert_prefill(
             tokens: Tensor[(S, _HID), _DT],
             sh_gate: ConstTensor[(1, _HID, _SI), _DT],
             sh_up: ConstTensor[(1, _HID, _SI), _DT],
             sh_down: ConstTensor[(1, _SI, _HID), _DT],
         ) -> Tensor[(S, _HID), _DT]:
             # One dense SwiGLU expert every token pays for, unscaled: the routed
-            # scaling factor applies to the routed branch only. Parameters are
-            # named as `moe` names them: one Module's weights are keyed by name,
-            # so a shared expert weight called `w_gate` here would collide with
-            # the expert stack `moe` declares under that name.
+            # scaling factor applies to the routed branch only.
             x = tf.reshape(tokens, new_shape=(1, S, _HID))
             gate = tf.matmul(x, sh_gate)
             up = tf.matmul(x, sh_up)
@@ -741,29 +580,30 @@ def build(cfg: KimiLinearConfig):
             return tf.reshape(tf.matmul(h, sh_down), new_shape=(S, _HID))
 
         @func
-        def moe(
+        def moe_prefill(
             hidden: Tensor[(1, S, _HID), _DT],
             gamma_post: ConstTensor[(_HID,), _DT],
             w_router: ConstTensor[(_HID, _E), _DT],
             bias: ConstTensor[(_E,), _DT],
             routed_scale: Tensor[(1, 1), _DT],
-            w_gate: ConstTensor[(_E, cfg.moe_intermediate_size, _HID), _DT],
-            w_up: ConstTensor[(_E, cfg.moe_intermediate_size, _HID), _DT],
+            w_gate_up: ConstTensor[(_E, (2 * _MI), _HID), _DT],
             w_down: ConstTensor[(_E, _HID, cfg.moe_intermediate_size), _DT],
             sh_gate: ConstTensor[(1, _HID, _SI), _DT],
             sh_up: ConstTensor[(1, _HID, _SI), _DT],
             sh_down: ConstTensor[(1, _SI, _HID), _DT],
         ) -> Tensor[(1, S, _HID), _DT]:
-            # Fused post-attention RMSNorm + MoE, no residual (the layer owns that).
+            # Fused post-attention RMSNorm + MoE, no residual (the layer owns
+            # that).
             hn32 = tf.cast(hidden, dtype="f32")
             hn_var = tf.reduce(hn32 * hn32, axes=(-1,), keepdim=True, kind="mean")
             hn = tf.cast(hn32 * tf.rsqrt(hn_var + _EPS), dtype="bf16") * gamma_post
             tokens = tf.reshape(hn, new_shape=(S, _HID))
-            weights, indices = router(tokens, w_router, bias, routed_scale)
+            weights, indices = router_prefill(tokens, w_router, bias, routed_scale)
 
-            # Expert selection is runtime data: the indices select the
-            # expert weights and a batched matmul over [tokens, top_k]. No static
-            # 256-way expansion and no Python control flow.
+            # The checkpoint ABI is one packed gate/up tensor. HIR exposes its
+            # two semantic halves as static views without a prefill-time concat.
+            w_gate = w_gate_up[:, :_MI, :]
+            w_up = w_gate_up[:, _MI:(2 * _MI), :]
             flat_indices = tf.reshape(indices, new_shape=(S * _TOPK,))
             g_sel = tf.reshape(
                 tf.index_select(w_gate, flat_indices, dim=0),
@@ -789,19 +629,17 @@ def build(cfg: KimiLinearConfig):
                 keepdim=False,
                 kind="sum",
             )
-            shared = shared_expert(tokens, sh_gate, sh_up, sh_down)
+            shared = shared_expert_prefill(tokens, sh_gate, sh_up, sh_down)
             return tf.reshape(routed + shared, new_shape=(1, S, _HID))
 
         # ---- raw checkpoint -> declared weight ---------------------------
         #
+        # Identical to the decode block's: same tensors, same stores.
         # `gamma_post` is the layer's `post_attention_layernorm` (Absolutely
-        # addressed, no converter: `KimiRMSNorm` is flat). `bias` is stored as
-        # declared. `w_gate` / `w_up` / `w_down` are stored per expert as
-        # `experts.{i}.w1/w3/w2.weight`, already (out, in) per expert -- the
-        # alias table names the one-to-many group and `prepare` stacks it, so
-        # no converter. The shared expert is three `nn.Linear`s.
+        # addressed, no converter). The expert stacks are one-to-many alias
+        # groups that `prepare` stacks; the shared expert is three nn.Linears.
 
-        @moe.converter("w_router")
+        @moe_prefill.converter("w_router")
         def _(
             router_weight: ConstTensor[(_E, _HID), _DT],
         ) -> Tensor[(_HID, _E), _DT]:
@@ -809,7 +647,7 @@ def build(cfg: KimiLinearConfig):
             # other way.
             return tf.transpose(router_weight, perm=(1, 0))
 
-        @moe.converter("sh_gate")
+        @moe_prefill.converter("sh_gate")
         def _(
             shared_gate_proj_weight: ConstTensor[(_SI, _HID), _DT],
         ) -> Tensor[(1, _HID, _SI), _DT]:
@@ -817,7 +655,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(shared_gate_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _SI)
             )
 
-        @moe.converter("sh_up")
+        @moe_prefill.converter("sh_up")
         def _(
             shared_up_proj_weight: ConstTensor[(_SI, _HID), _DT],
         ) -> Tensor[(1, _HID, _SI), _DT]:
@@ -825,7 +663,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(shared_up_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _SI)
             )
 
-        @moe.converter("sh_down")
+        @moe_prefill.converter("sh_down")
         def _(
             shared_down_proj_weight: ConstTensor[(_HID, _SI), _DT],
         ) -> Tensor[(1, _SI, _HID), _DT]:
@@ -833,14 +671,16 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(shared_down_proj_weight, perm=(1, 0)), new_shape=(1, _SI, _HID)
             )
 
-    @module(entry="mlp")
-    class KimiDenseMlp:
-        """Layer 0's feed-forward: a dense SwiGLU (``KimiMLP``), which is what
-        ``first_k_dense_replace: 1`` puts in place of the MoE. Fused
-        post-attention RMSNorm, no residual (the layer owns that)."""
+    @module(entry="mlp_prefill")
+    class KimiDenseMlpPrefill:
+        """Layer 0's feed-forward over a whole prompt: a dense SwiGLU.
+
+        Fused post-attention RMSNorm, no residual (the layer owns that).
+        Position-wise, so the decode body with S open.
+        """
 
         @func
-        def mlp(
+        def mlp_prefill(
             hidden: Tensor[(1, S, _HID), _DT],
             gamma_post: ConstTensor[(_HID,), _DT],
             w_gate: ConstTensor[(1, _HID, _I), _DT],
@@ -856,7 +696,7 @@ def build(cfg: KimiLinearConfig):
 
         # ---- raw checkpoint -> declared weight ---------------------------
 
-        @mlp.converter("w_gate")
+        @mlp_prefill.converter("w_gate")
         def _(
             mlp_gate_proj_weight: ConstTensor[(_I, _HID), _DT],
         ) -> Tensor[(1, _HID, _I), _DT]:
@@ -864,7 +704,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(mlp_gate_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _I)
             )
 
-        @mlp.converter("w_up")
+        @mlp_prefill.converter("w_up")
         def _(
             mlp_up_proj_weight: ConstTensor[(_I, _HID), _DT],
         ) -> Tensor[(1, _HID, _I), _DT]:
@@ -872,7 +712,7 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(mlp_up_proj_weight, perm=(1, 0)), new_shape=(1, _HID, _I)
             )
 
-        @mlp.converter("w_down")
+        @mlp_prefill.converter("w_down")
         def _(
             mlp_down_proj_weight: ConstTensor[(_HID, _I), _DT],
         ) -> Tensor[(1, _I, _HID), _DT]:
@@ -880,38 +720,28 @@ def build(cfg: KimiLinearConfig):
                 tf.transpose(mlp_down_proj_weight, perm=(1, 0)), new_shape=(1, _I, _HID)
             )
 
-    def _moe_layer_forward(self, hidden, mixer_args, routed_scale):
-        """One decode step: mixer + residual, then MoE + residual.
+    # ── the layers ───────────────────────────────────────────────────────────
+    #
+    # Same two layer shapes as decode (mixer + residual, then FFN + residual),
+    # with the mixer step replaced by the prefill form of its kind. The KDA
+    # mixer is the decode module itself -- its step *is* the recurrence the
+    # prefill loops.
 
-        Mirrors ``KimiDecoderLayer.forward``. The two pre-norms are not here
-        because each block fuses its own -- the mixer fuses ``input_layernorm``
-        and the MoE block fuses ``post_attention_layernorm``.
-
-        *mixer_args* is what the mixer is handed after the hidden state, its
-        cache already spliced in. What comes back is the layer output and
-        whatever state the mixer produced, passed through untouched for the
-        caller to advance.
-        """
-        mixed, *state = self.mixer(hidden, *mixer_args)
+    def _kda_layer_prefill(self, hidden, routed_scale):
+        mixed = self.mixer(hidden)
         attended = self.residual_add(hidden, mixed)
-        ffn_out = self.moe(attended, routed_scale)
-        return self.residual_add(attended, ffn_out), tuple(state)
+        ffn_out = self.moe(attended, routed_scale) if hasattr(self, "moe") else self.mlp(attended)
+        return self.residual_add(attended, ffn_out)
 
-    def _dense_layer_forward(self, hidden, mixer_args, routed_scale):
-        """Layer 0's step: mixer + residual, then the dense MLP + residual.
-
-        Same shape as the MoE layers' step; *routed_scale* is taken and ignored
-        so the walk hands every layer the same arguments.
-        """
-        mixed, *state = self.mixer(hidden, *mixer_args)
+    def _mla_layer_prefill(self, hidden, routed_scale, scale):
+        mixed, _keys, _values = self.mixer(hidden, scale)
         attended = self.residual_add(hidden, mixed)
-        ffn_out = self.mlp(attended)
-        return self.residual_add(attended, ffn_out), tuple(state)
+        return self.residual_add(attended, self.moe(attended, routed_scale))
 
     @module(entry="residual_add")
-    class KimiKdaDenseLayer:
-        mixer = KimiKda.renamed("mixer")
-        mlp = KimiDenseMlp.renamed("mlp")
+    class KimiKdaDenseLayerPrefill:
+        mixer = KimiKdaPrefill.renamed("mixer")
+        mlp = KimiDenseMlpPrefill.renamed("mlp")
 
         @func
         def residual_add(
@@ -920,12 +750,12 @@ def build(cfg: KimiLinearConfig):
         ) -> Tensor[(1, S, _HID), _DT]:
             return a + b
 
-        forward = _dense_layer_forward
+        forward = _kda_layer_prefill
 
     @module(entry="residual_add")
-    class KimiKdaMoeLayer:
-        mixer = KimiKda.renamed("mixer")
-        moe = KimiMoe.renamed("moe")
+    class KimiKdaMoeLayerPrefill:
+        mixer = KimiKdaPrefill.renamed("mixer")
+        moe = KimiMoePrefill.renamed("moe")
 
         @func
         def residual_add(
@@ -934,12 +764,12 @@ def build(cfg: KimiLinearConfig):
         ) -> Tensor[(1, S, _HID), _DT]:
             return a + b
 
-        forward = _moe_layer_forward
+        forward = _kda_layer_prefill
 
     @module(entry="residual_add")
-    class KimiMlaMoeLayer:
-        mixer = KimiMla.renamed("mixer")
-        moe = KimiMoe.renamed("moe")
+    class KimiMlaMoeLayerPrefill:
+        mixer = KimiMlaPrefill.renamed("mixer")
+        moe = KimiMoePrefill.renamed("moe")
 
         @func
         def residual_add(
@@ -948,284 +778,132 @@ def build(cfg: KimiLinearConfig):
         ) -> Tensor[(1, S, _HID), _DT]:
             return a + b
 
-        forward = _moe_layer_forward
-
-    # ── the stack ────────────────────────────────────────────────────────────
-
-    def _layer_kinds(cfg: KimiLinearConfig) -> tuple:
-        """Each layer's (mixer, ffn) kind, in published order.
-
-        The mixers come from `linear_attn_config`'s 1-based lists; the ffn from
-        `first_k_dense_replace` / `moe_layer_freq` -- the same facts
-        ``KimiDecoderLayer.__init__`` reads.
-        """
-        kinds = []
-        for index in range(cfg.num_hidden_layers):
-            mixer = "kda" if cfg.is_kda_layer(index) else "mla"
-            moe = (
-                cfg.num_experts is not None
-                and index >= cfg.first_k_dense_replace
-                and index % cfg.moe_layer_freq == 0
-            )
-            kinds.append((mixer, "moe" if moe else "dense"))
-        return tuple(kinds)
-
-    LAYER_KINDS = _layer_kinds(cfg)
+        forward = _mla_layer_prefill
 
     #: Which layer class each (mixer, ffn) kind names.
     LAYER_TYPE = {
-        ("kda", "dense"): KimiKdaDenseLayer,
-        ("kda", "moe"): KimiKdaMoeLayer,
-        ("mla", "moe"): KimiMlaMoeLayer,
+        ("kda", "dense"): KimiKdaDenseLayerPrefill,
+        ("kda", "moe"): KimiKdaMoeLayerPrefill,
+        ("mla", "moe"): KimiMlaMoeLayerPrefill,
     }
 
     #: _DT as torch spells it -- the state below is at the kernels' own dtype.
     _TORCH_DT = to_torch_dtype(DType.from_name(_DT))
 
-    #: The parameters a mixer declares for its own state, whichever kind it is.
-    #: The root splices a layer's cache in at the first of them.
-    _CACHE_PARAMS = frozenset(
-        {"k_cache", "v_cache", "conv_state_q", "conv_state_k", "conv_state_v", "state"}
-    )
-
-    def _with_cache(mixer, mixer_args, cache):
-        """*mixer_args* with *cache* spliced in where *mixer* declares its state.
-
-        The position is counted over the parameters a step is handed, since a
-        loading fills the weights by name, and read from the Module a loading
-        stands over so that one rule answers for both.
-        """
-        node = getattr(mixer, "module", mixer)
-        names = [
-            param.name for param in node.entry_function().params if not param.is_const
-        ][1:]
-        # `next`, not `min`: `from tilefoundry.dsl.tf import *` binds `min` to the op.
-        at = next(index for index, name in enumerate(names) if name in _CACHE_PARAMS)
-        return (*mixer_args[:at], *cache, *mixer_args[at:])
-
-    def advance_state(kind, state, fresh):
-        """A layer of *kind*'s next state, from what its mixer returned.
-
-        KDA **replaces**: the recurrent matrix and the three convolution windows
-        are fixed size, and the mixer returns them whole -- reordered here into
-        the cache's (conv_q, conv_k, conv_v, state) layout, which is the order
-        the entry declares them in. MLA **appends**: key and value grow along
-        the position axis by the one entry the step returned.
-        """
-        import torch  # noqa: PLC0415
-
-        if kind == "kda":
-            state_next, conv_q_next, conv_k_next, conv_v_next = fresh
-            return (conv_q_next, conv_k_next, conv_v_next, state_next)
-        return tuple(torch.cat([old, new], dim=1) for old, new in zip(state, fresh))
-
     @module(
         target=CudaTarget("nvidia.h200_sxm"),
         topologies=(Topology("cta", 132), Topology("thread", 512)),
     )
-    class KimiLinear48BA3B:
-        """The layer stack in published order, and the step around it --
-        embedding, the walk, the closing norm, the head. Each layer is an
-        independent copy, so an analysis of one annotates only it."""
+    class KimiLinear48BA3BPrefill:
+        """The layer stack in published order over a whole prompt.
 
-        # The published layer cycle determines each layer Module.
+        And the step around it -- embedding, the walk, the closing norm, the
+        head over the last position. Each layer is an independent copy, so an
+        analysis of one annotates only it.
+        """
+
         layers = tuple(
             LAYER_TYPE[kind].renamed(f"layer{index}")
             for index, kind in enumerate(LAYER_KINDS)
         )
 
         @func
-        def embed(
+        def embed_prefill(
             table: ConstTensor[(cfg.vocab_size, _HID), _DT],
-            token_ids: Tensor[(1,), "i64"],
+            token_ids: Tensor[(S,), "i64"],
         ) -> Tensor[(1, S, _HID), _DT]:
-            # HF `KimiLinearModel.embed_tokens`: the decoded token's own row.
+            # HF `KimiLinearModel.embed_tokens`: each prompt token's own row.
             return tf.reshape(
                 tf.index_select(table, token_ids, dim=0), new_shape=(1, S, _HID)
             )
 
         @func
-        def final_rms_norm(
+        def final_rms_norm_prefill(
             hidden: Tensor[(1, S, _HID), _DT],
             gamma_final: ConstTensor[(_HID,), _DT],
         ) -> Tensor[(1, S, _HID), _DT]:
-            # HF `KimiLinearModel.norm`, applied once after the last layer.
-            # `KimiRMSNorm` rounds the normalised value to the input dtype before
-            # the learned scale multiplies it, so the norm is written out rather
-            # than `tf.rms_norm`, which keeps f32 through that multiply.
+            # HF `KimiLinearModel.norm`, applied once after the last layer, to
+            # every position. `KimiRMSNorm` rounds the normalised value to the
+            # input dtype before the learned scale multiplies it, so the norm
+            # is written out rather than `tf.rms_norm`.
             hn32 = tf.cast(hidden, dtype="f32")
             hn_var = tf.reduce(hn32 * hn32, axes=(-1,), keepdim=True, kind="mean")
             return tf.cast(hn32 * tf.rsqrt(hn_var + _EPS), dtype="bf16") * gamma_final
 
         @func
-        def lm_head(
+        def lm_head_prefill(
             hidden: Tensor[(1, S, _HID), _DT],
+            last_index: Tensor[(1,), "i64"],
             w_head: ConstTensor[(_HID, cfg.vocab_size), _DT],
         ) -> Tensor[(1, cfg.vocab_size), _DT]:
-            # HF `KimiLinearForCausalLM.lm_head`, over the one token being decoded.
-            return tf.matmul(tf.reshape(hidden, new_shape=(1, _HID)), w_head)
+            # HF `KimiLinearForCausalLM.lm_head`, over the prompt's last
+            # position only -- the next-token distribution. The gather is an
+            # index_select on an index the orchestration passes: a
+            # symbolic-bound slice (hidden[:, S-1:S]) type-infers but the
+            # evaluator has no visit routine for a DimVar bound.
+            last = tf.reshape(
+                tf.index_select(hidden, last_index, dim=1), new_shape=(1, _HID)
+            )
+            return tf.matmul(last, w_head)
 
-        @lm_head.converter("w_head")
+        @lm_head_prefill.converter("w_head")
         def _(
             head_weight_raw: ConstTensor[(cfg.vocab_size, _HID), _DT],
         ) -> Tensor[(_HID, cfg.vocab_size), _DT]:
-            # HF stores the head as (vocab, hidden); the matmul above wants it the
-            # other way. `tie_word_embeddings` is false and the checkpoint ships a
-            # real `lm_head.weight`, so nothing aliases the embedding table.
+            # HF stores the head as (vocab, hidden); the matmul above wants it
+            # the other way. `tie_word_embeddings` is false and the checkpoint
+            # ships a real `lm_head.weight`.
             return tf.transpose(head_weight_raw, perm=(1, 0))
 
-        def decode_hidden(self, hidden, layer_args, caches, routed_scale):
-            """One decode step through every layer, then the final norm.
-
-            *layer_args* is one layer's mixer arguments per layer, carrying no
-            state; *caches* is each layer's own state, spliced into its mixer
-            call; *routed_scale* is the MoE's scaling factor, the same tensor
-            for every layer. What comes back is the normed hidden state and
-            each layer's fresh state.
-            """
-            if len(layer_args) != len(self.modules) or len(caches) != len(self.modules):
-                raise ValueError(
-                    f"decoder has {len(self.modules)} layers but was given "
-                    f"{len(layer_args)} argument tuples and {len(caches)} caches"
-                )
-            states = []
-            for layer, mixer_args, cache in zip(self.modules, layer_args, caches):
-                hidden, state = layer(
-                    hidden, _with_cache(layer.mixer, mixer_args, cache), routed_scale
-                )
-                states.append(state)
-            return self.final_rms_norm(hidden), tuple(states)
-
-        def forward(self, token_ids, layer_args, caches, routed_scale):
-            """One decode step of the whole model: token ids in, logits out.
-
-            The fresh per-layer state comes out beside the logits; growing
-            *caches* with it is the caller's step, through `append_cache`.
-            """
-            hidden = self.embed(token_ids)
-            normed, states = self.decode_hidden(hidden, layer_args, caches, routed_scale)
-            return self.lm_head(normed), states
-
-        def init_caches(self, device=None):
-            """The per-layer state container, one entry per layer.
-
-            A KDA layer's four halves are genuinely zero at the start: Hugging
-            Face left-pads the convolution windows when the context is shorter
-            than them, and `initial_state=None` is the zero recurrent matrix.
-            An MLA layer gets a container of no positions, which `ctx_len`
-            admits: the first step of a sequence attends the one position it
-            brings itself.
-            """
+        def forward(self, token_ids, routed_scale, mla_scale):
+            """Run the whole prompt and return last-position logits only."""
             import torch  # noqa: PLC0415
 
-            device = torch.accelerator.current_accelerator() if device is None else device
-            entries = []
-            for mixer, _ffn in LAYER_KINDS:
-                if mixer == "kda":
-                    entries.append((
-                        torch.zeros(1, _WS, _KP, dtype=_TORCH_DT, device=device),
-                        torch.zeros(1, _WS, _KP, dtype=_TORCH_DT, device=device),
-                        torch.zeros(1, _WS, _KP, dtype=_TORCH_DT, device=device),
-                        torch.zeros(1, _KH, _KD, _KD, dtype=_TORCH_DT, device=device),
-                    ))
-                else:
-                    entries.append((
-                        torch.zeros(1, 0, _H, _QK, dtype=_TORCH_DT, device=device),
-                        torch.zeros(1, 0, _H, _V, dtype=_TORCH_DT, device=device),
-                    ))
-            return tuple(entries)
-
-        def append_cache(self, caches, fresh):
-            """Every layer's state advanced by the step it just took: a kernel
-            hands back its own token's entry, and joining it on (or replacing
-            with it) is the caller's."""
-            return tuple(
-                advance_state(mixer, cache, new)
-                for (mixer, _ffn), cache, new in zip(LAYER_KINDS, caches, fresh)
+            hidden = self.embed_prefill(token_ids)
+            for layer, (mixer_kind, _ffn_kind) in zip(self.modules, LAYER_KINDS):
+                hidden = (
+                    layer(hidden, routed_scale)
+                    if mixer_kind == "kda"
+                    else layer(hidden, routed_scale, mla_scale)
+                )
+            hidden = self.final_rms_norm_prefill(hidden)
+            last_index = torch.tensor(
+                [token_ids.shape[0] - 1], dtype=torch.int64, device=token_ids.device
             )
-
-        def prepare_inputs_for_generation(self, input_ids, step, caches, device=None):
-            """The token and each layer's non-state activations for one decode step.
-
-            The MLA mixers get the identity rotary -- cos = 1, sin = 0 -- which
-            is what `mla_use_nope: true` means at runtime: the 64 rotary-half
-            dimensions still enter the score and the scaling denominator; they
-            are simply not rotated.
-            """
-            import torch  # noqa: PLC0415
-
-            device = torch.accelerator.current_accelerator() if device is None else device
-            token_ids = input_ids[step].reshape(1).to(device=device, dtype=torch.int64)
-            layer_args = []
-            for mixer, _ffn in LAYER_KINDS:
-                if mixer == "mla":
-                    cos_cache = torch.ones(S, _ROPE, dtype=_TORCH_DT, device=device)
-                    sin_cache = torch.zeros(S, _ROPE, dtype=_TORCH_DT, device=device)
-                    pos_ids = torch.zeros(S, dtype=torch.int32, device=device)
-                    scale = torch.full(
-                        (1, 1, 1, 1), _QK ** -0.5, dtype=_TORCH_DT, device=device
-                    )
-                    layer_args.append((cos_cache, sin_cache, pos_ids, scale))
-                else:
-                    scale = torch.full(
-                        (1, 1, 1), _KD ** -0.5, dtype=_TORCH_DT, device=device
-                    )
-                    layer_args.append((scale,))
-            routed_scale = torch.full(
-                (1, 1), cfg.routed_scaling_factor, dtype=_TORCH_DT, device=device
-            )
-            return token_ids, tuple(layer_args), caches, routed_scale
+            return self.lm_head_prefill(hidden, last_index)
 
     return {
-        "KimiKda": KimiKda,
-        "KimiMla": KimiMla,
-        "KimiMoe": KimiMoe,
-        "KimiDenseMlp": KimiDenseMlp,
-        "KimiKdaDenseLayer": KimiKdaDenseLayer,
-        "KimiKdaMoeLayer": KimiKdaMoeLayer,
-        "KimiMlaMoeLayer": KimiMlaMoeLayer,
-        "KimiLinear48BA3B": KimiLinear48BA3B,
+        "KimiKdaPrefill": KimiKdaPrefill,
+        "KimiMlaPrefill": KimiMlaPrefill,
+        "KimiMoePrefill": KimiMoePrefill,
+        "KimiDenseMlpPrefill": KimiDenseMlpPrefill,
+        "KimiKdaDenseLayerPrefill": KimiKdaDenseLayerPrefill,
+        "KimiKdaMoeLayerPrefill": KimiKdaMoeLayerPrefill,
+        "KimiMlaMoeLayerPrefill": KimiMlaMoeLayerPrefill,
+        "KimiLinear48BA3BPrefill": KimiLinear48BA3BPrefill,
         "LAYER_KINDS": LAYER_KINDS,
         "LAYER_TYPE": LAYER_TYPE,
-        "advance_state": advance_state,
     }
 
 
 # ---------------------------------------------------------------------------
-# The published configuration, as module-level names a CLI selector can address.
+# The published tree, importable the way the decode shell's is. Building it
+# also builds the decode tree it borrows the KDA step and layer kinds from.
 # ---------------------------------------------------------------------------
-
-_REAL = build(published())
-
-KimiKda = _REAL["KimiKda"]
-KimiMla = _REAL["KimiMla"]
-KimiMoe = _REAL["KimiMoe"]
-KimiDenseMlp = _REAL["KimiDenseMlp"]
-KimiKdaDenseLayer = _REAL["KimiKdaDenseLayer"]
-KimiKdaMoeLayer = _REAL["KimiKdaMoeLayer"]
-KimiMlaMoeLayer = _REAL["KimiMlaMoeLayer"]
-KimiLinear48BA3B = _REAL["KimiLinear48BA3B"]
-LAYER_KINDS = _REAL["LAYER_KINDS"]
-LAYER_TYPE = _REAL["LAYER_TYPE"]
-advance_state = _REAL["advance_state"]
 
 config = published()
+_REAL = build(config)
 
-
-# ---------------------------------------------------------------------------
-# {canonical: raw} for the published checkpoint.
-# ---------------------------------------------------------------------------
-#
-# The resource prefix is made to *track* the checkpoint's own paths: segment
-# aliases rename each layer Module onto `model.layers.{i}`, `mixer` onto
-# `self_attn`, and `moe` onto `block_sparse_moe` (the dense layer-0 MLP is
-# already named `mlp`, as the checkpoint names it). Every leaf below is then a
-# bare relative name that serves every instance of its scope uniformly, except
-# the two layer-owned norms a child consumes (`input_layernorm` is the layer's,
-# not the mixer's), which aliasing can only reach downward from -- those are
-# `Absolute`, keyed by the resolved path the lookup is made at. The expert
-# stacks are the one-to-many case: a tuple value, `load_group` reads it and
-# `prepare` stacks it in declared order.
+KimiKdaPrefill = _REAL["KimiKdaPrefill"]
+KimiMlaPrefill = _REAL["KimiMlaPrefill"]
+KimiMoePrefill = _REAL["KimiMoePrefill"]
+KimiDenseMlpPrefill = _REAL["KimiDenseMlpPrefill"]
+KimiKdaDenseLayerPrefill = _REAL["KimiKdaDenseLayerPrefill"]
+KimiKdaMoeLayerPrefill = _REAL["KimiKdaMoeLayerPrefill"]
+KimiMlaMoeLayerPrefill = _REAL["KimiMlaMoeLayerPrefill"]
+KimiLinear48BA3BPrefill = _REAL["KimiLinear48BA3BPrefill"]
+LAYER_KINDS = _REAL["LAYER_KINDS"]
+LAYER_TYPE = _REAL["LAYER_TYPE"]
 
 
 def hf_alias(cfg: KimiLinearConfig | None = None, *, prefix="model", head="lm_head.weight"):
@@ -1281,8 +959,11 @@ def hf_alias(cfg: KimiLinearConfig | None = None, *, prefix="model", head="lm_he
         # MoE leaves
         "router_weight": "gate.weight",
         "bias": "gate.e_score_correction_bias",
-        "w_gate": tuple(f"experts.{j}.w1.weight" for j in range(cfg.num_experts)),
-        "w_up": tuple(f"experts.{j}.w3.weight" for j in range(cfg.num_experts)),
+        "w_gate_up": tuple(
+            name
+            for j in range(cfg.num_experts)
+            for name in (f"experts.{j}.w1.weight", f"experts.{j}.w3.weight")
+        ),
         "w_down": tuple(f"experts.{j}.w2.weight" for j in range(cfg.num_experts)),
         "shared_gate_proj_weight": "shared_experts.gate_proj.weight",
         "shared_up_proj_weight": "shared_experts.up_proj.weight",
@@ -1304,20 +985,7 @@ def hf_alias(cfg: KimiLinearConfig | None = None, *, prefix="model", head="lm_he
 
 
 __all__ = [
-    "KimiDenseMlp",
-    "KimiKda",
-    "KimiKdaDenseLayer",
-    "KimiKdaMoeLayer",
-    "KimiLinear48BA3B",
-    "KimiLinearConfig",
-    "KimiMla",
-    "KimiMlaMoeLayer",
-    "KimiMoe",
-    "LAYER_KINDS",
-    "LAYER_TYPE",
-    "advance_state",
-    "build",
-    "config",
-    "hf_alias",
-    "published",
+    "KimiDenseMlpPrefill", "KimiKdaPrefill", "KimiLinear48BA3BPrefill",
+    "KimiLinearConfig", "KimiMlaPrefill", "KimiMoePrefill", "LAYER_KINDS",
+    "LAYER_TYPE", "build", "config", "hf_alias", "published",
 ]

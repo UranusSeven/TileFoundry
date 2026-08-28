@@ -1,35 +1,8 @@
+"""Prefill-only Kimi-Linear-48B-A3B extension.
 
-"""Kimi-Linear-48B-A3B-Instruct, authored outside the shipped tree.
-
-`model.py` is the full decode shell in HIR: the vendored config class, the
-three shipped mixers (KDA / MLA / MoE) plus the dense layer-0 MLP, the
-27-layer stack with embed / final norm / lm_head, and `hf_alias` for the
-published checkpoint. `kernels/` holds the tilelang implementation of the
-decode-step mixers plus their plain-torch reference.
-
-The Milestone-1 runtimes: `weights.py` binds the published checkpoint to the
-shell's declared weights (converters on demand, expert stacks grouped);
-`runtime_model.py` is the `@runtime_module` twins plus the `Session` decode
-driver; `run.py` decodes real tokens and reports decode tok/s;
-`check_twin.py` validates twins against the authored evaluator on real
-weights. `check_{kda,mla,moe}_kernel.py` are the per-kernel validations.
-
-Milestone 2 (TP2): `ops.py` registers the external HIR op `tf.all_reduce`
-(the Partial -> converged boundary of docs/spec/shard.md);
-`runtime_tp2.py` is the two-GPU twins -- weights sliced per rank, one
-NCCL all-reduce per mixer/FFN output -- and its `SessionTP2` driver;
-`run.py --tp 2` runs them under torchrun. `check_allreduce_op.py` and
-`check_tp2_shards.py` are their validations.
-
-Milestone 3 (prefill): `model_prefill.py` is the S-symbolic prefill shell,
-authored beside the untouched decode one -- MLA as one masked-softmax pass
-(MHA form, causal `arange`/`where` mask, NoPE so no rotary), KDA as the
-decode recurrence looped in orchestration (the chunked-rule twin's semantic
-reference), the position-wise blocks re-stated over `DimVar("seq_len")`, and
-the head over the last position only. `forward` returns the per-layer caches
-in the decode shell's layout, so decode continues from a prefill.
-`check_prefill.py` validates: CLI self-consistency, prefill-vs-decode at
-S=8 (module level, real dims; whole reduced shells, with the cache handoff
-exercised), and the MLA prefill against the checkpoint's own
-`KimiMLAAttention`.
+`model.py` owns the independent S-symbolic 27-layer authored HIR. `ops.py`
+registers HIR-only KDA recurrence and paged MLA prefill operations. `weights.py`
+binds the checkpoint using the packed expert ABI `[E, 2I, H]` / `[E, H, I]`.
+The retained runtime prefill code is transitional and is not yet a complete
+end-to-end prefill pipeline.
 """

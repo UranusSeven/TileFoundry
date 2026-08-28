@@ -10,10 +10,10 @@ Two differences from the example, both from this checkpoint:
 * **Everything is bf16.** The shell declares `_DT = bf16` for every weight
   (the checkpoint stores bf16; `A_log` / `dt_bias` are stored f32 but their
   converters cast down). There is no f32 exception set.
-* **The expert stacks are one-to-many aliases.** `w_gate` / `w_up` / `w_down`
-  name 256 raw tensors each (`experts.{i}.w1/w3/w2.weight`), which
-  `SafetensorsResource.load` refuses; `load_group` reads them and this file
-  stacks them in declared (expert) order -- what `prepare` would write.
+* **The expert stacks are one-to-many aliases.** `w_gate_up` names interleaved
+  `experts.{i}.w1/w3.weight` tensors and is packed to `[E, 2I, H]` while
+  `w_down` stacks `experts.{i}.w2.weight` to `[E, H, I]`. These are the sole
+  declared expert ABI tensors.
 """
 from __future__ import annotations
 
@@ -79,9 +79,15 @@ class HFResource:
         if conv is None:
             parts = self._raw.load_group(name)
             if parts is not None:
-                # The one-to-many expert stacks: 256 raw tensors, stacked in
-                # alias order -- what `prepare` writes for them.
-                value = torch.stack([p.to(self._dtype) for p in parts])
+                if name == "w_gate_up":
+                    if len(parts) % 2:
+                        raise ValueError("w_gate_up alias must contain gate/up pairs")
+                    value = torch.stack([
+                        torch.cat((parts[i], parts[i + 1]), dim=0).to(self._dtype)
+                        for i in range(0, len(parts), 2)
+                    ])
+                else:
+                    value = torch.stack([part.to(self._dtype) for part in parts])
             else:
                 value = self._fetch(name).to(self._dtype)
         else:
@@ -130,15 +136,15 @@ def raw_resource(ckpt=CKPT, cfg=None, *, device="cuda"):
     return SafetensorsResource(str(ckpt), device=device, alias=sem.hf_alias(cfg))
 
 
-def decoder_resource(node=None, ckpt=CKPT, cfg=None, *, device="cuda",
+def prefill_resource(node=None, ckpt=CKPT, cfg=None, *, device="cuda",
                      dtype=DTYPE, verbose=False):
-    """What `KimiLinear48BA3B.load(...)` / the twin's `load(...)` reads.
+    """What `KimiLinear48BA3BPrefill.load(...)` / the twin's `load(...)` reads.
 
     *node* is the authored root the resource walks -- the published one by
     default, or a truncated `model.build(cfg)` for a short loop. It has to
     match *cfg*, since the alias table is generated per layer index.
     """
-    node = sem.KimiLinear48BA3B if node is None else node
+    node = sem.KimiLinear48BA3BPrefill if node is None else node
     total = {"bytes": 0, "n": 0, "t0": time.perf_counter()}
 
     def report(name, value):
@@ -189,7 +195,7 @@ __all__ = [
     "CKPT",
     "DTYPE",
     "HFResource",
-    "decoder_resource",
+    "prefill_resource",
     "nope_caches",
     "raw_resource",
     "tokenizer",
