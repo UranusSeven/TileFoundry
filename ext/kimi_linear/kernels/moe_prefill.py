@@ -18,10 +18,12 @@ _NO_WS = {PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True}
 def _kernel(H, I, E, total_blocks, xdt, wdt):
     @tilelang.jit(pass_configs=_NO_WS)
     def build():
+        # TileLang resolves postponed annotations from function globals.
+        globals().update(H=H, I=I, E=E, total_blocks=total_blocks, xdt=xdt, wdt=wdt)
         @T.prim_func
-        def main(X: T.Tensor((total_blocks * BM, H), xdt),
-                 WG: T.Tensor((E, I, H), wdt), WU: T.Tensor((E, I, H), wdt),
-                 WD: T.Tensor((E, H, I), wdt),
+        def main(X: T.Tensor((total_blocks * BM, H), "bfloat16"),
+                 WG: T.Tensor((E, I, H), "bfloat16"), WU: T.Tensor((E, I, H), "bfloat16"),
+                 WD: T.Tensor((E, H, I), "bfloat16"),
                  group_sizes: T.Tensor((E,), T.int32),
                  group_offsets: T.Tensor((E,), T.int32),
                  padded_offsets: T.Tensor((E,), T.int32),
@@ -53,7 +55,7 @@ def _kernel(H, I, E, total_blocks, xdt, wdt):
                     if i < rows and by * BN_I + j < I:
                         g = ho[i, j]
                         u = ua[i, j]
-                        HBuf[start + i, by * BN_I + j] = g / (1.0 + T.exp(-g)) * u
+                        HBuf[p0 + i, by * BN_I + j] = g / (1.0 + T.exp(-g)) * u
 
             with T.Kernel(total_blocks, T.ceildiv(H, BN_H), threads=THREADS) as (bx, by):
                 e = group_for_block[bx]
@@ -73,7 +75,7 @@ def _kernel(H, I, E, total_blocks, xdt, wdt):
                 T.copy(acc, out)
                 for i, j in T.Parallel(BM, BN_H):
                     if i < rows and by * BN_H + j < H:
-                        Out[start + i, by * BN_H + j] = out[i, j] * weights[start + i]
+                        Out[p0 + i, by * BN_H + j] = out[i, j] * weights[p0 + i]
         return main
     return build()
 
@@ -87,9 +89,9 @@ def grouped_routed(tokens, weights, indices, w_gate, w_up, w_down):
     sorted_tokens = tokens.repeat_interleave(TOP_K, 0)[order]
     sorted_weights = weights.reshape(-1).float()[order]
     counts = torch.bincount(sorted_e, minlength=E).to(torch.int32)
-    offsets = torch.cumsum(counts, 0) - counts
+    offsets = (torch.cumsum(counts, 0) - counts).to(torch.int32)
     padded_counts = ((counts + BM - 1) // BM) * BM
-    padded_offsets = torch.cumsum(padded_counts, 0) - padded_counts
+    padded_offsets = (torch.cumsum(padded_counts, 0) - padded_counts).to(torch.int32)
     total_blocks = int(((counts + BM - 1) // BM).sum().item())
     if total_blocks == 0:
         return torch.zeros((S, H), device=tokens.device, dtype=torch.float32)
