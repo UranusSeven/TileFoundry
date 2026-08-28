@@ -1,32 +1,15 @@
-"""Paged prefill for Kimi-Linear-48B-A3B: the prompt in one pass, at S > 1.
+"""Self-contained prefill runtime for Kimi-Linear-48B-A3B.
 
-M3-B. Three pieces:
-
-* `BlockManager` -- the page pool the MLA layers' prefill KV lives in. Pages
-  are vllm_flash_attn-shaped ``[num_pages, page_size, H, D]``; a sequence's
-  block table is its physical page ids in logical order. Allocated at
-  prefill, freed when the driver hands over to decode.
-* The prefill twins. MLA: `flash_attn_varlen_func` (FA3 -- FA2's paged
-  kernel requires headdim_v == headdim_qk, and here they are 128 and 192)
-  over the pages, the production counterpart of the `tf.paged_mla_prefill`
-  HIR op in `ops.py`. KDA: fla's `chunk_kda` over the whole prompt, with the
-  causal depthwise convolutions and the forget gate computed batched in
-  torch. MoE uses vLLM's fused experts with GPU-only dispatch by default; the
-  corrected TileLang grouped kernel remains an explicit fallback. Dense MLP is
-  plain batched torch. The runtime remains transitional and will be rewritten in the next phase.
-* `prefill(session, prompt_ids)` -- the driver: embed, walk the layers,
-  closing norm and head on the last position, then install the state the
-  decode driver continues from. The handoff is contract option (a): KDA
-  recurrent state and conv windows carry over directly (fla's final state is
-  k-major `[1, H, K, V]`; the authored layout is v-major `[1, H, V, K]` --
-  transposed here), and the MLA pages are repacked once into the session's
-  contiguous decode caches.
-
-Numerics follow the authored IR's rounding placements: the rms norms round to bf16 before
-gamma multiplies, the KDA gate's softplus input rounds through bf16, and the
-attention / MoE reductions accumulate in f32.
+``PrefillRunner`` owns the published prefill weights and executes exactly one
+request at a time: embedding, 27 batched layers, final norm, and the
+last-position LM head. MLA uses request-local FA3 pages, KDA uses FLA
+``chunk_kda`` without returning recurrent state, and MoE uses vLLM fused
+experts with the checkpoint's packed ``gate_up`` ABI. No decode state, cache
+handoff, or generation resource is part of this module.
 """
 from __future__ import annotations
+
+import time
 
 import torch
 import torch.nn.functional as F
@@ -212,26 +195,12 @@ def _conv_prefill(x_raw, conv_w):
     return F.silu(acc).to(x_raw.dtype)
 
 
-def _conv_state(x_raw, length: int):
-    """The decode window after the prompt.
-
-    The last three raw rows, zero
-    left-padded when the prompt is shorter than the window (HF left-pads).
-    """
-    if length >= _WS:
-        return x_raw[:, length - _WS :].contiguous()
-    pad = torch.zeros(
-        1, _WS - length, _KP, dtype=x_raw.dtype, device=x_raw.device
-    )
-    return torch.cat([pad, x_raw], dim=1)
-
 
 def kda_prefill(hidden, w, length: int):
     """One KDA layer over the whole prompt via fla's `chunk_kda`.
 
-    Returns the layer output ``[1, S, _HID]``, the recurrent state in the
-    authored v-major layout ``[1, H, V, K]`` (fla's final state is k-major),
-    and the three conv windows for the decode handoff.
+    Returns only the layer output ``[1, S, _HID]``. The recurrence starts at
+    zero and its final state is intentionally discarded.
     """
     hn = _rms(hidden, w["gamma_in"])
     q_raw = torch.matmul(hn, w["w_q"])
@@ -251,7 +220,7 @@ def kda_prefill(hidden, w, length: int):
         1, length, _NH
     )
 
-    o, final_state = chunk_kda(
+    o, _ = chunk_kda(
         q=q_c.view(1, length, _NH, _DK),
         k=k_c.view(1, length, _NH, _DK),
         v=v_c.view(1, length, _NH, _DK),
@@ -259,7 +228,7 @@ def kda_prefill(hidden, w, length: int):
         beta=beta,
         scale=_DK ** -0.5,
         initial_state=None,
-        output_final_state=True,
+        output_final_state=False,
         use_qk_l2norm_in_kernel=True,
     )
 
@@ -273,14 +242,7 @@ def kda_prefill(hidden, w, length: int):
     on = on * w["gamma_o"].float() * torch.sigmoid(g2)
     out = torch.matmul(on.reshape(1, length, _KP).to(_BF16), w["w_o"])
 
-    state = final_state.transpose(-1, -2).to(_BF16).contiguous()
-    return (
-        out,
-        state,
-        _conv_state(q_raw, length),
-        _conv_state(k_raw, length),
-        _conv_state(v_raw, length),
-    )
+    return out
 
 
 def _router(tokens, w_router, bias, routed_scale):
@@ -301,7 +263,7 @@ def _router(tokens, w_router, bias, routed_scale):
     return weights.to(_BF16), indices
 
 
-def moe_prefill(hidden, w, routed_scale, chunk: int = 32):
+def moe_prefill(hidden, w, routed_scale):
     """Prefill MoE with GPU-only vLLM dispatch or the TileLang fallback."""
     length = hidden.shape[1]
     hn = _rms(hidden, w["gamma_post"])
@@ -334,73 +296,74 @@ def mlp_prefill(hidden, w):
     )
 
 
-@torch.no_grad()
-def prefill(session, prompt_ids, moe_chunk: int = 32, *, prepare_decode: bool = True):
-    """The prompt through the whole stack in one pass.
+class PrefillRunner:
+    """Weight-owning, single-device prefill runner."""
 
-    Returns last-position
-    logits with the session's state installed for decode.
+    def __init__(self, ckpt=None, *, device="cuda", verbose=False):
+        import model as sem  # noqa: PLC0415
+        import weights as wt  # noqa: PLC0415
 
-    KDA layers hand over (conv_q, conv_k, conv_v, state) -- the session's
-    cache layout -- and the MLA pages are repacked once into the contiguous
-    decode buffers, so the decode path is exactly the M1 one from position
-    `len(prompt_ids)` on.
-    """
-    twin = session.twin
-    device = session.device
-    length = len(prompt_ids)
-    if length + 1 > session.capacity:
-        raise RuntimeError(
-            f"prompt of {length} exceeds the session capacity {session.capacity}"
+        self.device = torch.device(device)
+        self.config = sem.config
+        self.kinds = sem.LAYER_KINDS
+        resource, totals = wt.prefill_resource(
+            ckpt=wt.CKPT if ckpt is None else ckpt,
+            device=str(self.device),
+            verbose=verbose,
         )
-    ids = torch.tensor(prompt_ids, dtype=torch.int64, device=device)
-    hidden = twin._bound["table"][ids].reshape(1, length, _HID)
-
-    mgr = BlockManager(session.capacity, device)
-    mgr.alloc(length)
-    kda_states: dict[int, tuple] = {}
-    try:
-        for index, (mixer_kind, ffn_kind) in enumerate(session.kinds):
-            layer = twin.modules[index]
-            bw = layer.mixer._bound
-            if mixer_kind == "kda":
-                mixed, state, cq, ck, cv = kda_prefill(hidden, bw, length)
-                kda_states[index] = (cq, ck, cv, state)
-            else:
-                mixed = mla_prefill(hidden, bw, mgr, index, length)
-            hidden = hidden + mixed
-            ffn = layer.moe if ffn_kind == "moe" else layer.mlp
-            if ffn_kind == "moe":
-                hidden = hidden + moe_prefill(
-                    hidden, ffn._bound, session.routed_scale, moe_chunk
-                )
-            else:
-                hidden = hidden + mlp_prefill(hidden, ffn._bound)
-
-        normed = _rms(hidden, twin._bound["gamma_final"])
-        logits = torch.matmul(
-            normed[:, -1].reshape(1, _HID), twin._bound["w_head"]
+        started = time.perf_counter()
+        self.weights = sem.KimiLinear48BA3BPrefill.load(resource)
+        self.load_seconds = time.perf_counter() - started
+        self.loaded_bytes = totals["bytes"]
+        self.routed_scale = torch.tensor(
+            self.config.routed_scaling_factor, dtype=_BF16, device=self.device
         )
 
-        # The handoff. reset() first so every buffer is in a known state.
-        session.reset()
-        slots = mgr.slot_ids(length)
-        for index, (mixer_kind, _ffn) in enumerate(session.kinds):
-            if mixer_kind == "kda":
-                session.kda[index] = kda_states[index]
-            else:
-                k_pages, v_pages = mgr.pages(index)
-                session.kbuf[index][:, :length] = (
-                    k_pages.view(-1, mgr.nh, _QK)[slots].unsqueeze(0)
-                )
-                session.vbuf[index][:, :length] = (
-                    v_pages.view(-1, mgr.nh, _V)[slots].unsqueeze(0)
-                )
-        session.pos = length
-    finally:
-        mgr.free()
-    return logits
+    @torch.no_grad()
+    def __call__(self, input_ids):
+        """Return ``[1, vocab]`` BF16 logits for the prompt's last position."""
+        ids = torch.as_tensor(input_ids, dtype=torch.int64, device=self.device)
+        if ids.ndim != 1 or not ids.numel():
+            raise ValueError("input_ids must be a non-empty one-dimensional sequence")
+        length = ids.numel()
+        if length > self.config.model_max_length:
+            raise ValueError(
+                f"prompt length {length} exceeds model_max_length "
+                f"{self.config.model_max_length}"
+            )
+
+        hidden = self.weights.constants["table"][ids].reshape(1, length, _HID)
+        pages = BlockManager(length, self.device)
+        pages.alloc(length)
+        try:
+            for index, ((mixer_kind, ffn_kind), layer) in enumerate(
+                zip(self.kinds, self.weights.modules)
+            ):
+                mixer = layer.mixer.constants
+                if mixer_kind == "kda":
+                    mixed = kda_prefill(hidden, mixer, length)
+                else:
+                    mixed = mla_prefill(hidden, mixer, pages, index, length)
+                hidden = hidden + mixed
+                ffn = layer.moe.constants if ffn_kind == "moe" else layer.mlp.constants
+                if ffn_kind == "moe":
+                    hidden = hidden + moe_prefill(hidden, ffn, self.routed_scale)
+                else:
+                    hidden = hidden + mlp_prefill(hidden, ffn)
+
+            normed = _rms(hidden, self.weights.constants["gamma_final"])
+            return torch.matmul(normed[:, -1], self.weights.constants["w_head"])
+        finally:
+            pages.free()
 
 
-__all__ = ["PAGE_SIZE", "BlockManager", "flash_paged", "kda_prefill",
-           "mla_prefill", "mlp_prefill", "moe_prefill", "prefill"]
+__all__ = [
+    "PAGE_SIZE",
+    "BlockManager",
+    "PrefillRunner",
+    "flash_paged",
+    "kda_prefill",
+    "mla_prefill",
+    "mlp_prefill",
+    "moe_prefill",
+]

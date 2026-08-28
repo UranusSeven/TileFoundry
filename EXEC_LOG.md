@@ -87,3 +87,25 @@ The remaining gap is not host MoE dispatch. At S=1024, GPU busy is 29.7 ms above
 - Unified routed-expert weights to packed `w_gate_up [E, 2I, H]` plus `w_down [E, H, I]`; authored HIR uses static slices for gate/up, and checkpoint loading packs per-expert `w1/w3` pairs directly.
 - Checks: all retained extension Python files compile; the authored model imports and has 27 layers; model forest/function counts and KDA evaluator/type inference were inspected; paged MLA smoke, Ruff, repository hygiene lints, and `git diff --check` were run before commit.
 - Limitation: this is phase-1 HIR convergence, not a complete runnable prefill pipeline. `run.py`, `prefill.py`, and legacy broad check drivers still contain decode-session assumptions and are deferred to the phase-2 runtime rewrite.
+
+## Prefill-only runtime（阶段2）
+
+All work and validation ran inside pod `dev-yingshan-7cf9dbcf45-xtm8p` on branch `kimi-linear-run`, using GPU 2 (`CUDA_VISIBLE_DEVICES=2`).
+
+- Replaced the transitional session/handoff driver with `PrefillRunner`, which loads and owns the prefill-only weight tree and executes embedding, all 27 layers, final RMS norm, and the last-position LM head. MLA pages are allocated per request and freed in `finally`; KDA calls FLA `chunk_kda` with `initial_state=None` and `output_final_state=False`; MoE calls vLLM `fused_experts` over packed `w_gate_up [256, 2048, 2304]` and `w_down`.
+- Reduced `weights.py` to the prefill resource API and removed tokenizer/rotary/decode-resource helpers. Rewrote `run.py` as a prefill-only benchmark with `--input-ids`, `--length`, `--repeat`, `--warmup`, `--max-tokens 1`, and `--out`. Added `hf_prefill_logits.py` using the checkpoint `modeling_kimi`, `use_cache=False`, fixed token ids, the known `/root/develop/yingshan/venv_hf`, and compatibility-only import/gate/eager-attention shims.
+- Replaced legacy decode/handoff checks with a prefill forest/packed-ABI check and a paged-MLA external-op plus real-checkpoint HF-logit check.
+
+Correctness on the fixed ids:
+
+- S=8: runtime/HF argmax `3971/3971`, relative L2 `3.406950e-02`.
+- S=32: runtime/HF argmax `1/1`, relative L2 `3.971295e-02`.
+- S=100: runtime/HF argmax `295/295`, relative L2 `3.983630e-02`.
+- Every runtime row had shape `(163840,)` and all finite values; all comparisons passed the required `rel_l2 <= 6e-2` gate.
+- Paged MLA evaluator versus FA3: max absolute `1.562500e-02`, relative L2 `1.894684e-03`.
+
+Benchmark contract, S=32, one warmup and three repeats: logits shape `[1, 163840]`, BF16/CUDA, argmax `1`, checksum `-560219.75`, median TTFT `48.867 ms`, input throughput `654.834 tok/s`. `--max-tokens 2` was rejected by argparse and `--max-tokens 1` completed and wrote the JSON report.
+
+Validation passed: Python compilation for all retained extension files, 27-layer model forest and packed-weight ABI, `check_kda_prefill_op.py`, rewritten fast checks, HF/runtime real-checkpoint comparisons at S=8/32/100, Ruff on changed files, comment/English/forward-reference/machine-path hygiene lints, and `git diff --check`.
+
+Phase 3 remains intentionally out of scope: TP2 prefill and the broader performance sweep/tuning.

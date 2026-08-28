@@ -31,14 +31,6 @@ def implementation() -> str:
     return impl
 
 
-def prepare_fused_weights(twin, kinds) -> None:
-    """Validate that every MoE already carries the unified packed ABI."""
-    if implementation() != "vllm":
-        return
-    for index, (_mixer_kind, ffn_kind) in enumerate(kinds):
-        if ffn_kind == "moe" and "w_gate_up" not in twin.modules[index].moe._bound:
-            raise KeyError(f"layer {index} is missing packed w_gate_up")
-
 def fused_routed(tokens, weights, indices, gate_up, down):
     """Run custom GPU routing through vLLM unquantized fused experts."""
     return fused_experts(
@@ -48,5 +40,5 @@ def fused_routed(tokens, weights, indices, gate_up, down):
 
 
 __all__ = [
-    "fused_routed", "implementation", "prepare_fused_weights",
+    "fused_routed", "implementation",
 ]

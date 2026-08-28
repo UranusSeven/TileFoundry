@@ -887,8 +887,7 @@ def build(cfg: KimiLinearConfig):
 
 
 # ---------------------------------------------------------------------------
-# The published tree, importable the way the decode shell's is. Building it
-# also builds the decode tree it borrows the KDA step and layer kinds from.
+# The published prefill-only tree and its independently authored layer kinds.
 # ---------------------------------------------------------------------------
 
 config = published()

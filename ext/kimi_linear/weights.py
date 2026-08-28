@@ -40,12 +40,11 @@ CKPT = os.environ.get(
 DTYPE = torch.bfloat16
 
 
-class HFResource:
+class PrefillWeightResource:
     """A `RuntimeResource` over the raw checkpoint that answers canonical names.
 
     Implements the protocol of runtime §1.5 -- `load` / `load_group` /
-    `subtree` -- so both a `Module` and its `RuntimeModule` twin can be
-    loaded from it.
+    `subtree` -- so the authored prefill tree can be loaded directly from it.
     """
 
     #: (raw resource, name, tensor) of the last raw read, shared across
@@ -67,11 +66,11 @@ class HFResource:
         Converter parameters that share a raw tensor are asked for back to
         back; one entry is enough because the reuse is always immediate.
         """
-        cached = HFResource._last
+        cached = PrefillWeightResource._last
         if cached is not None and cached[0] is self._raw and cached[1] == name:
             return cached[2]
         value = self._raw.load(name)
-        HFResource._last = (self._raw, name, value)
+        PrefillWeightResource._last = (self._raw, name, value)
         return value
 
     def load(self, name: str) -> torch.Tensor:
@@ -105,10 +104,10 @@ class HFResource:
         # Every group weight of this model is stacked by `load` above.
         return None
 
-    def subtree(self, seg: str) -> "HFResource":
+    def subtree(self, seg: str) -> "PrefillWeightResource":
         for child in self._node.modules:
             if child.name == seg:
-                return HFResource(
+                return PrefillWeightResource(
                     child,
                     self._raw.subtree(seg),
                     dtype=self._dtype,
@@ -138,10 +137,10 @@ def raw_resource(ckpt=CKPT, cfg=None, *, device="cuda"):
 
 def prefill_resource(node=None, ckpt=CKPT, cfg=None, *, device="cuda",
                      dtype=DTYPE, verbose=False):
-    """What `KimiLinear48BA3BPrefill.load(...)` / the twin's `load(...)` reads.
+    """What `KimiLinear48BA3BPrefill.load(...)` reads.
 
     *node* is the authored root the resource walks -- the published one by
-    default, or a truncated `model.build(cfg)` for a short loop. It has to
+    default, or another prefill-only tree returned by `model.build(cfg)`. It has to
     match *cfg*, since the alias table is generated per layer index.
     """
     node = sem.KimiLinear48BA3BPrefill if node is None else node
@@ -159,7 +158,7 @@ def prefill_resource(node=None, ckpt=CKPT, cfg=None, *, device="cuda",
                 flush=True,
             )
 
-    return HFResource(
+    return PrefillWeightResource(
         node,
         raw_resource(ckpt, cfg, device=device),
         dtype=dtype,
@@ -167,36 +166,11 @@ def prefill_resource(node=None, ckpt=CKPT, cfg=None, *, device="cuda",
     ), total
 
 
-def nope_caches(capacity: int, *, device="cuda"):
-    """The identity rotary tables NoPE means: `cos = 1, sin = 0`, `(capacity, 64)`.
-
-    `mla_use_nope: true` rotates nothing, so the tables are constant; the
-    per-position rows exist because the capacity attention kernel indexes
-    them by position. bf16 holds 1 and 0 exactly.
-    """
-    rope = sem.config.qk_rope_head_dim
-    cos = torch.ones(capacity, rope, dtype=DTYPE, device=device)
-    sin = torch.zeros(capacity, rope, dtype=DTYPE, device=device)
-    return cos, sin
-
-
-def tokenizer(ckpt=CKPT):
-    """The published tokenizer.
-
-    tiktoken behind `tokenization_kimi.py`, so `AutoTokenizer` with the
-    checkpoint's own code (there is no `tokenizer.json`).
-    """
-    from transformers import AutoTokenizer  # noqa: PLC0415
-
-    return AutoTokenizer.from_pretrained(str(ckpt), trust_remote_code=True)
-
 
 __all__ = [
     "CKPT",
     "DTYPE",
-    "HFResource",
+    "PrefillWeightResource",
     "prefill_resource",
-    "nope_caches",
     "raw_resource",
-    "tokenizer",
 ]
