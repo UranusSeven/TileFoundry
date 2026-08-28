@@ -27,6 +27,7 @@ def parse_args(argv=None):
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=1, choices=[1])
     parser.add_argument("--tp", type=int, default=1, choices=[1, 2])
+    parser.add_argument("--cuda-graph", action="store_true")
     parser.add_argument("--out", help="write the report as JSON")
     return parser.parse_args(argv)
 
@@ -58,15 +59,25 @@ def main(argv=None) -> int:
         from prefill import PrefillRunner  # noqa: PLC0415
 
         runner = PrefillRunner()
-    for _ in range(args.warmup):
-        runner(ids)
+    graph_state = None
+    if args.cuda_graph:
+        if args.tp != 2:
+            raise ValueError("--cuda-graph currently requires --tp 2")
+        graph_state = runner.capture(ids, warmup=args.warmup)
+        runner.set_graph_input(ids)
+    else:
+        for _ in range(args.warmup):
+            runner(ids)
     torch.cuda.synchronize()
 
     elapsed = []
     logits = None
     for _ in range(args.repeat):
         started = time.perf_counter()
-        logits = runner(ids)
+        if graph_state is None:
+            logits = runner(ids)
+        else:
+            logits = runner.replay(len(ids))
         torch.cuda.synchronize()
         elapsed.append(time.perf_counter() - started)
 
@@ -85,8 +96,27 @@ def main(argv=None) -> int:
         "input_tok_s": len(ids) / median,
         "repeat": args.repeat,
         "warmup": args.warmup,
+        "cuda_graph": graph_state is not None,
     }
+    if graph_state is not None:
+        report.update(
+            {
+                "graph_warmup_ms": graph_state.warmup_seconds * 1e3,
+                "graph_capture_ms": graph_state.capture_seconds * 1e3,
+                "graph_memory_gib": graph_state.memory_bytes / 2**30,
+            }
+        )
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    if graph_state is not None:
+        graph_rank = {
+            "rank": rank,
+            "warmup_ms": graph_state.warmup_seconds * 1e3,
+            "capture_ms": graph_state.capture_seconds * 1e3,
+            "memory_gib": graph_state.memory_bytes / 2**30,
+        }
+        graph_ranks = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(graph_ranks, graph_rank)
+        report["graph_ranks"] = graph_ranks
     if args.tp == 2:
         report.update(
             {

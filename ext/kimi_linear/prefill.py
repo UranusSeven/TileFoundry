@@ -78,6 +78,8 @@ class BlockManager:
         self._pages: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
         self._free = list(range(self.num_pages))
         self.block_table: torch.Tensor | None = None  # [1, live pages], i32
+        self.cu_q: torch.Tensor | None = None
+        self.seqused: torch.Tensor | None = None
 
     def pages(self, layer: int):
         """The layer's (k_pages, v_pages), allocated on first touch."""
@@ -111,6 +113,8 @@ class BlockManager:
             raise RuntimeError(f"page pool exhausted: need {n}, have {len(self._free)}")
         taken, self._free = self._free[:n], self._free[n:]
         self.block_table = torch.tensor(taken, dtype=torch.int32, device=self.device).reshape(1, n)
+        self.cu_q = torch.tensor([0, length], dtype=torch.int32, device=self.device)
+        self.seqused = torch.tensor([length], dtype=torch.int32, device=self.device)
         return self.block_table
 
     def free(self) -> None:
@@ -152,11 +156,11 @@ def mla_prefill(hidden, w, mgr: BlockManager, layer: int, length: int):
     k_pages.view(-1, mgr.nh, _QK)[slots] = k_new[0].contiguous()
     v_pages.view(-1, mgr.nh, _V)[slots] = v_new[0].contiguous()
 
-    out = flash_paged(q, k_pages, v_pages, mgr.block_table, length)
+    out = flash_paged(q, k_pages, v_pages, mgr.block_table, length, mgr.cu_q, mgr.seqused)
     return torch.matmul(out.view(1, length, mgr.nh * _V), w["w_o"])
 
 
-def flash_paged(q, k_pages, v_pages, block_table, length: int):
+def flash_paged(q, k_pages, v_pages, block_table, length: int, cu_q=None, seqused=None):
     """The paged causal attention call itself, batch one, no prefix.
 
     *q* is ``[S, H, Dqk]``; the pages and block table are the pinned layout
@@ -166,8 +170,10 @@ def flash_paged(q, k_pages, v_pages, block_table, length: int):
     vllm's own prefill call shape (flash_attn.py's forward).
     """
     device = q.device
-    cu_q = torch.tensor([0, length], dtype=torch.int32, device=device)
-    seqused = torch.tensor([length], dtype=torch.int32, device=device)
+    if cu_q is None:
+        cu_q = torch.tensor([0, length], dtype=torch.int32, device=device)
+    if seqused is None:
+        seqused = torch.tensor([length], dtype=torch.int32, device=device)
     return flash_attn_varlen_func(
         q=q,
         k=k_pages,
@@ -189,18 +195,13 @@ def _conv_prefill(x_raw, conv_w, conv_metadata=None):
     if conv_w.shape[0] == _W:
         xp = torch.cat(
             [
-                torch.zeros(
-                    1, _WS, x_raw.shape[-1], dtype=x_raw.dtype, device=x_raw.device
-                ),
+                torch.zeros(1, _WS, x_raw.shape[-1], dtype=x_raw.dtype, device=x_raw.device),
                 x_raw,
             ],
             dim=1,
         )
         window = xp.unfold(1, _W, 1)
-        acc = (
-            window.float()
-            * conv_w.float().permute(1, 0).unsqueeze(0).unsqueeze(0)
-        ).sum(-1)
+        acc = (window.float() * conv_w.float().permute(1, 0).unsqueeze(0).unsqueeze(0)).sum(-1)
         return F.silu(acc).to(x_raw.dtype)
     convolved = F.conv1d(
         x_raw.transpose(1, 2),

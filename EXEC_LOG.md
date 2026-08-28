@@ -144,3 +144,25 @@ Correctness 对 HF 与优化前 TP1（S=8/32/100）均 argmax exact；HF rel_l2 
 最终同 shape warmup 后 n=3 median TP2 TTFT：S=512 57.539 ms（vLLM 23.7 ms，2.428x，未达标）；S=1024 58.617 ms（50.8 ms，1.154x，通过）；S=4096 72.786 ms（58.0 ms，1.255x，通过）。因并非全部 <=1.5x，未跑 full 32-length sweep。长 shape KDA 瓶颈已明显降低，当前 S=4096 KDA 内最大 stage 是 FLA `chunk_kda`，其次是 conv；整体短 shape 残差仍是固定 54 次 collective/跨 rank 等待，不应转向 MoE/MLA 优化。
 
 每 rank resident/load peak 为 47.246/47.271 GiB；运行峰值在 focused trace 为 47.463 GiB@1024、47.976 GiB@4096。打包只发生在已切片的 rank-local tensor 上，load peak 与 resident 相差 0.026 GiB，无 full-weight temporary。
+
+
+## Prefill-only TP2 CUDA graph
+
+在固定 chengfeng 容器、`kimi-linear-run`、GPU 0+1 上，为每个 `(length, rank)` 捕获完整 fixed-shape TP2 prefill CUDA graph。graph 包含 embedding、27 层 mixer/FFN、54 次 NCCL all-reduce、final norm、LM head 和 rank-0 broadcast；两 rank 在 warmup、capture、replay 前后保持相同 collective 顺序。`BlockManager`、MLA K/V pages、block table、FA3 `cu_q`/`seqused`、静态 token IDs、graph output 及算子 workspace 均由每个 shape 的 graph state 持有。请求 token 在 replay 前复制进静态 input；eager `__call__` 保留。`run.py --cuda-graph --tp 2` 分开报告 warmup、capture、每 rank graph memory，TTFT 只计 replay。
+
+首次 full capture 暴露的唯一阻塞是 FA3 metadata 内部的 CPU→CUDA copy：`torch.tensor([0, length], device=device)` 报 `Cannot copy between CPU and CUDA tensors during CUDA graph capture unless the CPU tensor is pinned`。将 `cu_q` 和 `seqused` 移入持久 `BlockManager` 后，full graph capture 成功；FLA、vLLM fused experts 和 NCCL 均无需 breakable fallback。
+
+Correctness（fixed IDs，graph 对 eager TP2 与 HF）：
+- S=8：graph/eager bit-exact，rank logits bit-exact，argmax 3971/3971，HF rel_l2 0.036915。
+- S=32：graph/eager bit-exact，rank logits bit-exact，argmax 1/1，HF rel_l2 0.040674。
+- S=100：graph/eager bit-exact，rank logits bit-exact，argmax 295/295，HF rel_l2 0.050207。
+
+Quick gate，same-shape warmup/capture 后 n=3 median replay TTFT：
+- S=512：17.115 ms，vLLM 23.7 ms，0.722x（目标 <=35.55 ms，PASS）；capture 226.298 ms，graph memory 0.068 GiB/rank。
+- S=1024：23.598 ms，vLLM 50.8 ms，0.465x（目标 <=76.2 ms，PASS）；capture 210.448 ms，graph memory 0.102 GiB/rank。
+- S=4096：67.919 ms，vLLM 58.0 ms，1.171x（目标 <=87.0 ms，PASS）；capture 220.313 ms，graph memory 0.305 GiB/rank。
+- 独立最终 S=512 smoke 报 warmup rank0/rank1 2694.346/1593.289 ms、capture 217.962/217.945 ms、graph memory 均 0.068 GiB，replay 17.125 ms。resident/load peak 仍为 47.246/47.271 GiB/rank。
+
+Quick gate 全通过后完成 512..16384、步长 512 的 32-length sweep。TTFT 从 17.121 ms@512 单调增长到 259.087 ms@16384；代表点为 24.333@1024、38.398@2048、68.643@4096、130.692@8192、194.522@12288、259.087@16384 ms。每 rank graph memory 从 0.068 GiB@512 增至 1.094 GiB@16384；同一进程保留全部 32 个 graph 时 peak memory 达 68.135 GiB/rank。完整结果保存于 `/root/develop/yingshan/cudagraph_sweep.json`（非仓库产物）。
+
+验证通过：`py_compile` 全部 extension Python 文件、Ruff check/format、comment/English/forward-reference/machine-path hygiene、`git diff --check`，以及新的 `check_cuda_graph.py` TP2 correctness driver。未修改 HIR 或 KDA correctness semantics。
