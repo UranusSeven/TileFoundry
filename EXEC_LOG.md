@@ -50,3 +50,30 @@ The trace **did contain** old `void at::native::vectorized_gather_kernel<16, lon
 - grouped_routed in ext/kimi_linear/kernels/moe_prefill.py uses sort/pad indexing followed by one TileLang function containing two grouped GEMM kernels (gate/up and down); it has no expert-weight gather. Full traces expose generated nvjet_sm90_tst_* names, not a source-level grouped label.
 - Isolated grouped-MoE profiling was attempted but could not start: an existing vLLM worker PID 61146 occupied GPU 2 and model construction failed OOM. No algorithm change was made. Source inspection and full-trace evidence classify the remaining gathers as non-MoE bookkeeping (paged MLA/page or block-table repack, embedding/indexing/routing), not per-token expert-weight gathers.
 - Fix commit 029c7d4 and validation commit 5bc190c remain on local kimi-linear-run (ahead 3); no push.
+
+
+## MoE prefill 全 GPU dispatch（vLLM fused_moe）
+
+All implementation and validation ran inside the chengfeng pod on GPU 2 with vLLM 0.27.1. The selected API is `vllm.model_executor.layers.fused_moe.fused_moe.fused_experts`: unquantized BF16, `MoEActivation.SILU` (fused SiLU+mul), `w1=[E,2I,H]`, `w2=[E,H,I]`, custom CUDA `topk_weights/topk_ids=[S,8]`, and `apply_router_weight_on_input=False`. The installed API accepts BF16 or FP32 routing weights and int32 or int64 ids. A synthetic E=4/H=64/I=32/S=8 probe reported `rel_l2=3.397e-3`, argmax agreement, and BF16 output.
+
+`ext/kimi_linear/kernels/moe_prefill_vllm.py` loads only vLLM's fused kernel module (the package initializer's optional NIXL/DeepEP protobuf extensions conflict with TileFoundry's OR-Tools in this image). Session initialization concatenates gate/up once into `[256,2048,2304]`, retaining decode-compatible names as views while prefill runs; final paged prefill restores contiguous decode tensors layer-by-layer. `KIMI_MOE_PREFILL_IMPL=tilelang` keeps commit 029c7d4's grouped kernel as the explicit fallback. The default hot call has no `.cpu()`, `.numpy()`, `bincount`, host sort, Python expert loop, or per-token expert-weight gather. Authored routing remains unchanged: f32 sigmoid logits, top-k on score+bias, selected-bias subtraction, top-k renormalization, BF16 scale 2.446, and unscaled shared expert.
+
+Focused real-shape E=256/H=2304/I=1024/topk=8 comparisons against an authored-rounding Torch reference:
+- S=8: max_abs `7.8125e-3`, rel_l2 `3.473e-3`, argmax `8/8`.
+- S=32: max_abs `7.8125e-3`, rel_l2 `3.363e-3`, argmax `32/32`.
+
+Correctness:
+- `CUDA_VISIBLE_DEVICES=2 python3 ext/kimi_linear/check_paged_prefill.py`: **PASS** (`max|d|=1.562e-2`, `rel_l2=1.895e-3`).
+- Fixed prompt paged vs loop generation: `greedy_ids` exact equality, **32/32**, zero mismatches. The paged output used the default vLLM fused path; loop retained decode kernels.
+
+Steady-state prefill-only wall after same-shape warmup (`max_tokens=1` equivalent final-logit work, exact token tensors):
+- S=512: **51.772 ms** (vLLM TP2 baseline 23.7 ms; 2.18x).
+- S=1024: **74.866 ms** (baseline 50.8 ms; 1.47x).
+- S=4096: **135.898 ms** (baseline 58.0 ms; 2.34x).
+
+Exact-shape Torch/CUDA traces (`/root/develop/yingshan/traces/tf_vllm_moe/`), each after same-shape warmup:
+- S=1024: profiled CPU wall 79.064 ms, CPU event span 78.928 ms, summed GPU kernels+memcpy 51.090 ms, MoE CUDA 23.331 ms (52 `fused_moe_kernel`, 26 `moe_sum`, 26 GPU `moe_align_block_size`). Previous TileLang full trace was 81.904 ms GPU / 2494.8 ms wall; vLLM TP2 GPU baseline 21.4 ms.
+- S=4096: profiled CPU wall 159.341 ms, CPU event span 159.210 ms, summed GPU kernels+memcpy 132.923 ms, MoE CUDA 37.573 ms with the same 104 MoE launches. Previous TileLang full trace was 199.814 ms GPU / 9515.1 ms wall; vLLM TP2 GPU baseline 49.4 ms.
+- Trace CPU-op search found no `.cpu()`, `bincount`, NumPy, argsort, or host sort operation in either trace. MoE metadata is produced by vLLM's CUDA `moe_align_block_size_kernel`.
+
+The remaining gap is not host MoE dispatch. At S=1024, GPU busy is 29.7 ms above the vLLM TP2 rank baseline and MoE alone is 23.3 ms; TP1 reads full expert weights while the baseline is TP2. At S=4096, GPU busy exceeds baseline by 83.5 ms while MoE is 37.6 ms, so KDA/MLA/dense TP1 work and the 26-layer Python launch span dominate the residual. The installed package has no tuned H200 config for E=256/N=1024 and emits the default-config warning, leaving additional fused-MoE tuning headroom.

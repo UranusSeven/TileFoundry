@@ -227,10 +227,14 @@ def main(argv=None) -> int:
     print(f"loading {ckpt} ...", flush=True)
     if args.tp == 2:
         session = rt2.SessionTP2(
-            cfg, ckpt=ckpt, capacity=need, device=device, verbose=args.verbose
+            cfg, ckpt=ckpt, capacity=need, device=device, verbose=args.verbose,
+            prepare_moe_prefill=args.prefill == "paged",
         )
     else:
-        session = rt.Session(cfg, ckpt=ckpt, capacity=need, verbose=args.verbose)
+        session = rt.Session(
+            cfg, ckpt=ckpt, capacity=need, verbose=args.verbose,
+            prepare_moe_prefill=args.prefill == "paged",
+        )
     print(
         f"loaded {session.loaded_bytes / 1e9:.1f} GB in {session.load_seconds:.1f}s"
         f"  ({session.loaded_bytes / 1e9 / session.load_seconds:.2f} GB/s)",
@@ -269,8 +273,7 @@ def main(argv=None) -> int:
         # Loop prefill absorbs the decode half inside its own timed loop; a
         # server pays all of it once at startup, so the timed sections below
         # run warm.
-        warm_logits = pf.prefill(session, prompt_ids)
-        session.step(int(warm_logits.argmax()))
+        warm_logits = pf.prefill(session, prompt_ids, prepare_decode=False)
         session.reset()
     torch.cuda.synchronize()
     t0 = time.perf_counter()

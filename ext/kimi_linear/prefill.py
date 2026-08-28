@@ -11,10 +11,9 @@ M3-B. Three pieces:
   over the pages, the production counterpart of the `tf.paged_mla_prefill`
   HIR op in `ops.py`. KDA: fla's `chunk_kda` over the whole prompt, with the
   causal depthwise convolutions and the forget gate computed batched in
-  torch. MoE / dense MLP: plain batched torch -- the decode kernels are
-  S=1-shaped, and prefill here is correctness first (the gather-per-token
-  routed-expert loop reads every selected expert's weights per token; a
-  grouped-by-expert variant is the performance follow-up).
+  torch. MoE uses vLLM's fused experts with GPU-only dispatch by default; the
+  corrected TileLang grouped kernel remains an explicit fallback. Dense MLP is
+  plain batched torch. Decode kernels remain S=1-shaped and unchanged.
 * `prefill(session, prompt_ids)` -- the driver: embed, walk the layers,
   closing norm and head on the last position, then install the state the
   decode driver continues from. The handoff is contract option (a): KDA
@@ -36,8 +35,14 @@ from fla.ops.kda import chunk_kda
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 try:
     from .kernels.moe_prefill import grouped_routed
+    from .kernels.moe_prefill_vllm import (
+        fused_routed, implementation, restore_decode_weights,
+    )
 except ImportError:
     from kernels.moe_prefill import grouped_routed
+    from kernels.moe_prefill_vllm import (
+        fused_routed, implementation, restore_decode_weights,
+    )
 
 # The dims, spelled as runtime_model spells them (the published config's).
 _HID = 2304
@@ -295,12 +300,17 @@ def _router(tokens, w_router, bias, routed_scale):
 
 
 def moe_prefill(hidden, w, routed_scale, chunk: int = 32):
-    """Prefill MoE using expert-sorted grouped GEMM."""
+    """Prefill MoE with GPU-only vLLM dispatch or the TileLang fallback."""
     length = hidden.shape[1]
     hn = _rms(hidden, w["gamma_post"])
     tokens = hn.reshape(length, _HID)
     weights, indices = _router(tokens, w["w_router"], w["bias"], routed_scale)
-    routed = grouped_routed(tokens, weights, indices, w["w_gate"], w["w_up"], w["w_down"])
+    if implementation() == "vllm":
+        routed = fused_routed(tokens, weights, indices, w["w_gate_up"], w["w_down"])
+    else:
+        routed = grouped_routed(
+            tokens, weights, indices, w["w_gate"], w["w_up"], w["w_down"]
+        )
     x = tokens.reshape(1, length, _HID)
     shared = torch.matmul(
         F.silu(torch.matmul(x, w["sh_gate"])) * torch.matmul(x, w["sh_up"]),
@@ -319,7 +329,7 @@ def mlp_prefill(hidden, w):
 
 
 @torch.no_grad()
-def prefill(session, prompt_ids, moe_chunk: int = 32):
+def prefill(session, prompt_ids, moe_chunk: int = 32, *, prepare_decode: bool = True):
     """The prompt through the whole stack in one pass.
 
     Returns last-position
@@ -358,6 +368,8 @@ def prefill(session, prompt_ids, moe_chunk: int = 32):
                 hidden = hidden + moe_prefill(
                     hidden, ffn._bound, session.routed_scale, moe_chunk
                 )
+                if prepare_decode and implementation() == "vllm":
+                    restore_decode_weights(ffn._bound)
             else:
                 hidden = hidden + mlp_prefill(hidden, ffn._bound)
 

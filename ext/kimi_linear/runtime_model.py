@@ -428,6 +428,7 @@ class Session:
         device="cuda",
         capacity: int = 1024,
         verbose=False,
+        prepare_moe_prefill=False,
     ) -> None:
         self.cfg = sem.config if cfg is None else cfg
         self.device = device
@@ -446,6 +447,12 @@ class Session:
         )
         self.twin.load(resource)
         self._post_load()
+        try:
+            from .kernels.moe_prefill_vllm import prepare_fused_weights
+        except ImportError:
+            from kernels.moe_prefill_vllm import prepare_fused_weights
+        if prepare_moe_prefill:
+            prepare_fused_weights(self.twin, self.kinds)
         self.load_seconds = time.perf_counter() - t0
         self.loaded_bytes = tally["bytes"]
 
