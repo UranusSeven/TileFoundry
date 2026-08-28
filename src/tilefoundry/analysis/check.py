@@ -20,7 +20,6 @@ from tilefoundry.ir.core.pattern import DimVarRangePat
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.grid_region import GridRegionExpr
 from tilefoundry.ir.hir.specialize import (
-    PROVENANCE,
     SpecializationError,
     _record_complete_bindings,
     dim_vars_reached,
@@ -51,10 +50,10 @@ from tilefoundry.ir.types.substitute import (
     substitute_shape_dim,
     substitute_topology_dims,
 )
-from tilefoundry.ir.visitor import ExprMutator
+from tilefoundry.ir.visitor import ExprCloner
 from tilefoundry.target import UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import CostContext, FunctionScope, TypeInferContext
-from tilefoundry.visitor_registry.visitors import CostEvaluator
+from tilefoundry.visitor_registry.visitors import TypeInferVisitor
 
 from .compute_cost import _call_cost_record, _is_structural_occurrence
 from .errors import AnalysisError
@@ -69,7 +68,7 @@ from .metadata import (
 )
 from .movement import call_traffic
 from .preflight import infer_authored_types, validate_call_context
-from .walk import describe, postorder, reachable_functions, tensor_types
+from .walk import collect_exprs, describe, reachable_functions, tensor_types
 
 _INLINE_NODES = 10_000
 _DERIVED_METADATA = {
@@ -299,16 +298,14 @@ def _call_placements(
     selected = module.resolve_topology(level)
     timed = _timed_level(module.resolve_target())
     scope = FunctionScope(module, function)
-    whole = CostEvaluator(CostContext(scope=scope))
-    local = CostEvaluator(
-        CostContext(
-            scope=scope,
-            level=level,
-            topologies=module.effective_topologies(),
-        )
+    whole = CostContext(scope=scope)
+    local = CostContext(
+        scope=scope,
+        level=level,
+        topologies=module.effective_topologies(),
     )
     result: dict[int, Placement] = {}
-    for expr in postorder(function.body):
+    for expr in collect_exprs(function.body):
         if not isinstance(expr, Call) or isinstance(expr.target, Function):
             continue
         try:
@@ -327,7 +324,7 @@ def _call_placements(
 class AnalysisCheckContext:
     """What every input check reads: the program, the machine, and the level.
 
-    The evaluators are bound to the derived Function the analyses will read, so
+    The cost contexts are bound to the derived Function the analyses will read, so
     a check answers about the same program they do. Costing here is a question,
     not a record: nothing this context computes is attached.
     """
@@ -336,8 +333,8 @@ class AnalysisCheckContext:
     function: Function
     target: object
     level: str | None
-    whole: CostEvaluator
-    local: CostEvaluator
+    whole: CostContext
+    local: CostContext
 
     @property
     def selected_topology(self) -> Topology:
@@ -355,9 +352,9 @@ def analysis_check_context(
 ) -> AnalysisCheckContext:
     """Bind one context to the derived Function the analyses will read."""
     scope = FunctionScope(module, function)
-    whole = CostEvaluator(CostContext(scope=scope))
-    local = CostEvaluator(
-        CostContext(scope=scope, level=level, topologies=module.effective_topologies())
+    whole = CostContext(scope=scope)
+    local = CostContext(
+        scope=scope, level=level, topologies=module.effective_topologies()
     )
     return AnalysisCheckContext(
         module=module,
@@ -601,7 +598,7 @@ def _resource_parameters(
     paths = _module_paths(module)
     needed: dict[_ResourceKey, Var] = {}
     for caller in reachable_functions(function):
-        for expr in postorder(caller.body):
+        for expr in collect_exprs(caller.body):
             if not isinstance(expr, Call) or not isinstance(expr.target, Function):
                 continue
             owner = _call_reading(module, caller, expr)
@@ -646,76 +643,48 @@ def _view_metadata(expr: Expr) -> tuple:
     )
 
 
-class _InlineMutator(ExprMutator):
-    def __init__(self, owner, env, memo, function, path, active) -> None:
+class _InlineMutator(ExprCloner):
+    def __init__(self, owner, function, path, active) -> None:
         super().__init__()
         self.owner = owner
-        self.env = env
-        self.memo = memo
         self.function = function
         self.path = path
         self.active = active
 
-    def _cached(self, expr):
-        bound = self.env.get(id(expr))
+    def visit_Var(self, expr: Var, ctx: Mapping[int, Expr]) -> Expr:
+        bound = ctx.get(id(expr))
         if bound is not None:
             return bound
-        return self.memo.get(id(expr))
+        return replace(expr, metadata=_view_metadata(expr))
 
-    def _finish(self, expr, rebuilt):
-        self.memo[id(expr)] = rebuilt
-        return rebuilt
+    def visit_Constant(self, expr: Constant, ctx: Mapping[int, Expr]) -> Expr:
+        return replace(expr, metadata=_view_metadata(expr))
 
-    def visit_Var(self, expr: Var) -> Expr:
-        cached = self._cached(expr)
-        if cached is not None:
-            return cached
-        return self._finish(expr, replace(expr, metadata=_view_metadata(expr)))
-
-    def visit_Constant(self, expr: Constant) -> Expr:
-        cached = self._cached(expr)
-        if cached is not None:
-            return cached
-        return self._finish(expr, replace(expr, metadata=_view_metadata(expr)))
-
-    def visit_Tuple(self, expr: Tuple) -> Expr:
-        cached = self._cached(expr)
-        if cached is not None:
-            return cached
-        rebuilt = replace(
+    def visit_Tuple(self, expr: Tuple, ctx: Mapping[int, Expr]) -> Expr:
+        return replace(
             expr,
-            elements=tuple(self.visit(item) for item in expr.elements),
+            elements=tuple(self.visit(item, ctx) for item in expr.elements),
             metadata=_view_metadata(expr),
         )
-        return self._finish(expr, rebuilt)
 
-    def visit_GridRegionExpr(self, grid: GridRegionExpr) -> GridRegionExpr:
-        cached = self._cached(grid)
-        if cached is not None:
-            return cached
-        init_args = tuple(self.visit(item) for item in grid.init_args)
+    def visit_GridRegionExpr(
+        self, grid: GridRegionExpr, ctx: Mapping[int, Expr]
+    ) -> GridRegionExpr:
+        init_args = tuple(self.visit(item, ctx) for item in grid.init_args)
         induction_var = replace(
             grid.induction_var, metadata=_view_metadata(grid.induction_var)
         )
         carried_args = tuple(
             replace(item, metadata=_view_metadata(item)) for item in grid.carried_args
         )
-        inner_env = dict(self.env)
+        inner_env = dict(ctx)
         inner_env[id(grid.induction_var)] = induction_var
         inner_env.update(
             (id(old), new) for old, new in zip(grid.carried_args, carried_args)
         )
-        inner = _InlineMutator(
-            self.owner,
-            inner_env,
-            self.memo,
-            self.function,
-            self.path,
-            self.active,
-        )
-        body = inner.visit(grid.body)
-        yield_values = tuple(inner.visit(item) for item in grid.yield_values)
-        rebuilt = replace(
+        body = self.visit(grid.body, inner_env)
+        yield_values = tuple(self.visit(item, inner_env) for item in grid.yield_values)
+        return replace(
             grid,
             induction_var=induction_var,
             carried_args=carried_args,
@@ -724,18 +693,14 @@ class _InlineMutator(ExprMutator):
             yield_values=yield_values,
             metadata=_view_metadata(grid),
         )
-        return self._finish(grid, rebuilt)
 
-    def visit_Call(self, expr: Call) -> Expr:
-        cached = self._cached(expr)
-        if cached is not None:
-            return cached
+    def visit_Call(self, expr: Call, ctx: Mapping[int, Expr]) -> Expr:
         target = expr.target
         call_index = None
         if isinstance(target, Function):
             call_index = self.owner.function_call_counters[-1]
             self.owner.function_call_counters[-1] += 1
-        new_args = tuple(self.visit(arg) for arg in expr.args)
+        new_args = tuple(self.visit(arg, ctx) for arg in expr.args)
         if isinstance(target, Function):
             reading = _call_reading(self.owner.module, self.function, expr)
             supplied = iter(new_args)
@@ -753,11 +718,11 @@ class _InlineMutator(ExprMutator):
                 (*self.path, target.name, str(call_index)),
                 self.active,
             )
-            return self._finish(expr, rebuilt)
+            return rebuilt
         metadata = (*_view_metadata(expr), BindingMetadata(self.owner._binding()))
-        return self._finish(expr, replace(expr, args=new_args, metadata=metadata))
+        return replace(expr, args=new_args, metadata=metadata)
 
-    def default_visit(self, expr: Expr) -> Expr:
+    def default_visit(self, expr: Expr, ctx: Mapping[int, Expr]) -> Expr:
         raise AnalysisError(f"cannot inline unsupported HIR node {type(expr).__name__}")
 
 
@@ -803,7 +768,6 @@ class _Inliner:
             return self.expr(
                 function.body,
                 env,
-                {},
                 function,
                 path,
                 active | {identity},
@@ -815,12 +779,11 @@ class _Inliner:
         self,
         expr: Expr,
         env: Mapping[int, Expr],
-        memo: dict[int, Expr],
         function: Function,
         path: tuple[str, ...],
         active: frozenset[int],
     ) -> Expr:
-        return _InlineMutator(self, env, memo, function, path, active).visit(expr)
+        return _InlineMutator(self, function, path, active).visit(expr, env)
 
 
 def _inline_view(module: Module, function: Function, budget: int) -> Function:
@@ -848,7 +811,7 @@ def _inline_view(module: Module, function: Function, budget: int) -> Function:
         module, resources, paths, {param.name for param in view_params}
     )
     body = inliner.function_body(function, env, (function.name,), frozenset())
-    size = len(postorder(body))
+    size = len(collect_exprs(body))
     if size > budget:
         raise AnalysisError(
             f"inlining {function.name!r} produces {size} body nodes, exceeding "
@@ -864,7 +827,7 @@ def _inline_view(module: Module, function: Function, budget: int) -> Function:
         variants=(),
         converters=(),
     )
-    object.__setattr__(view, PROVENANCE, function)
+    view._specialized_from = function
     return view
 
 
@@ -910,13 +873,16 @@ def check_program(
     infer_authored_types(functions, module)
     validate_call_context(module, functions)
     derived = _inline_view(module, function, budget)
+    TypeInferVisitor(owns_body=True).visit(
+        derived.body, TypeInferContext(scope=FunctionScope(module, derived))
+    )
     checkers = tuple(analyzer.input_checker for analyzer in analyzers)
     if not checkers:
         return derived
     ctx = analysis_check_context(module, derived, level)
     for checker in checkers:
         checker.check_target(ctx)
-    for expr in postorder(derived.body):
+    for expr in collect_exprs(derived.body):
         if not isinstance(expr, Call) or isinstance(expr.target, Function):
             continue
         for checker in checkers:

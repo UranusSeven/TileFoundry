@@ -57,7 +57,8 @@ class Function(Expr):
   - an `Expr` subclass whose value type is the function signature; always returns
     by value (explicit output params are TIR-only). Typing and shape-dispatch
     rules are stated below.
-  - defined as a frozen dataclass — instances are immutable after construction.
+  - mutable during the compiler's authorised typing, metadata, and specialization updates;
+    fields that are not updated retain structural equality and hashing semantics.
   - a `Function` MUST NOT declare or override execution context. The `Module`
     that owns it declares the `Target` and the ordered `Topology` hierarchy its
     body runs against ([core-ir §1](./core-ir.md#1-module)).
@@ -115,39 +116,36 @@ declares, but it MUST NOT create a level or change one's extent.
 `return_type`. The projection is fixed at construction and stays
 consistent across construction sites.
 
-**Call typing — elaboration.** The template a `@func` declares lives at the
-Python-source level; IR never carries a template object or a shared
-polymorphic body. A `Call` whose target is a `Function` types by
-*elaboration*: `elaborate(callee, arg_types)` binds each parameter to the
-caller's actual argument type, then reconstructs the body under that
-binding — every node the reconstruction touches is typeinferred afresh and
-stamped exactly once, so **the callee specializes per call site** and a
-caller-supplied layout (sharding) flowing into a layout-unconstrained
-parameter propagates through the whole body, including through a `Tuple` or
-`GridRegionExpr` return. The result of elaboration is the concrete
-`Function` instance that becomes the `Call`'s `target`; the `Call`'s type is
-that instance's (re-derived) body type, never a stale `return_type` field
-carried over from a different call site.
+**Call typing — visitor-scoped inference.** A `Call` keeps its authored
+`Function` template as `target`. Its result type is inferred by seeding a new
+visitor memo with the actual argument types bound to the callee's formal
+parameters, then walking the callee body in a child context. This is type
+inference only: it does not rebuild a `Function`, mutate the target, or create
+a per-call instance.
+Caller-supplied layout (sharding) flowing into a layout-unconstrained
+parameter propagates through the body, including through a `Tuple` or
+`GridRegionExpr` return.
 
-How a `Call` binds is part of what it states: which declared parameters
-`Call.args` supply, and the scope
-([visitor-registry §4](./visitor-registry.md#4-instance-1--typeinfer)) the
-callee's body is read in. Argument types bind to the supplied parameters in
-order; a parameter the call does not supply keeps its declared type in the
-rebuilt signature, which for a `ConstTensor` is already concrete — no value it
-stands for enters the IR, and what fills it comes from outside
+Within one inference traversal, repeated calls to the same `Function` object
+with equal argument types MUST reuse the previously inferred result type. The
+cache key uses callee identity and the argument-type tuple; the cached value is
+only a `Type`, never a derived `Function` or a replacement `Call.target`.
+
+Argument types bind to supplied parameters in order. A `ConstTensor` parameter
+owned by a direct child module is omitted from `Call.args` and keeps its
+declared type in the callee visitor memo; no value it stands for enters the IR,
+and what fills it comes from outside
 ([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)). The
-binding is part of the elaboration cache key. It MUST be stated by the call in
-the scope it is read in, never counted from how many arguments the call passes,
-and it is not a question the context answers.
+child-module resolver in the walk context
+([visitor-registry §4](./visitor-registry.md#4-instance-1--typeinfer)) decides
+whether this omission is available before collection.
 
 Omitting a parameter is valid only where, within that scope, the callee is
 uniquely owned by a direct child of the caller's owner
 ([core-ir §1](./core-ir.md#1-module)); before collection the authored binding
 answers the same question of the child it names. Ownership that is missing,
-ambiguous, or not a direct child supplies every declared parameter, as does
-`elaborate` with no call in hand, so a standalone or low-level call cannot
-acquire implicit constants.
+ambiguous, or not a direct child supplies every declared parameter, so a
+standalone or low-level call cannot acquire implicit constants.
 
 Caller and callee MUST resolve one effective `Target` and one effective topology
 hierarchy: a same-kernel call is one execution context, whichever `Module` owns
@@ -164,12 +162,12 @@ Argument ↔ parameter binding is:
 - A parameter that carries a `ShardLayout` is an explicit **contract**: the
   argument type MUST match it exactly.
 - Any other parameter requires exact type equality.
-- `DimVar` shapes keep envelope matching — elaboration does not
+- `DimVar` shapes keep envelope matching — inference does not
   monomorphize a dynamic shape into a concrete one (that is **Shape
-  dispatch and specializations** below, unaffected by elaboration).
+  dispatch and specializations** below, unaffected by call typing).
 
 The per-mesh-axis `Partial` state is part of the actual argument type. When a
-layout-unconstrained parameter binds to a sharded argument, elaboration MUST
+layout-unconstrained parameter binds to a sharded argument, inference MUST
 carry each `Partial(reduction)` at its original mesh-axis index through the
 body and into the concrete return type, including tuple fields. Only an
 explicit `Reshard` or allreduce may complete that state.
@@ -177,24 +175,15 @@ explicit `Reshard` or allreduce may complete that state.
 When the body cannot express a propagated sharding (e.g. a reshape
 whose layout factorization straddles a new axis), typeinfer fails at that
 op, not at the boundary. A dispatch-prototype callee
-(`variants != ()`, `body is None`) is not elaborated: the call's
+(`variants != ()`, `body is None`) is not walked: the call's
 result is the declared `return_type` and the `None` body is never inspected
 (variant selection is **Shape dispatch and specializations** below).
 
-An elaborated instance MUST record the function it was rebuilt from, the same
-record a specialization writes (`origin_of`, **Function specialization API**
-below), so the instance in a `Call.target` stays connected to the function a
-Module owns without matching on the name they share. It records no bound
-dimensions: a call site binds parameter types, it does not choose an extent.
-
-Elaboration memoizes per construction session — one parser run, or one
-top-level `elaborate` call and every nested call it re-elaborates — keyed
-on (callee, argument types): two call sites of the same callee with
-identical argument types MUST resolve to the identical `Function`
-instance, not merely an equal one, so a viewer/printer keyed on instance
-identity renders one node per distinct specialization. The memo is
-session-local state, not module or process state; it carries nothing
-across sessions.
+Call typing does not record provenance or bound dimensions because no
+call-site function instance is created. Explicit specialization remains the
+separate operation that produces a derived `Function`; such a derived
+function records its origin and chosen dimensions as specified by the
+**Function specialization API** below.
 
 **Signature annotation `Layout.strides` materialization.** A
 `Tensor[..., (sugar)]` annotation on a parameter or return appears
@@ -223,9 +212,9 @@ structured exception that carries loop-phi-shaped SSA is
 `GridRegionExpr` ([§1.2](#12-gridregionexpr)). Everything else is a
 pure Call DAG.
 
-**Function typing rules.** Enforced by the registered
-`@register_typeinfer(Function)` body via `ctx.error(...)`
-([visitor-registry §4](./visitor-registry.md#4-instance-1--typeinfer)):
+**Function typing rules.** `Function` is not an `Op` and is not registered in
+the Op typeinfer registry. `TypeInferVisitor` handles it directly as a
+`Call.target`; structural signature rules are enforced by the HIR verifier:
 
 - `Function.body` is a single Expr; Stmts MUST NOT appear.
 - `Function.params` entries MUST be `Var`s.
@@ -349,7 +338,7 @@ class GridRegionExpr(Expr):
   - the only HIR exception to pure Call DAG: loop-phi-shaped structured SSA that
     folds a tile-style loop into one `Expr` value; `type` is `TensorType` (single
     carry) or `TupleType` (multi-carry).
-  - defined as a frozen dataclass — instances are immutable after construction.
+  - mutable during the compiler's authorised typing and metadata updates.
 
 **Iteration domain.** Both DSL loop surfaces — `for i in tile(...)` and
 `for i in range(...)` — lower to this one node; they share the domain
@@ -400,6 +389,13 @@ len(yield_values)`; all three are empty for a no-carry loop. The node
 is self-contained: the first-iteration value of each `carried_args`
 phi is its `init_args` entry, not a name looked up in the enclosing
 parser scope.
+
+Type inference first derives every `init_args` type in the enclosing visitor.
+It then opens a new visitor over the same context, seeded with the enclosing
+memo plus the induction variable's annotation and each `carried_args` phi bound
+to its matching init type. The body and yields are derived in that region
+visitor. A carry result is read from those phi bindings, never from the phi
+node's stamped `.type`.
 
 `GridRegionExpr.type` is `TensorType` (single carry) or `TupleType`
 (multi-carry); the value is the Expr itself, not a `Call`.
@@ -1616,10 +1612,8 @@ def is_concrete(fn: Function) -> bool:
   - `specialize_function` MUST reject an empty binding, an unknown dimension,
     or a selected implementation with no body. It MUST record the chosen
     implementation and sorted bindings on a rebuilt function so `origin_of`
-    and `bound_dims_of` can recover them. A rebuild that chose no extent — a
-    call site's elaboration — MUST record its origin and no bindings, so
-    `bound_dims_of` stays `None` and two call sites of one callee are not
-    reported as one program at one size.
+    and `bound_dims_of` can recover them. Function calls do not rebuild their
+    targets and therefore do not create provenance records.
   - `specialize_concretely` MUST require a non-empty string-to-integer mapping
     and MUST reject any residual dimension after specialization.
   - Provenance and bound-dimension records MUST NOT participate in structural

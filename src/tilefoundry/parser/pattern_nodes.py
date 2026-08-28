@@ -1838,8 +1838,9 @@ class CallTypeInferenceRule:
         infer_context = context.lexical_scope.lookup(_TYPE_INFER_CONTEXT)
         if not isinstance(infer_context, runtime.TypeInferContext):
             infer_context = runtime.TypeInferContext()
-        computed = runtime.TypeInferVisitor(infer_context).visit(value)
-        return dataclasses.replace(value, type=computed)
+        computed = runtime.TypeInferVisitor().visit(value, infer_context)
+        value.type = computed
+        return value
 
 
 class CallExpectedTypeRule:
@@ -2335,13 +2336,7 @@ class CallPattern(ElementPattern):
                 target=callee,
                 args=args,
             )
-            infer_context = context.lexical_scope.lookup(_TYPE_INFER_CONTEXT)
-            if not isinstance(infer_context, runtime.TypeInferContext):
-                infer_context = runtime.TypeInferContext()
-            instance = runtime.elaborate(
-                callee, tuple(arg.type for arg in args), infer_context, placeholder
-            )
-            return dataclasses.replace(placeholder, target=instance)
+            return placeholder
         raise RuntimeError(f"no constructor branch for {match.branch_id!r}")
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = (
@@ -3956,7 +3951,7 @@ class StatementPattern(ElementPattern):
                         f"duplicate where annotation for Expr {label!r}",
                     )
                 value = replace_metadata(value, BindingMetadata(match.captures["name"]))
-                object.__setattr__(value, "metadata", (*value.metadata, annotation))
+                value.metadata = (*value.metadata, annotation)
             elif annotation is not None and value.type != annotation:
                 raise ParseError.from_node(
                     match.node, context, "annotated assignment type mismatch"
@@ -4088,7 +4083,7 @@ class FunctionReturnRule:
             infer_context = context.lexical_scope.lookup(_TYPE_INFER_CONTEXT)
             if not isinstance(infer_context, runtime.TypeInferContext):
                 infer_context = runtime.TypeInferContext()
-            body_type = runtime.TypeInferVisitor(infer_context).visit(value.body)
+            body_type = runtime.TypeInferVisitor().visit(value.body, infer_context)
             if not _types_compatible(body_type, value.return_type):
                 raise ParseError.from_node(
                     match.node,
@@ -4297,10 +4292,10 @@ class FunctionPattern(ElementPattern):
                 specializations=specializations,
             )
             if context.function.role is FunctionRole.VARIANT:
-                object.__setattr__(function, runtime.DISPLAY_NAME, match.captures["name"])
-                object.__setattr__(function, "name", function_name)
+                setattr(function, runtime.DISPLAY_NAME, match.captures["name"])
+                function.name = function_name
             elif context.function.role is FunctionRole.CONVERTER:
-                object.__setattr__(function, "name", f"{function_name}.converter[{converter}]")
+                function.name = f"{function_name}.converter[{converter}]"
             binding = context.function.binding_name or match.captures["name"]
             define = getattr(context.function.module_scope, "define", None)
             if callable(define):

@@ -24,7 +24,7 @@ from tilefoundry.ir.types.dim_isl import normalize_dim
 from tilefoundry.ir.types.shard import ComposedLayout, Layout, make_mesh
 from tilefoundry.ir.types.shard.shard_layout import ShardLayout, Split, shard_layout_of
 from tilefoundry.visitor_registry.contexts import CostContext, TrafficBytes
-from tilefoundry.visitor_registry.visitors import CostEvaluator
+from tilefoundry.visitor_registry.visitors import CostEvaluator, TypeInferVisitor
 
 _F = DType.f32
 _M = make_mesh((4,))
@@ -48,7 +48,7 @@ def _slice_call(source, starts, sizes, strides, *, source_expr=None):
         target=Slice(sizes=sizes, strides=strides),
         args=(source_expr, starts_expr),
     )
-    return replace(call, type=TypeInferContext().type_of(call))
+    return replace(call, type=TypeInferVisitor().visit(call, TypeInferContext()))
 
 
 def _slice_type(source, starts, sizes, strides):
@@ -203,9 +203,9 @@ def test_fused_gqa_qkv_slices_keep_distribution_visible_to_consumers():
 
     add = Binary(kind=BinaryKind.ADD)
     q_used = Call(type=q.type, target=add, args=(q, q))
-    q_used = replace(q_used, type=TypeInferContext().type_of(q_used))
+    q_used = replace(q_used, type=TypeInferVisitor().visit(q_used, TypeInferContext()))
     kv_used = Call(type=k.type, target=add, args=(k, v))
-    kv_used = replace(kv_used, type=TypeInferContext().type_of(kv_used))
+    kv_used = replace(kv_used, type=TypeInferVisitor().visit(kv_used, TypeInferContext()))
 
     assert isinstance(q_used.type.layout, ShardLayout)
     assert isinstance(kv_used.type.layout, ShardLayout)
@@ -229,7 +229,7 @@ def test_slice_cost_charges_coordinates_but_not_the_view():
         (1, 1, 1, 1),
     )
 
-    cost = CostEvaluator(CostContext()).visit(call)
+    cost = CostEvaluator().visit(call, CostContext())
 
     assert cost.flops == {}
     assert cost.traffic == (

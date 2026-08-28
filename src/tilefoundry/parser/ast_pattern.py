@@ -34,7 +34,7 @@ from tilefoundry.ir.core.expr import Tuple as IrTuple
 from tilefoundry.ir.core.kinds import BinaryKind, UnaryKind
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.core.op_schema import OpSchema
-from tilefoundry.ir.hir.function import Function, elaborate
+from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.grid_region import GridRegionExpr
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
@@ -71,7 +71,7 @@ from tilefoundry.ir.types.shard import (
 )
 from tilefoundry.ir.types.shard.layout import LayoutBase
 from tilefoundry.ir.types.storage import StorageKind, resolve_storage
-from tilefoundry.visitor_registry.contexts import CallFeed, FunctionScope, TypeInferContext
+from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 from tilefoundry.visitor_registry.visitors import TypeInferVisitor
 
 T = TypeVar("T")
@@ -207,7 +207,6 @@ runtime = SimpleNamespace(
     canonical_shard_layout=canonical_shard_layout,
     composed=composed,
     dim_expr=dim_expr,
-    elaborate=elaborate,
     normalize_dim=normalize_dim,
     slice_size=slice_size,
     simplify_dim=simplify_dim,
@@ -775,12 +774,12 @@ class FuncParserContext:
 
 
 @dataclass(frozen=True)
-class ParserCallFeedProvider:
-    """Build call feeds from the authored module scope during parsing."""
+class ParserChildModuleResolver:
+    """Resolve callees owned by authored child modules during parsing."""
 
     module_scope: object | None
 
-    def _child_for(self, callee: object):
+    def child_for(self, callee: object):
         if self.module_scope is None:
             return None
         for _name, child in self.module_scope.items():
@@ -788,27 +787,17 @@ class ParserCallFeedProvider:
                 return child
         return None
 
-    def build_call_feed(self, callee: object, supplied: tuple[object, ...]) -> CallFeed:
-        child = self._child_for(callee)
-        params = tuple(p for p in callee.params if not (child is not None and p.is_const))
-        if len(supplied) != len(params):
-            kind = "activation(s)" if child is not None else "parameter(s)"
-            raise VerifyError(
-                f"hir Function call {callee.name!r}: arity mismatch — "
-                f"callee declares {len(params)} {kind}, call passed {len(supplied)}"
-            )
-        given = iter(supplied)
-        return CallFeed(
-            {
-                id(param): param.type if child is not None and param.is_const else next(given)
-                for param in callee.params
-            }
-        )
 
-    def scope_for(self, callee: object) -> FunctionScope | None:
-        child = self._child_for(callee)
-        return None if child is None else FunctionScope(child, callee)
+@dataclass
+class ParserTypeInferContext(TypeInferContext):
+    """Type inference state with parser-local child-module resolution."""
 
+    child_resolver: ParserChildModuleResolver | None = None
+
+    def child_for(self, callee: object):
+        if self.child_resolver is not None:
+            return self.child_resolver.child_for(callee)
+        return super().child_for(callee)
 
 @dataclass(frozen=True)
 class ModuleFunctionValidationRule:
@@ -1169,13 +1158,13 @@ class MatchContext:
     def from_function(cls, function: FuncParserContext) -> MatchContext:
         scope = LexicalScope()
         provider = (
-            ParserCallFeedProvider(function.module_scope)
+            ParserChildModuleResolver(function.module_scope)
             if function.module_scope is not None
             else None
         )
         scope.define(
             _TYPE_INFER_CONTEXT,
-            runtime.TypeInferContext(call_feed_provider=provider),
+            ParserTypeInferContext(child_resolver=provider),
         )
         return cls(
             function=function,
@@ -1206,13 +1195,13 @@ class MatchContext:
         if switching_function:
             scope = LexicalScope()
             provider = (
-                ParserCallFeedProvider(function.module_scope)
+                ParserChildModuleResolver(function.module_scope)
                 if function is not None and function.module_scope is not None
                 else None
             )
             scope.define(
                 _TYPE_INFER_CONTEXT,
-                runtime.TypeInferContext(call_feed_provider=provider),
+                ParserTypeInferContext(child_resolver=provider),
             )
         else:
             scope = self.lexical_scope.fork() if isolated_scope else self.lexical_scope
@@ -1626,7 +1615,7 @@ def _infer_call(operation, args, context):
     infer_context = context.lexical_scope.lookup(_TYPE_INFER_CONTEXT)
     if not isinstance(infer_context, runtime.TypeInferContext):
         infer_context = runtime.TypeInferContext()
-    inferred = runtime.TypeInferVisitor(infer_context).visit(placeholder)
+    inferred = runtime.TypeInferVisitor().visit(placeholder, infer_context)
     return dataclasses.replace(placeholder, type=inferred)
 
 

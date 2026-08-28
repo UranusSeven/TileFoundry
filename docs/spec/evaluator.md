@@ -8,9 +8,9 @@ does not lower to TIR or invoke codegen / runtime.
 ```mermaid
 flowchart TB
     evaluate["<b>evaluate()</b><br/>entry"]
-    Evaluator["<b>Evaluator</b><br/>ExprVisitor[Value]"]
+    Evaluator["<b>EvaluatorVisitor</b><br/>ExprVisitor[Value]"]
     registry["<b>eval_registry</b><br/>register_eval(Op)"]
-    handler["per-op handler<br/>(EvalContext → Value)"]
+    handler["per-op handler<br/>(EvaluateContext → Value)"]
     Value["<b>Value</b>"]
     TensorValue["<b>TensorValue</b><br/>(data, type)"]
     TupleValue["<b>TupleValue</b><br/>(elements)"]
@@ -131,27 +131,31 @@ def register_eval(op_cls: type[Op]):
     ...
 ```
 
-A handler receives an `EvalContext` and returns a `Value`:
+A handler receives an `EvaluateContext` and returns a `Value`:
 
 ```python
-class EvalContext:
-    """Carry one registered evaluator invocation.
+class EvaluateContext:
+    """Carry one recursive evaluation and registered evaluator invocation.
 
     Attributes:
         op: attribute; Operation instance.
         args: attribute; Evaluated operands in Call-argument order.
         result_type: attribute; Call result type.
+        loaded_module: attribute; Runtime module reading, when one is active.
         device: attribute; Backend device name.
         dim_bindings: attribute; concrete values for symbolic ShapeDims.
     """
 
-    op: Any
-    args: tuple[Any, ...]
-    result_type: Any
+    op: Any = None
+    args: tuple[Any, ...] = ()
+    result_type: Any = None
+    loaded_module: Any | None = None
     device: str = "cpu"
-    dim_bindings: dict[str, int] | None = None
+    dim_bindings: Mapping[str, int] = field(default_factory=dict)
 
-def handler(ctx: EvalContext) -> Value:
+    def for_op(self, op: Any, args: tuple[Any, ...], result_type: Any) -> EvaluateContext: ...
+
+def handler(ctx: EvaluateContext) -> Value:
     """Evaluate one registered Op invocation."""
     ...
 ```
@@ -167,11 +171,11 @@ Evaluation is an `ExprVisitor[Value]`
 a shared sub-DAG ([hir §1.1](./hir.md#11-function)) is evaluated once:
 
 ```python
-class Evaluator(ExprVisitor):
+class EvaluatorVisitor(ExprVisitor):
     """Evaluate expressions with identity-based memoization."""
 
-    def visit(self, expr: Expr) -> Value: ...
-    def visit_GridRegionExpr(self, region: GridRegionExpr) -> Value: ...
+    def visit(self, expr: Expr, ctx: EvaluateContext) -> Value: ...
+    def visit_GridRegionExpr(self, region: GridRegionExpr, ctx: EvaluateContext) -> Value: ...
 ```
 
 - A `Var` resolves to its binding in the current environment; a
@@ -180,7 +184,7 @@ class Evaluator(ExprVisitor):
 - A `Call` whose `target` is an `Op` evaluates its operands, then
   dispatches through `eval_registry`
   ([§3](#3-register_eval-and-the-eval-context)).
-- `EvalContext` carries evaluated operands and concrete `dim_bindings` for
+- `EvaluateContext` carries evaluated operands and concrete `dim_bindings` for
   call-invariant `ShapeDim` attributes. Expr-valued runtime data MUST be a Call
   operand; handlers MUST NOT re-enter the evaluator through an attribute.
 - `Slice` consumes its evaluated `starts` tuple and resolves `sizes/strides`
@@ -194,13 +198,16 @@ class Evaluator(ExprVisitor):
   evaluated arguments to the callee's parameters in a fresh environment
   and evaluates the callee `body` — the same value semantics a call site
   has under type inference.
+  Each evaluated argument's HIR type MUST be compatible with its parameter
+  annotation under the Function-boundary rules in HIR; an incompatible value
+  raises `EvalError` before the callee body is evaluated.
 
 ## 5. `GridRegionExpr`
 
 A `GridRegionExpr` ([hir §1.2](./hir.md#12-gridregionexpr)) is a loop over its iteration
 domain whose carry chain starts from `init_args`:
 
-`Evaluator.visit_GridRegionExpr(region)` implements the loop; there is no
+`EvaluatorVisitor.visit_GridRegionExpr(region)` implements the loop; there is no
 separate `eval_grid` function.
 
 - The first iteration binds each `carried_args` phi to the matching

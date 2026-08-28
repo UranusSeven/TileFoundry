@@ -35,12 +35,16 @@ from tilefoundry.ir.core.kinds import BinaryKind, UnaryKind
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.core.pattern import DimVarRangePat, Pattern
 from tilefoundry.ir.hir.function import Function as HirFunction
-from tilefoundry.ir.hir.function import canonical_specialization_signature
 from tilefoundry.ir.hir.grid_region import GridRegionExpr
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
 from tilefoundry.ir.hir.sharding.reshard import Reshard
-from tilefoundry.ir.hir.specialize import dim_vars_reached, display_name, origin_of
+from tilefoundry.ir.hir.specialize import (
+    canonical_specialization_signature,
+    dim_vars_reached,
+    display_name,
+    origin_of,
+)
 from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.slice import Slice, window_base
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
@@ -174,16 +178,16 @@ class _ShapeEntryVisitor(ExprFunctor[str]):
         super().__init__()
         self.nested = nested
 
-    def visit_DimVar(self, entry: DimVar) -> str:
+    def visit_DimVar(self, entry: DimVar, ctx=None) -> str:
         return entry.name
 
-    def visit_Var(self, entry: Var) -> str:
+    def visit_Var(self, entry: Var, ctx=None) -> str:
         return entry.name
 
-    def visit_Constant(self, entry: Constant) -> str:
+    def visit_Constant(self, entry: Constant, ctx=None) -> str:
         return str(entry.value)
 
-    def visit_Call(self, entry: Call) -> str:
+    def visit_Call(self, entry: Call, ctx=None) -> str:
         ceildiv_args = _ceildiv_args(entry)
         if ceildiv_args is not None:
             a, b = ceildiv_args
@@ -202,7 +206,7 @@ class _ShapeEntryVisitor(ExprFunctor[str]):
                 return f"{fname}({rendered})"
         return repr(entry)
 
-    def default_visit(self, entry) -> str:
+    def default_visit(self, entry, ctx=None) -> str:
         if isinstance(entry, bool):
             return repr(entry)
         if isinstance(entry, int):
@@ -213,7 +217,7 @@ class _ShapeEntryVisitor(ExprFunctor[str]):
         previous = self.nested
         self.nested = nested
         try:
-            return self.visit(entry)
+            return self.visit(entry, None)
         finally:
             self.nested = previous
 
@@ -1174,35 +1178,35 @@ def _emit_def(
         def emit(self, expr: Expr) -> None:
             self.visit(expr)
 
-        def visit(self, expr):
+        def visit(self, expr, ctx=None):
             key = id(expr)
             if key in printed:
                 return None
             if key in _inlined_start_ids:
                 printed.add(key)
                 return None
-            return super().visit(expr)
+            return super().visit(expr, ctx)
 
-        def visit_Var(self, expr: Var) -> None:
+        def visit_Var(self, expr: Var, ctx=None) -> None:
             printed.add(id(expr))
 
-        def visit_Constant(self, expr: Constant) -> None:
+        def visit_Constant(self, expr: Constant, ctx=None) -> None:
             lines.append(
                 f"{self.level}{_names[id(expr)]} = {repr(expr.value)}"
                 f"{_comments(expr, options, mesh_map)}"
             )
             printed.add(id(expr))
 
-        def visit_Tuple(self, expr: Tuple) -> None:
+        def visit_Tuple(self, expr: Tuple, ctx=None) -> None:
             for element in expr.elements:
                 if not isinstance(element, Constant):
-                    self.visit(element)
+                    self.visit(element, ctx)
             printed.add(id(expr))
 
-        def visit_GridRegionExpr(self, expr: GridRegionExpr) -> None:
+        def visit_GridRegionExpr(self, expr: GridRegionExpr, ctx=None) -> None:
             _emit_grid(expr, self.level)
 
-        def visit_Call(self, expr: Call) -> None:
+        def visit_Call(self, expr: Call, ctx=None) -> None:
             if (
                 isinstance(expr.target, TupleGetItem)
                 and len(expr.args) == 1
@@ -1212,10 +1216,10 @@ def _emit_def(
                 printed.add(id(expr))
                 return
             for arg in expr.args:
-                self.visit(arg)
+                self.visit(arg, ctx)
             _emit_inline_call(expr, self.level)
 
-        def default_visit(self, expr) -> None:
+        def default_visit(self, expr, ctx=None) -> None:
             return None
 
     _expr_emitter = _ExprEmitter("")

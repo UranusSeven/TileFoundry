@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tilefoundry.ir.core import Expr, FunctionScope, TypeInferContext, VerifyError
+from tilefoundry.ir.core import Expr, VerifyError
 from tilefoundry.ir.core.expr import Call, Var
 from tilefoundry.ir.core.pattern import DimVarRangePat
 from tilefoundry.ir.tir.stmt import Stmt
@@ -9,7 +9,8 @@ from tilefoundry.ir.types.dim import DimVar
 from tilefoundry.ir.types.tensor_type import TupleType
 from tilefoundry.ir.visitor import ExprVisitor
 
-from .function import Function, canonical_specialization_signature
+from .function import Function
+from .specialize import canonical_specialization_signature
 
 
 def verify_function(fn: Function, *, module=None) -> None:
@@ -34,8 +35,6 @@ def verify_function(fn: Function, *, module=None) -> None:
         )
     _reject_stmt_nodes(fn.body)
 
-    scope = FunctionScope(module, fn) if module is not None else None
-    TypeInferContext(scope=scope).type_of(fn.body)
 
 
 def _verify_variants(base: Function, *, module=None) -> None:
@@ -141,7 +140,7 @@ class _SignatureDimVisitor(ExprVisitor[None]):
         super().__init__()
         self.bounds = bounds
 
-    def visit_DimVar(self, entry: DimVar) -> None:
+    def visit_DimVar(self, entry: DimVar, ctx=None) -> None:
         prior = self.bounds.get(entry.name)
         if prior is None:
             self.bounds[entry.name] = (entry.lo, entry.hi)
@@ -152,11 +151,11 @@ class _SignatureDimVisitor(ExprVisitor[None]):
                 f"[{entry.lo}, {entry.hi})"
             )
 
-    def visit_Call(self, entry: Call) -> None:
+    def visit_Call(self, entry: Call, ctx=None) -> None:
         for arg in entry.args:
-            self.visit(arg)
+            self.visit(arg, ctx)
 
-    def default_visit(self, entry) -> None:
+    def default_visit(self, entry, ctx=None) -> None:
         return None
 
 
@@ -214,15 +213,15 @@ def _verify_signature_dim_vars(fn: Function) -> None:
 
 
 class _StmtRejectingVisitor(ExprVisitor[None]):
-    def visit_Call(self, expr: Call) -> None:
+    def visit_Call(self, expr: Call, ctx=None) -> None:
         for arg in expr.args:
             if isinstance(arg, Stmt):
                 raise VerifyError(
                     f"hir body contains a Stmt node {type(arg).__name__}; hir is expr-only"
                 )
-            self.visit(arg)
+            self.visit(arg, ctx)
 
-    def default_visit(self, expr) -> None:
+    def default_visit(self, expr, ctx=None) -> None:
         if isinstance(expr, Stmt):
             raise VerifyError(
                 f"hir body contains a Stmt node {type(expr).__name__}; hir is expr-only"

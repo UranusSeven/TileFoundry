@@ -35,7 +35,9 @@ __all__ = [
     "ExprFunctor",
     "ExprVisitor",
     "ExprWalker",
-    "ExprMutator",
+    "ExprCollector",
+    "collect_exprs",
+    "ExprCloner",
     "StmtVisitor",
     "StmtMutator",
     "StmtExprMutator",
@@ -49,13 +51,13 @@ def _expr_children(expr: Expr) -> tuple[Expr, ...]:
 
     Binding-site Var fields (e.g. `GridRegionExpr.induction_var` /
     `GridRegionExpr.carried_args`) are intentionally excluded — rewriting
-    them with a generic ExprMutator could produce type-illegal nodes (a
+    them with a generic ExprCloner could produce type-illegal nodes (a
     non-Var in a `tuple[Var, ...]` slot). A mutator that wants to rename
     or substitute bindings must override `visit_GridRegionExpr` and rebuild
     explicitly.
     """
     match expr:
-        case Var() | Constant() | SymbolRef():
+        case Var() | Constant() | SymbolRef() | ShapeOf():
             return ()
         case Call(args=args):
             return args
@@ -198,18 +200,18 @@ class ExprFunctor[T]:
     def __init__(self) -> None:
         self._root: Expr | None = None
 
-    def visit(self, expr: Expr) -> T:
+    def visit(self, expr: Expr, ctx: Any = None) -> T:
         if self._root is None:
             self._root = expr
-        return self.dispatch_visit(expr)
+        return self.dispatch_visit(expr, ctx)
 
-    def dispatch_visit(self, expr: Expr) -> T:
+    def dispatch_visit(self, expr: Expr, ctx: Any) -> T:
         method = getattr(self, f"visit_{type(expr).__name__}", None)
         if method is not None:
-            return method(expr)
-        return self.default_visit(expr)
+            return method(expr, ctx)
+        return self.default_visit(expr, ctx)
 
-    def default_visit(self, expr: Expr) -> T:
+    def default_visit(self, expr: Expr, ctx: Any) -> T:
         raise NotImplementedError(f"no visit routine for {type(expr).__name__}")
 
     def clear(self) -> None:
@@ -222,6 +224,7 @@ class ExprVisitor[T](ExprFunctor[T]):
     def __init__(
         self,
         *,
+        memo: dict[int, tuple[Expr, T]] | None = None,
         visit_other_functions: bool = False,
         root_function: Expr | None = None,
     ) -> None:
@@ -234,25 +237,39 @@ class ExprVisitor[T](ExprFunctor[T]):
         super().__init__()
         self._root = root_function
         self._visit_other_functions = visit_other_functions
-        self._memo: dict[int, tuple[Expr, T]] = {}
+        self._memo: dict[int, tuple[Expr, T]] = dict(memo) if memo else {}
 
-    def dispatch_visit(self, expr: Expr) -> T:
+    def dispatch_visit(self, expr: Expr, ctx: Any) -> T:
         hit = self._memo.get(id(expr))
         if hit is not None:
             return hit[1]
-        result = super().dispatch_visit(expr)
+        leaf = getattr(self, f"visit_leaf_{type(expr).__name__}", None)
+        if leaf is not None:
+            operands = self.visit_operands(expr, ctx)
+            result = leaf(expr, operands, ctx)
+        else:
+            legacy = getattr(self, f"visit_{type(expr).__name__}", None)
+            if legacy is not None:
+                result = legacy(expr, ctx)
+            elif type(self).default_visit_leaf is ExprVisitor.default_visit_leaf:
+                result = self.default_visit(expr, ctx)
+            else:
+                operands = self.visit_operands(expr, ctx)
+                result = self.default_visit_leaf(expr, operands, ctx)
         self._memo[id(expr)] = (expr, result)
         return result
 
-    def visit_operands(self, expr: Expr) -> None:
+    def visit_operands(self, expr: Expr, ctx: Any) -> tuple[T, ...]:
         """Visit value children from the fixed `_expr_children` table."""
-        for child in _expr_children(expr):
-            self.visit(child)
+        return tuple(self.visit(child, ctx) for child in _expr_children(expr))
+
+    def default_visit_leaf(self, expr: Expr, operands: tuple[T, ...], ctx: Any) -> T:
+        return self.default_visit(expr, ctx)
 
     def can_visit_function_body(self, fn: Expr) -> bool:
         return self._visit_other_functions or fn is self._root
 
-    def visit_function_body(self, fn: Expr) -> T:
+    def visit_function_body(self, fn: Expr, ctx: Any = None) -> T:
         """Enter `fn.body` while retaining `fn` as the explicit root."""
         if self._root is None:
             self._root = fn
@@ -261,7 +278,7 @@ class ExprVisitor[T](ExprFunctor[T]):
         body = getattr(fn, "body", None)
         if body is None:
             raise ValueError(f"cannot visit body of prototype {fn!r}")
-        return self.visit(body)
+        return self.visit(body, ctx)
 
     def clear(self) -> None:
         self._memo.clear()
@@ -271,52 +288,38 @@ class ExprVisitor[T](ExprFunctor[T]):
 class ExprWalker[T](ExprVisitor[T]):
     """Memoized side-effect traversal for the known value Expr shapes."""
 
-    def visit_Call(self, call: Call) -> T:
-        self.visit_operands(call)
-        return None  # type: ignore[return-value]
-
-    def visit_Var(self, var: Var) -> T:
-        return None  # type: ignore[return-value]
-
-    def visit_Constant(self, const: Constant) -> T:
-        return None  # type: ignore[return-value]
-
-    def visit_SymbolRef(self, ref: SymbolRef) -> T:
-        return None  # type: ignore[return-value]
-
-    def visit_Tuple(self, tup: Tuple) -> T:
-        self.visit_operands(tup)
-        return None  # type: ignore[return-value]
-
-    def visit_GridRegionExpr(self, grid: GridRegionExpr) -> T:
-        self.visit_operands(grid)
-        return None  # type: ignore[return-value]
-
-    def visit_Function(self, fn: Expr) -> T:
-        self.visit_operands(fn)
-        return None  # type: ignore[return-value]
-
-    def visit_ShapeOf(self, shape: ShapeOf) -> T:
+    def default_visit_leaf(self, expr: Expr, operands: tuple[T, ...], ctx: Any) -> T:
         return None  # type: ignore[return-value]
 
 
-def _dispatch(obj: Any, node: Any, generic: Callable[[Any], Any]) -> Any:
-    """Dispatch a statement or embedded expression, falling back to `generic`.
+class ExprCollector(ExprWalker[None]):
+    """Append every visited Expr to the list passed as traversal context."""
 
-    Shared by statement visitors and ``StmtExprMutator``; ExprFunctor has its
-    own dispatch point so ExprVisitor can memoize it centrally.
+    def default_visit_leaf(
+        self, expr: Expr, operands: tuple[None, ...], ctx: list[Expr]
+    ) -> None:
+        ctx.append(expr)
+
+
+def collect_exprs(root: Expr | None) -> tuple[Expr, ...]:
+    """Every value reachable from *root*, operands before their consumer.
+
+    The body is an SSA DAG rather than a tree, so a shared value is visited
+    once. Function reachability relies on this operand-before-consumer order:
+    changing it changes the order of callees reached within one caller.
     """
-    method = getattr(obj, f"visit_{type(node).__name__}", None)
-    if method is not None:
-        return method(node)
-    return generic(node)
+    if root is None:
+        return ()
+    found: list[Expr] = []
+    ExprCollector().visit(root, found)
+    return tuple(found)
 
 
 def _generic_expr_rewrite(expr: Expr, visit_fn: Callable[[Expr], Expr]) -> Expr:
     """Rebuild `expr` from `visit_fn`-rewritten children, preserving identity when no child changed.
 
     Rebuild `expr` from `visit_fn`-rewritten children, preserving
-    identity when no child changed. Shared by `ExprMutator.default_visit`
+    identity when no child changed. Shared by `ExprCloner.default_visit`
     and `StmtExprMutator._expr_generic_visit`.
     """
     children = _expr_children(expr)
@@ -326,7 +329,7 @@ def _generic_expr_rewrite(expr: Expr, visit_fn: Callable[[Expr], Expr]) -> Expr:
     return _rebuild_expr(expr, new_children)
 
 
-class ExprMutator(ExprFunctor[Expr]):
+class ExprCloner(ExprVisitor[Expr]):
     """Expr → Expr rewrite with identity preservation.
 
     Invariant: if every child visit returns an `is`-identical object, the
@@ -334,8 +337,8 @@ class ExprMutator(ExprFunctor[Expr]):
     lets callers detect "did this pass change anything" via `new is old`.
     """
 
-    def default_visit(self, expr: Expr) -> Expr:
-        return _generic_expr_rewrite(expr, self.visit)
+    def default_visit(self, expr: Expr, ctx: Any) -> Expr:
+        return _generic_expr_rewrite(expr, lambda child: self.visit(child, ctx))
 
 
 from tilefoundry.ir.hir.function import Function as HirFunction  # noqa: E402
@@ -391,17 +394,20 @@ class StmtExprMutator(StmtMutator):
     def visit_stmt(self, stmt: Stmt) -> Stmt:
         return self.visit(stmt)
 
-    def visit_expr(self, expr: Expr) -> Expr:
-        return _dispatch(self, expr, self._expr_generic_visit)
+    def visit_expr(self, expr: Expr, ctx: Any = None) -> Expr:
+        method = getattr(self, f"visit_{type(expr).__name__}", None)
+        if method is not None:
+            return method(expr, ctx)
+        return self._expr_generic_visit(expr, ctx)
 
-    def _expr_generic_visit(self, expr: Expr) -> Expr:
-        return _generic_expr_rewrite(expr, self.visit_expr)
+    def _expr_generic_visit(self, expr: Expr, ctx: Any = None) -> Expr:
+        return _generic_expr_rewrite(expr, lambda child: self.visit_expr(child, ctx))
 
     def generic_visit(self, stmt: Stmt) -> Stmt:  # type: ignore[override]
 
         stmt_after_kids = StmtMutator.generic_visit(self, stmt)
 
-        return _rewrite_stmt_exprs(stmt_after_kids, self.visit_expr)
+        return _rewrite_stmt_exprs(stmt_after_kids, lambda expr: self.visit_expr(expr, None))
 
 
 def _rewrite_stmt_exprs(stmt: Stmt, fn) -> Stmt:
