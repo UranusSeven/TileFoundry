@@ -57,12 +57,14 @@ def binding_name(expr: "Expr") -> str | None:
     return binding.name if binding is not None else None
 
 
+def _span_text(expr: "Expr") -> str | None:
+    span = get_metadata(expr, SourceSpanMetadata)
+    return f"{span.file}:{span.line}:{span.column}" if span is not None else None
+
+
 def diagnostic_location(expr: "Expr") -> str | None:
     """Return the most precise source identity available for diagnostics."""
-    span = get_metadata(expr, SourceSpanMetadata)
-    if span is not None:
-        return f"{span.file}:{span.line}:{span.column}"
-    return binding_name(expr)
+    return _span_text(expr) or binding_name(expr)
 
 
 def source_metadata(expr: "Expr") -> tuple[IRMetadata, ...]:
@@ -70,6 +72,25 @@ def source_metadata(expr: "Expr") -> tuple[IRMetadata, ...]:
     return tuple(
         value for value in expr.metadata if type(value) in {BindingMetadata, SourceSpanMetadata}
     )
+
+
+def describe_expr(expr: "Expr") -> str:
+    """One diagnostic line locating *expr* in authored source."""
+    where = _span_text(expr)
+    prefix = f"{where}: " if where is not None else ""
+    op = type(expr.target).__name__ if hasattr(expr, "target") else type(expr).__name__
+    return f"{prefix}binding={binding_name(expr) or '<unnamed>'} op={op}"
+
+
+def attach_metadata(expr: "Expr", value: IRMetadata) -> None:
+    """Attach *value* to *expr* in place, replacing its concrete metadata type."""
+    kept = tuple(item for item in expr.metadata if type(item) is not type(value))
+    expr.metadata = (*kept, value)
+
+
+def detach_metadata(expr: "Expr", cls: type[IRMetadata]) -> None:
+    """Remove metadata of concrete type *cls* from *expr* in place."""
+    expr.metadata = tuple(item for item in expr.metadata if type(item) is not cls)
 
 
 def replace_metadata(expr: "Expr", value: IRMetadata) -> "Expr":
@@ -102,7 +123,10 @@ __all__ = [
     "ExecutionDomainMetadata",
     "SourceSpanMetadata",
     "binding_name",
+    "describe_expr",
     "diagnostic_location",
+    "attach_metadata",
+    "detach_metadata",
     "get_metadata",
     "remove_metadata",
     "replace_metadata",

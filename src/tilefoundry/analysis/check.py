@@ -1,24 +1,35 @@
-"""The shared authored-program gate for analysis and scheduling."""
+"""The shared authored-program gate for analysis and scheduling.
+
+An analysis reads inferred types and assumes the authored program holds
+together. Both conditions are established once per public call rather than
+per algorithm, so no family can be the one that forgot. The same gate is used
+by scheduling before it makes placement decisions.
+"""
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 
 from tilefoundry.ir.core import (
     BindingMetadata,
     Call,
-    Constant,
     ExecutionDomainMetadata,
     Expr,
-    Tuple,
     Var,
+    describe_expr,
     get_metadata,
 )
-from tilefoundry.ir.core.module import Module, child_module_of, owning_module, subtree
+from tilefoundry.ir.core.module import (
+    Module,
+    called_functions,
+    child_module_of,
+    owning_module,
+    reachable_functions,
+    subtree,
+)
 from tilefoundry.ir.core.pattern import DimVarRangePat
 from tilefoundry.ir.hir.function import Function
-from tilefoundry.ir.hir.grid_region import GridRegionExpr
 from tilefoundry.ir.hir.specialize import (
     SpecializationError,
     _record_complete_bindings,
@@ -26,7 +37,7 @@ from tilefoundry.ir.hir.specialize import (
     is_concrete,
     specialize_concretely,
 )
-from tilefoundry.ir.types import Type, callable_type_for
+from tilefoundry.ir.types import Type, callable_type_for, tensor_types
 from tilefoundry.ir.types.shape_helpers import static_dim_value
 from tilefoundry.ir.types.shard import (
     ComposedLayout,
@@ -50,10 +61,10 @@ from tilefoundry.ir.types.substitute import (
     substitute_shape_dim,
     substitute_topology_dims,
 )
-from tilefoundry.ir.visitor import ExprCloner
+from tilefoundry.ir.visitor import BindingSubstitutionCloner, ExprVisitor, collect_exprs
 from tilefoundry.target import UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import CostContext, FunctionScope, TypeInferContext
-from tilefoundry.visitor_registry.visitors import TypeInferVisitor
+from tilefoundry.visitor_registry.visitors import inference_type
 
 from .compute_cost import _call_cost_record, _is_structural_occurrence
 from .errors import AnalysisError
@@ -67,8 +78,6 @@ from .metadata import (
     TrafficMetadata,
 )
 from .movement import call_traffic
-from .preflight import infer_authored_types, validate_call_context
-from .walk import collect_exprs, describe, reachable_functions, tensor_types
 
 _INLINE_NODES = 10_000
 _DERIVED_METADATA = {
@@ -316,7 +325,7 @@ def _call_placements(
             if _is_structural_occurrence(cost, moved, bandwidth_level=timed):
                 result[id(expr)] = frozenset()
                 continue
-            raise AnalysisError(f"performance: {describe(expr)}: {error}") from None
+            raise AnalysisError(f"performance: {describe_expr(expr)}: {error}") from None
     return result
 
 
@@ -414,7 +423,7 @@ class PerformanceInputChecker:
         try:
             _execution_placement(call, ctx.selected_topology)
         except AnalysisError as error:
-            raise AnalysisError(f"performance: {describe(call)}: {error}") from None
+            raise AnalysisError(f"performance: {describe_expr(call)}: {error}") from None
 
     def finish(self, function: Function, ctx: AnalysisCheckContext) -> None:
         """Nothing further: where the buffers go is decided with the schedule."""
@@ -513,6 +522,18 @@ def _reached_owners(module: Module, function: Function) -> tuple[Module, ...]:
             owners.append(owner)
             seen.add(id(owner))
     return tuple(owners)
+
+
+def _required_owner(module: Module, function: Function) -> Module:
+    """Resolve *function*'s owner or retain analysis's actionable failure."""
+    owner = owning_module(module, function)
+    if owner is None:
+        raise AnalysisError(
+            f"function {function.name!r} is owned by no single node of module "
+            f"{module.name!r}; analysis answers ownership within the tree it was "
+            "given, never by name"
+        )
+    return owner
 
 
 def _substitute_module_tree(module: Module, dims: Mapping[str, int]) -> Module:
@@ -643,56 +664,21 @@ def _view_metadata(expr: Expr) -> tuple:
     )
 
 
-class _InlineMutator(ExprCloner):
+class _AnalysisViewCloner(BindingSubstitutionCloner):
+    """Clone one inline call site after substituting its parameter bindings.
+
+    ``BindingSubstitutionCloner`` preserves sharing within this call site by
+    memoizing source expressions by identity. ``_Inliner`` creates a fresh
+    instance for every call site, so two calls to the same Function still get
+    independent cloned bodies and derived metadata.
+    """
+
     def __init__(self, owner, function, path, active) -> None:
-        super().__init__()
+        super().__init__(metadata=_view_metadata)
         self.owner = owner
         self.function = function
         self.path = path
         self.active = active
-
-    def visit_Var(self, expr: Var, ctx: Mapping[int, Expr]) -> Expr:
-        bound = ctx.get(id(expr))
-        if bound is not None:
-            return bound
-        return replace(expr, metadata=_view_metadata(expr))
-
-    def visit_Constant(self, expr: Constant, ctx: Mapping[int, Expr]) -> Expr:
-        return replace(expr, metadata=_view_metadata(expr))
-
-    def visit_Tuple(self, expr: Tuple, ctx: Mapping[int, Expr]) -> Expr:
-        return replace(
-            expr,
-            elements=tuple(self.visit(item, ctx) for item in expr.elements),
-            metadata=_view_metadata(expr),
-        )
-
-    def visit_GridRegionExpr(
-        self, grid: GridRegionExpr, ctx: Mapping[int, Expr]
-    ) -> GridRegionExpr:
-        init_args = tuple(self.visit(item, ctx) for item in grid.init_args)
-        induction_var = replace(
-            grid.induction_var, metadata=_view_metadata(grid.induction_var)
-        )
-        carried_args = tuple(
-            replace(item, metadata=_view_metadata(item)) for item in grid.carried_args
-        )
-        inner_env = dict(ctx)
-        inner_env[id(grid.induction_var)] = induction_var
-        inner_env.update(
-            (id(old), new) for old, new in zip(grid.carried_args, carried_args)
-        )
-        body = self.visit(grid.body, inner_env)
-        yield_values = tuple(self.visit(item, inner_env) for item in grid.yield_values)
-        return replace(
-            grid,
-            induction_var=induction_var,
-            carried_args=carried_args,
-            init_args=init_args,
-            body=body,
-            yield_values=yield_values,
-            metadata=_view_metadata(grid),
-        )
 
     def visit_Call(self, expr: Call, ctx: Mapping[int, Expr]) -> Expr:
         target = expr.target
@@ -783,7 +769,7 @@ class _Inliner:
         path: tuple[str, ...],
         active: frozenset[int],
     ) -> Expr:
-        return _InlineMutator(self, function, path, active).visit(expr, env)
+        return _AnalysisViewCloner(self, function, path, active).visit(expr, env)
 
 
 def _inline_view(module: Module, function: Function, budget: int) -> Function:
@@ -831,6 +817,83 @@ def _inline_view(module: Module, function: Function, budget: int) -> Function:
     return view
 
 
+class InlineCloner:
+    """Clone and inline one authored Function into an analysis view."""
+
+    def __init__(
+        self, module: Module, function: Function, budget: int = _INLINE_NODES
+    ) -> None:
+        self.module = module
+        self.function = function
+        self.budget = budget
+
+    def clone(self) -> Function:
+        """Return a fresh single-function view with every call site inlined."""
+        return _inline_view(self.module, self.function, self.budget)
+
+
+class ValidateVisitor(ExprVisitor[None]):
+    """Answer every authored-program requirement in one validation pass."""
+
+    def __init__(
+        self,
+        module: Module,
+        function: Function,
+        level: str | None,
+        analyzers: tuple[object, ...],
+        source_function: Function | None = None,
+    ) -> None:
+        super().__init__(root_function=function)
+        self.module = module
+        self.function = function
+        self.level = level
+        self.analyzers = analyzers
+        self.source_function = source_function or function
+
+    def run(self) -> None:
+        """Validate non-expression inputs, then visit every derived expression once."""
+        _require_concrete_geometry(self.module, self.function, error_type=AnalysisError)
+        target = self.module.resolve_target()
+        for topology in self.module.effective_topologies():
+            try:
+                target.validate_program_topology(topology)
+            except ValueError as error:
+                raise AnalysisError(
+                    f"program topology level {topology.name!r} with extent "
+                    f"{topology.size!r} is invalid: {error}"
+                ) from None
+        if self.level is not None:
+            try:
+                self.module.resolve_topology(self.level)
+            except ValueError as error:
+                raise AnalysisError(
+                    f"program topology level {self.level!r} is invalid: {error}"
+                ) from None
+
+        validate_call_context(self.module, reachable_functions(self.source_function))
+        checkers = tuple(analyzer.input_checker for analyzer in self.analyzers)
+        if not checkers:
+            return
+        self._checkers = checkers
+        ctx = analysis_check_context(self.module, self.function, self.level)
+        for checker in checkers:
+            checker.check_target(ctx)
+        self.visit(self.function.body, ctx)
+        for checker in checkers:
+            checker.finish(self.function, ctx)
+
+    def default_visit_leaf(
+        self, expr: Expr, _operands: tuple[None, ...], ctx: AnalysisCheckContext
+    ) -> None:
+        self._check_expr(expr, ctx)
+
+    def _check_expr(self, expr: Expr, ctx: AnalysisCheckContext) -> None:
+        if not isinstance(expr, Call) or isinstance(expr.target, Function):
+            return
+        for checker in self._checkers:
+            checker.check_call(expr, ctx)
+
+
 def check_program(
     module: Module,
     function: Function,
@@ -853,43 +916,47 @@ def check_program(
             f"inlining {function.name!r} needs a non-negative integer node budget, "
             f"got {budget!r}"
         )
-    _require_concrete_geometry(module, function, error_type=AnalysisError)
-    target = module.resolve_target()
-    for topology in module.effective_topologies():
-        try:
-            target.validate_program_topology(topology)
-        except ValueError as error:
-            raise AnalysisError(
-                f"program topology level {topology.name!r} with extent "
-                f"{topology.size!r} is invalid: {error}"
-            ) from None
-    if level is not None:
-        try:
-            module.resolve_topology(level)
-        except ValueError as error:
-            raise AnalysisError(f"program topology level {level!r} is invalid: {error}") from None
-
-    functions = reachable_functions(function)
-    infer_authored_types(functions, module)
-    validate_call_context(module, functions)
-    derived = _inline_view(module, function, budget)
-    TypeInferVisitor(owns_body=True).visit(
-        derived.body, TypeInferContext(scope=FunctionScope(module, derived))
-    )
-    checkers = tuple(analyzer.input_checker for analyzer in analyzers)
-    if not checkers:
-        return derived
-    ctx = analysis_check_context(module, derived, level)
-    for checker in checkers:
-        checker.check_target(ctx)
-    for expr in collect_exprs(derived.body):
-        if not isinstance(expr, Call) or isinstance(expr.target, Function):
-            continue
-        for checker in checkers:
-            checker.check_call(expr, ctx)
-    for checker in checkers:
-        checker.finish(derived, ctx)
+    derived = InlineCloner(module, function, budget).clone()
+    inference_type(derived.body, TypeInferContext(scope=FunctionScope(module, derived)))
+    ValidateVisitor(module, derived, level, analyzers, source_function=function).run()
     return derived
 
 
-__all__ = ["AnalysisCheckContext", "PerformanceInputChecker", "check_program"]
+def validate_call_context(module: Module, functions: Iterable[Function]) -> None:
+    """Reject a reached call whose two ends do not share one execution context.
+
+    Checked over what the selected query reaches, not at construction: an
+    attached child no call reaches has no edge to validate. Inheritance is the
+    canonical spelling, so a child declaring the caller's hierarchy explicitly
+    passes and any other value is a different context, not a nested launch.
+    """
+    for caller in functions:
+        caller_owner = _required_owner(module, caller)
+        for callee in called_functions(caller):
+            callee_owner = _required_owner(module, callee)
+            if callee_owner is caller_owner:
+                continue
+            if not any(child is callee_owner for child in caller_owner.modules):
+                raise AnalysisError(
+                    f"{caller.name!r} calls {callee.name!r} of module "
+                    f"{callee_owner.name!r}, which is not a child of "
+                    f"{caller_owner.name!r}; a call reaches a child of its own module"
+                )
+            if callee_owner.effective_topologies() != caller_owner.effective_topologies():
+                raise AnalysisError(
+                    f"{caller_owner.name!r} calls {callee_owner.name!r}, which "
+                    f"resolves a different topology hierarchy "
+                    f"{callee_owner.effective_topologies()} against "
+                    f"{caller_owner.effective_topologies()}; one kernel invocation "
+                    "runs one hierarchy -- declare none on the child and inherit"
+                )
+
+
+__all__ = [
+    "AnalysisCheckContext",
+    "InlineCloner",
+    "PerformanceInputChecker",
+    "ValidateVisitor",
+    "check_program",
+    "validate_call_context",
+]

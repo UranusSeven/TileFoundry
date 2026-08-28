@@ -9,6 +9,7 @@ See [tir §2](docs/spec/tir.md#2-tir-expr-and-callable-constructs).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any, Callable
 
@@ -38,6 +39,9 @@ __all__ = [
     "ExprCollector",
     "collect_exprs",
     "ExprCloner",
+    "BindingSubstitutionCloner",
+    "expr_children",
+    "function_values",
     "StmtVisitor",
     "StmtMutator",
     "StmtExprMutator",
@@ -46,7 +50,7 @@ __all__ = [
 ]
 
 
-def _expr_children(expr: Expr) -> tuple[Expr, ...]:
+def expr_children(expr: Expr) -> tuple[Expr, ...]:
     """Enumerate direct child Expr nodes of `expr`.
 
     Binding-site Var fields (e.g. `GridRegionExpr.induction_var` /
@@ -68,11 +72,11 @@ def _expr_children(expr: Expr) -> tuple[Expr, ...]:
         case Tuple(elements=elements):
             return elements
         case _:
-            raise AssertionError(f"_expr_children: unknown Expr subclass {type(expr).__name__}")
+            raise AssertionError(f"expr_children: unknown Expr subclass {type(expr).__name__}")
 
 
 def _rebuild_expr(expr: Expr, new_children: tuple[Expr, ...]) -> Expr:
-    """Rebuild `expr` with replaced children (same order as _expr_children).
+    """Rebuild `expr` with replaced children (same order as expr_children).
 
     Binding-site fields are carried over untouched.
     """
@@ -260,8 +264,8 @@ class ExprVisitor[T](ExprFunctor[T]):
         return result
 
     def visit_operands(self, expr: Expr, ctx: Any) -> tuple[T, ...]:
-        """Visit value children from the fixed `_expr_children` table."""
-        return tuple(self.visit(child, ctx) for child in _expr_children(expr))
+        """Visit value children from the fixed `expr_children` table."""
+        return tuple(self.visit(child, ctx) for child in expr_children(expr))
 
     def default_visit_leaf(self, expr: Expr, operands: tuple[T, ...], ctx: Any) -> T:
         return self.default_visit(expr, ctx)
@@ -322,7 +326,7 @@ def _generic_expr_rewrite(expr: Expr, visit_fn: Callable[[Expr], Expr]) -> Expr:
     identity when no child changed. Shared by `ExprCloner.default_visit`
     and `StmtExprMutator._expr_generic_visit`.
     """
-    children = _expr_children(expr)
+    children = expr_children(expr)
     new_children = tuple(visit_fn(c) for c in children)
     if all(nc is oc for nc, oc in zip(new_children, children)):
         return expr
@@ -342,6 +346,74 @@ class ExprCloner(ExprVisitor[Expr]):
 
 
 from tilefoundry.ir.hir.function import Function as HirFunction  # noqa: E402
+
+
+def function_values(function: HirFunction) -> tuple[Expr, ...]:
+    """The Function, its parameters, and every value reachable from its body."""
+    return (function, *function.params, *collect_exprs(function.body))
+
+
+class BindingSubstitutionCloner(ExprCloner):
+    """Clone an Expr DAG while replacing Vars from an identity-keyed environment.
+
+    This is an ``ExprCloner``, so one instance memoizes by source-expression
+    identity: shared inputs remain shared in its output. Callers that need
+    independent copies, such as two inline call sites, use one cloner instance
+    per copy. Binding sites in a GridRegion create an extended environment for
+    its body and yields without rewriting a Var slot to a non-Var value.
+    """
+
+    def __init__(self, metadata: Callable[[Expr], tuple] | None = None) -> None:
+        super().__init__()
+        self._cloned_metadata = metadata or (lambda expr: expr.metadata)
+
+    def visit_Var(self, expr: Var, ctx: Mapping[int, Expr]) -> Expr:
+        bound = ctx.get(id(expr))
+        if bound is not None:
+            return bound
+        return replace(expr, metadata=self._cloned_metadata(expr))
+
+    def visit_Constant(self, expr: Constant, ctx: Mapping[int, Expr]) -> Expr:
+        return replace(expr, metadata=self._cloned_metadata(expr))
+
+    def visit_Tuple(self, expr: Tuple, ctx: Mapping[int, Expr]) -> Expr:
+        return replace(
+            expr,
+            elements=tuple(self.visit(item, ctx) for item in expr.elements),
+            metadata=self._cloned_metadata(expr),
+        )
+
+    def visit_GridRegionExpr(
+        self, grid: GridRegionExpr, ctx: Mapping[int, Expr]
+    ) -> GridRegionExpr:
+        init_args = tuple(self.visit(item, ctx) for item in grid.init_args)
+        induction_var = replace(
+            grid.induction_var,
+            metadata=self._cloned_metadata(grid.induction_var),
+        )
+        carried_args = tuple(
+            replace(item, metadata=self._cloned_metadata(item))
+            for item in grid.carried_args
+        )
+        inner = dict(ctx)
+        inner[id(grid.induction_var)] = induction_var
+        inner.update((id(old), new) for old, new in zip(grid.carried_args, carried_args))
+        return replace(
+            grid,
+            induction_var=induction_var,
+            carried_args=carried_args,
+            init_args=init_args,
+            body=self.visit(grid.body, inner),
+            yield_values=tuple(self.visit(item, inner) for item in grid.yield_values),
+            metadata=self._cloned_metadata(grid),
+        )
+
+    def visit_Call(self, expr: Call, ctx: Mapping[int, Expr]) -> Expr:
+        return replace(
+            expr,
+            args=tuple(self.visit(arg, ctx) for arg in expr.args),
+            metadata=self._cloned_metadata(expr),
+        )
 
 
 class StmtVisitor[T]:

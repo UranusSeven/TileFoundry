@@ -7,9 +7,9 @@ those bytes are charged, which is where the leaves it reached live.
 
 from __future__ import annotations
 
-from tilefoundry.ir.core import Call, VerifyError
+from tilefoundry.ir.core import Call, VerifyError, describe_expr
 from tilefoundry.ir.hir.function import Function
-from tilefoundry.ir.types import TensorType, TupleType, Type
+from tilefoundry.ir.types import TensorType, TupleType, Type, bytes_by_storage
 from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.visitor_registry.access_relation import (
     access_relation_registry,
@@ -24,7 +24,6 @@ from tilefoundry.visitor_registry.visitors import CostEvaluator
 
 from .errors import AnalysisError
 from .metadata import TrafficBytes, TrafficMetadata
-from .walk import bytes_by_storage, describe
 
 _UMAT_CONSUMPTION_LEVEL = str(StorageKind.RMEM)
 
@@ -97,7 +96,7 @@ def _movement(
     operands = (*call.args, call)
     if len(cost.traffic) != len(operands):
         raise AnalysisError(
-            f"{describe(call)}: cost reports {len(cost.traffic)} operands, "
+            f"{describe_expr(call)}: cost reports {len(cost.traffic)} operands, "
             f"the call has {len(operands)}"
         )
     stated = cost.traffic
@@ -112,7 +111,7 @@ def _movement(
     else:
         if access_relation_registry.lookup(type(call.target)) is None:
             raise AnalysisError(
-                f"{describe(call)}: states no access relations, so nothing here "
+                f"{describe_expr(call)}: states no access relations, so nothing here "
                 "says what it moves"
             )
         relations = relations_of(call, ctx)
@@ -120,7 +119,7 @@ def _movement(
         fields = result.fields if isinstance(result, TupleType) else (result,)
         if len(fields) > len(relations.outputs):
             raise AnalysisError(
-                f"{describe(call)}: states {len(relations.outputs)} output "
+                f"{describe_expr(call)}: states {len(relations.outputs)} output "
                 f"boundaries for a result of {len(fields)} fields"
             )
         amounts, charged = [], []
@@ -139,7 +138,7 @@ def _movement(
             answer = _reached_bytes(asked, level)
             if answer is None:
                 raise AnalysisError(
-                    f"{describe(call)}: boundary {index} reaches coordinates "
+                    f"{describe_expr(call)}: boundary {index} reaches coordinates "
                     "nothing here can charge in bytes"
                 )
             moving, by_level = answer
@@ -168,7 +167,9 @@ def _movement(
     return levels, stated
 
 
-def call_traffic(expr: Call, whole: CostContext, local: CostContext) -> TrafficMetadata:
+def call_traffic(
+    expr: Call, whole: CostContext, local: CostContext
+) -> TrafficMetadata:
     """What one Call moves, whole and for one participant.
 
     The same registered evaluator the work half reads, projected onto its
@@ -194,7 +195,6 @@ def call_traffic(expr: Call, whole: CostContext, local: CostContext) -> TrafficM
     return TrafficMetadata(
         whole=whole_levels, per_unit=unit_levels, operands=operands
     )
-
 
 def add_traffic(
     whole: dict[str, TrafficBytes],
