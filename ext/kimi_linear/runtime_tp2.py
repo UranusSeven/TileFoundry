@@ -33,6 +33,21 @@ def _converge(value):
     return value
 
 
+def _pack_kda_weights(weights, kinds):
+    """Replace KDA matrices with equal-size packed runtime layouts."""
+    for (mixer_kind, _), layer in zip(kinds, weights.modules):
+        if mixer_kind != "kda":
+            continue
+        w = layer.mixer.constants
+        w["w_qkv"] = torch.cat((w.pop("w_q"), w.pop("w_k"), w.pop("w_v")), dim=-1)
+        w["w_fg_beta"] = torch.cat(
+            (w.pop("w_f_a"), w.pop("w_g_a"), w.pop("w_b")), dim=-1
+        )
+        w["w_fg_b"] = torch.stack((w.pop("w_f_b")[0], w.pop("w_g_b")[0]))
+        for name in ("conv_w_q", "conv_w_k", "conv_w_v"):
+            w[name] = w[name].transpose(0, 1).contiguous()
+
+
 class PrefillRunnerTP2:
     """Prefill-only TP=2 runner; each process owns one rank-local shard."""
 
@@ -60,6 +75,7 @@ class PrefillRunnerTP2:
         )
         started = time.perf_counter()
         self.weights = _load_unchecked(sem.KimiLinear48BA3BPrefill, resource)
+        _pack_kda_weights(self.weights, self.kinds)
         self.load_seconds = time.perf_counter() - started
         self.loaded_bytes = totals["bytes"]
         self.resident_bytes = torch.cuda.memory_allocated(self.device) - before

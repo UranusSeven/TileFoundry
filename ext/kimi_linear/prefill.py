@@ -15,6 +15,8 @@ import time
 import torch
 import torch.nn.functional as F
 from fla.ops.kda import chunk_kda
+from fla.ops.kda.gate import fused_kda_gate
+from vllm.third_party.flash_linear_attention.ops.kda import rms_norm_gated
 from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 try:
@@ -181,46 +183,78 @@ def flash_paged(q, k_pages, v_pages, block_table, length: int):
     )
 
 
-def _conv_prefill(x_raw, conv_w):
-    """The 4-tap causal depthwise conv + silu over the whole prompt.
+def _conv_prefill(x_raw, conv_w, conv_metadata=None):
+    """Run the four-tap causal depthwise convolution and SiLU."""
+    del conv_metadata
+    if conv_w.shape[0] == _W:
+        xp = torch.cat(
+            [
+                torch.zeros(
+                    1, _WS, x_raw.shape[-1], dtype=x_raw.dtype, device=x_raw.device
+                ),
+                x_raw,
+            ],
+            dim=1,
+        )
+        window = xp.unfold(1, _W, 1)
+        acc = (
+            window.float()
+            * conv_w.float().permute(1, 0).unsqueeze(0).unsqueeze(0)
+        ).sum(-1)
+        return F.silu(acc).to(x_raw.dtype)
+    convolved = F.conv1d(
+        x_raw.transpose(1, 2),
+        conv_w.unsqueeze(1),
+        padding=_WS,
+        groups=x_raw.shape[-1],
+    )[..., : x_raw.shape[1]]
+    return F.silu(convolved).transpose(1, 2)
 
-    *x_raw* is ``[1, S, _KP]`` pre-conv activations; the left side pads with
-    the zero initial conv window. Returns ``[1, S, _KP]``. (The conv weight
-    is ``[W, KP]`` tap-major -- it must be transposed before broadcasting
-    against the unfolded window's channel-major layout.)
-    """
-    xp = torch.cat(
-        [torch.zeros(1, _WS, x_raw.shape[-1], dtype=x_raw.dtype, device=x_raw.device), x_raw],
-        dim=1,
-    )
-    win = xp.unfold(1, _W, 1)  # [1, S, KP, W], windows [t-3 .. t]
-    acc = (win.float() * conv_w.float().permute(1, 0).unsqueeze(0).unsqueeze(0)).sum(-1)
-    return F.silu(acc).to(x_raw.dtype)
 
-
-def kda_prefill(hidden, w, length: int):
+def kda_prefill(hidden, w, length: int, conv_metadata=None):
     """One KDA layer over the whole prompt via fla's `chunk_kda`.
 
     Returns only the layer output ``[1, S, _HID]``. The recurrence starts at
     zero and its final state is intentionally discarded.
     """
     hn = _rms(hidden, w["gamma_in"])
-    kp = w["w_q"].shape[-1]
+    if "w_qkv" in w:
+        kp = w["w_qkv"].shape[-1] // 3
+        qkv = torch.matmul(hn, w["w_qkv"])
+        q_raw, k_raw, v_raw = qkv.split(kp, dim=-1)
+    else:
+        kp = w["w_q"].shape[-1]
+        q_raw = torch.matmul(hn, w["w_q"])
+        k_raw = torch.matmul(hn, w["w_k"])
+        v_raw = torch.matmul(hn, w["w_v"])
     nh = kp // _DK
-    q_raw = torch.matmul(hn, w["w_q"])
-    k_raw = torch.matmul(hn, w["w_k"])
-    v_raw = torch.matmul(hn, w["w_v"])
-    q_c = _conv_prefill(q_raw, w["conv_w_q"])
-    k_c = _conv_prefill(k_raw, w["conv_w_k"])
-    v_c = _conv_prefill(v_raw, w["conv_w_v"])
+    q_c = _conv_prefill(q_raw, w["conv_w_q"], conv_metadata)
+    k_c = _conv_prefill(k_raw, w["conv_w_k"], conv_metadata)
+    v_c = _conv_prefill(v_raw, w["conv_w_v"], conv_metadata)
 
-    # The per-channel forget gate: the softplus input rounds through bf16
-    # (the authored placement), the activation runs in f32.
-    g_raw = torch.matmul(torch.matmul(hn, w["w_f_a"]), w["w_f_b"]) + w["dt_bias"]
-    g = -w["a_log"].float().exp().reshape(1, 1, nh, 1) * F.softplus(
-        g_raw.view(1, length, nh, _DK).float()
+    # The packed projection preserves the authored bf16 landing before the
+    # gate B projections and activation.
+    if "w_fg_beta" in w:
+        fg_beta = torch.matmul(hn, w["w_fg_beta"])
+        f_a, g_a, beta_raw = fg_beta.split((_DK, _DK, nh), dim=-1)
+        fg = torch.bmm(torch.stack((f_a[0], g_a[0])), w["w_fg_b"])
+    else:
+        f_a = torch.matmul(hn, w["w_f_a"])
+        g_a = torch.matmul(hn, w["w_g_a"])
+        beta_raw = torch.matmul(hn, w["w_b"])
+        fg = torch.stack(
+            (
+                torch.matmul(f_a, w["w_f_b"])[0],
+                torch.matmul(g_a, w["w_g_b"])[0],
+            )
+        )
+    g = fused_kda_gate(
+        fg[0].view(1, length, nh, _DK),
+        w["a_log"],
+        w["dt_bias"],
+        output_dtype=torch.float32,
     )
-    beta = torch.sigmoid(torch.matmul(hn, w["w_b"]).float()).reshape(1, length, nh)
+    beta = torch.sigmoid(beta_raw.float()).reshape(1, length, nh)
 
     o, _ = chunk_kda(
         q=q_c.view(1, length, nh, _DK),
@@ -236,12 +270,16 @@ def kda_prefill(hidden, w, length: int):
 
     # Gated output norm: rms_norm(o) * gamma * sigmoid(g2), in f32, landed
     # once into bf16 for the output projection.
-    g2 = torch.matmul(torch.matmul(hn, w["w_g_a"]), w["w_g_b"]).view(1, length, nh, _DK).float()
-    of = o.float()
-    on = of * torch.rsqrt(of.pow(2).mean(-1, keepdim=True) + _EPS)
-    on = on * w["gamma_o"].float() * torch.sigmoid(g2)
-    out = torch.matmul(on.reshape(1, length, kp).to(_BF16), w["w_o"])
-
+    g2 = fg[1].view(1, length, nh, _DK)
+    on = rms_norm_gated(
+        o,
+        g2,
+        w["gamma_o"],
+        None,
+        activation="sigmoid",
+        eps=_EPS,
+    )
+    out = torch.matmul(on.reshape(1, length, kp), w["w_o"])
     return out
 
 

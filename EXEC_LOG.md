@@ -124,3 +124,23 @@ Correctness on fixed IDs:
 Quick gate medians: S=512 57.925 ms / 23.7 ms = 2.444x; S=1024 59.498 ms / 50.8 ms = 1.171x; S=4096 98.795 ms / 58.0 ms = 1.703x. The full sweep was skipped because 512 and 4096 miss 1.5x.
 
 Exact traces are `/root/develop/yingshan/traces/prefill_tp2_phase3_s1024_rank0.json` and `/root/develop/yingshan/traces/prefill_tp2_phase3_s4096_rank0.json`, with rank-1 siblings. S=1024 profiler wall/summed GPU events were 196.037/221.033 ms: MoE 41.048 ms, KDA 36.684 ms, NCCL 25.709 ms, MLA 5.010 ms. S=4096 was 181.115/257.545 ms: KDA 43.386 ms, MoE 35.282 ms, MLA 6.044 ms, NCCL 4.793 ms. The dominant residual bottleneck at the failing long shape is the 20-layer KDA path, not communication. Next action: fuse its projection-conv-gate elementwise path or use a TP-aware fused KDA prefill kernel; then revisit fixed 54-collective latency at S=512.
+
+
+## Prefill-only KDA TP2 优化
+
+在固定 chengfeng 容器、`kimi-linear-run`、GPU 0+1 上，仅优化了 prefill TP2 的 20 层 KDA runtime；`model.py` 的 authored HIR / external-op contract 未改，仍保持每 rank 16 heads、KDA 输出后一次 all-reduce。
+
+实现/API：
+- load 完成后把 rank-local `q/k/v` 权重打成一个 `w_qkv`，把 `f_a/g_a/beta` A 投影打成一个 `w_fg_beta`，并用 batched GEMM 执行 `f_b/g_b`；旧 tensor 立即从常量字典移除。打包前后元素数相同，不构造 full-weight 模型或跨 rank 临时权重。
+- 用 PyTorch/cuDNN grouped depthwise `F.conv1d` 替换 `unfold` + f32 materialization；分别执行 Q/K/V 比三者通道合并更快。
+- 使用已安装 FLA `fused_kda_gate` 融合 bias、f32 softplus 和 decay，继续使用 FLA `chunk_kda(use_qk_l2norm_in_kernel=True)`；使用 vLLM FLA-derived `rms_norm_gated(..., activation="sigmoid")` 融合 output RMSNorm/gate。Kimi-K3 的完整 layer API 依赖 vLLM forward context/cache metadata，FlashKDA 又要求 bounded gate，与本 checkpoint 的 authored softplus gate 不兼容，故未外接整层/FlashKDA。vLLM causal-conv wrapper standalone 需要 cache metadata/state，试验不安全；最终采用 production cuDNN depthwise convolution。
+
+Focused profiler（20 层合计 GPU event，rank0；ms，before -> after）：
+- S=1024：input RMSNorm 0.764 -> 0.764；q/k/v projection 0.887 -> packed 0.782；short conv 5.067 -> 2.777；gate projections+beta 0.914 -> 0.423；softplus gate 0.462 -> 0.083；FLA chunk KDA 2.462 -> 3.386；output gate/norm 0.838 -> 0.004；o_proj 0.371 -> 0.310。54 mixer/FFN all-reduces合计 rank0/rank1 6.850/24.231 ms。
+- S=4096：input RMSNorm 2.571 -> 2.574；q/k/v projection 2.996 -> packed 2.960；short conv 18.383 -> 9.919；gate projections+beta 1.818 -> 0.777；softplus gate 1.462 -> 0.319；FLA chunk KDA 9.306 -> 12.810；output gate/norm 3.223 -> profiler floor；o_proj 1.269 -> 1.024。54 all-reduces rank0/rank1 7.095/17.100 ms。Exact after traces: `/root/develop/yingshan/traces/prefill_tp2_kda_opt_s{1024,4096}_rank{0,1}.json`; focused logs: `kda_stages_{before,after}_s{1024,4096}.log`。
+
+Correctness 对 HF 与优化前 TP1（S=8/32/100）均 argmax exact；HF rel_l2 为 0.036915/0.040674/0.050207，TP1 rel_l2 为 0.023872/0.033613/0.048479，全部 <= 6e-2。
+
+最终同 shape warmup 后 n=3 median TP2 TTFT：S=512 57.539 ms（vLLM 23.7 ms，2.428x，未达标）；S=1024 58.617 ms（50.8 ms，1.154x，通过）；S=4096 72.786 ms（58.0 ms，1.255x，通过）。因并非全部 <=1.5x，未跑 full 32-length sweep。长 shape KDA 瓶颈已明显降低，当前 S=4096 KDA 内最大 stage 是 FLA `chunk_kda`，其次是 conv；整体短 shape 残差仍是固定 54 次 collective/跨 rank 等待，不应转向 MoE/MLA 优化。
+
+每 rank resident/load peak 为 47.246/47.271 GiB；运行峰值在 focused trace 为 47.463 GiB@1024、47.976 GiB@4096。打包只发生在已切片的 rank-local tensor 上，load peak 与 resident 相差 0.026 GiB，无 full-weight temporary。
