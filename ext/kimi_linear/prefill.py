@@ -34,6 +34,10 @@ import torch
 import torch.nn.functional as F
 from fla.ops.kda import chunk_kda
 from vllm.vllm_flash_attn import flash_attn_varlen_func
+try:
+    from .kernels.moe_prefill import grouped_routed
+except ImportError:
+    from kernels.moe_prefill import grouped_routed
 
 # The dims, spelled as runtime_model spells them (the published config's).
 _HID = 2304
@@ -291,40 +295,18 @@ def _router(tokens, w_router, bias, routed_scale):
 
 
 def moe_prefill(hidden, w, routed_scale, chunk: int = 32):
-    """The MoE block over the whole prompt, plain batched torch.
-
-    The routed experts run as per-(token, slot) batched matmuls over gathered
-    expert weights, in chunks of *chunk* tokens so the gather's footprint
-    stays bounded (~3.6 GB at the default). This reads every selected
-    expert's weights once per token -- the traffic-optimal shape is a
-    grouped-by-expert sweep, which is the performance follow-up, not this
-    milestone.
-    """
+    """Prefill MoE using expert-sorted grouped GEMM."""
     length = hidden.shape[1]
     hn = _rms(hidden, w["gamma_post"])
     tokens = hn.reshape(length, _HID)
     weights, indices = _router(tokens, w["w_router"], w["bias"], routed_scale)
-    routed = torch.zeros(length, _HID, dtype=torch.float32, device=hidden.device)
-    for c0 in range(0, length, chunk):
-        c1 = min(length, c0 + chunk)
-        n = c1 - c0
-        flat = indices[c0:c1].reshape(-1)
-        tok = tokens[c0:c1].repeat_interleave(_TOPK, dim=0)
-        gate = torch.bmm(w["w_gate"][flat], tok.unsqueeze(-1))
-        up = torch.bmm(w["w_up"][flat], tok.unsqueeze(-1))
-        h = F.silu(gate) * up
-        down = torch.bmm(w["w_down"][flat], h).view(n, _TOPK, _HID)
-        routed[c0:c1] = (
-            down.float() * weights[c0:c1].float().unsqueeze(-1)
-        ).sum(1)
+    routed = grouped_routed(tokens, weights, indices, w["w_gate"], w["w_up"], w["w_down"])
     x = tokens.reshape(1, length, _HID)
     shared = torch.matmul(
         F.silu(torch.matmul(x, w["sh_gate"])) * torch.matmul(x, w["sh_up"]),
         w["sh_down"],
     )
-    return (routed + shared.reshape(length, _HID).float()).to(_BF16).reshape(
-        1, length, _HID
-    )
+    return (routed + shared.reshape(length, _HID).float()).to(_BF16).reshape(1, length, _HID)
 
 
 def mlp_prefill(hidden, w):
