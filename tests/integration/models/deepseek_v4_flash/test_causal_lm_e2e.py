@@ -277,30 +277,31 @@ def test_prepare_and_parity(config, raw_tensors, prepared, twins):
     assert w1_scale.dtype == torch.float8_e8m0fnu
     assert torch.equal(w1_scale.float().cpu(), expected_scale)
 
-    leaf = semantic.layer0.moe.module
+    layer0 = next(child for child in semantic.modules if child.module.name == "layer0")
+    leaf = next(child for child in layer0.modules if child.module.name == "moe")
     with pytest.MonkeyPatch.context() as patched:
 
         def refuse(*_args, **_kwargs):
             raise AssertionError("loading one leaf reached Module.prepare")
 
         patched.setattr(Module, "prepare", refuse)
-        loaded_leaf = leaf.load(store.subtree("layer0").subtree("moe"))
+        loaded_leaf = leaf.module.load(store.subtree("layer0").subtree("moe"))
 
-    assert loaded_leaf.module is leaf
-    assert set(loaded_leaf.constants) == set(leaf.weights)
-    assert {f"layer0.moe.{name}" for name in loaded_leaf.constants} == {
+    assert loaded_leaf.module is leaf.module
+    assert set(loaded_leaf.module.weights) == set(leaf.module.weights)
+    assert {f"layer0.moe.{name}" for name in loaded_leaf.module.weights} == {
         key for key in EXPECTED_PREPARED_KEYS if key.startswith("layer0.moe.")
     }
     assert torch.equal(
-        loaded_leaf.constants["w1_weight"].float(), store.load("layer0.moe.w1_weight").float()
+        loaded_leaf.resource.load("w1_weight").float(), store.load("layer0.moe.w1_weight").float()
     )
 
     inputs = _node_inputs(semantic, config)
     step_and_latent = {"output[0]": _AGREES, "output[1]": _AGREES}
     nodes = {
-        "attention": (runtime.layer0.attention, semantic.layer0.attention, step_and_latent),
-        "moe": (runtime.layer0.moe, semantic.layer0.moe, {"output": _AGREES}),
-        "layer0": (runtime.layer0, semantic.layer0, step_and_latent),
+        "attention": (runtime.layer0.attention, semantic.modules[0].modules[0], step_and_latent),
+        "moe": (runtime.layer0.moe, semantic.modules[0].modules[1], {"output": _AGREES}),
+        "layer0": (runtime.layer0, semantic.modules[0], step_and_latent),
         "root": (
             runtime,
             semantic,
@@ -311,7 +312,8 @@ def test_prepare_and_parity(config, raw_tensors, prepared, twins):
         ),
     }
     for name, (candidate, reference, expect) in nodes.items():
-        report = check(candidate.forward, reference.forward, inputs[name], expect=expect)
+        reference_runner = reference.forward
+        report = check(candidate.forward, reference_runner, inputs[name], expect=expect)
         assert report.passed, f"{name}: {report}"
         assert "forward" not in vars(type(candidate)), name
 
@@ -328,7 +330,8 @@ def test_the_decode_loop_threads_state_across_both_twins(config, twins):
     semantic, runtime = twins
     steps = config.window + 2
     ids = torch.arange(steps, dtype=torch.int64, device="cuda") % config.vocab
-    seed_ctx = semantic.init_caches(device="cuda")[0].shape[1]
+    semantic_view = semantic
+    seed_ctx = semantic_view.init_caches(device="cuda")[0].shape[1]
     tokenizer = _Tokeniser(ids.cpu().tolist())
 
     reference = generation.decode(semantic, tokenizer, "", max_new=TWINNED_STEPS, device="cuda")
@@ -345,13 +348,18 @@ def test_the_decode_loop_threads_state_across_both_twins(config, twins):
         ("reference", semantic, steps),
         ("candidate", runtime, TWINNED_STEPS),
     ):
-        caches = model.init_caches(device="cuda")
+        view = semantic_view if model is semantic else model
+        caches = view.init_caches(device="cuda")
         logits = []
         for step in range(count):
             prior = caches
-            args = model.prepare_inputs_for_generation(ids[: step + 1], step, caches, device="cuda")
-            output, fresh = model(*args)
-            caches = model.append_cache(caches, fresh)
+            args = view.prepare_inputs_for_generation(ids[: step + 1], step, caches, device="cuda")
+            output, fresh = (
+                semantic.forward(*args)
+                if model is semantic
+                else model(*args)
+            )
+            caches = view.append_cache(caches, fresh)
             if step == 0:
                 assert fresh[0].shape[1] == 1, type(model).__name__
                 assert caches[0].shape[1] == prior[0].shape[1] + 1, type(model).__name__
@@ -430,8 +438,9 @@ def test_structure_mismatch_rejected(config, twins):
     """
     semantic, runtime = twins
 
-    attention = semantic.layer0.attention.module
-    layer = semantic.layer0.module
+    layer0 = semantic.modules[0]
+    attention = layer0.modules[0].module
+    layer = layer0.module
 
     with pytest.raises(TypeError, match=r"missing \['mla_kv_update'\]"):
 

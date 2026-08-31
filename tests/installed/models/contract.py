@@ -23,6 +23,7 @@ from safetensors.torch import save_file
 from tests.models.corpus import FunctionCase, ModelCase, states_execution_domain
 from tests.models.decode_oracle import one_ulp_at
 from tests.models.registry import cases_of
+from tilefoundry.runtime import PREDICATES, DictResource, check
 
 LOGICAL_FAMILIES = ("compute-cost", "memory", "roofline")
 FAMILIES = (*LOGICAL_FAMILIES, "performance")
@@ -277,8 +278,8 @@ def split_by_declaration(case: ModelCase, selector: str, args: Sequence):
     """One positional argument list, split the way the command takes it.
 
     An in-process call may hand every parameter over positionally, weights and all.
-    ``check`` does not: ``--input`` names the non-const parameters in declared order
-    and the rest arrive as a checkpoint. Split here from the declaration itself, so
+    ``check`` does not: ``--inputs files:...`` names the non-const parameters in
+    declared order and the rest arrive as a checkpoint. Split here from the declaration itself, so
     a parameter that changes kind moves sides on its own.
     """
     _module, function = case.resolve(case.build(), selector)
@@ -297,11 +298,9 @@ def nested_constants(loaded, prefix: str = "") -> dict:
     A Module names only its own; a checkpoint has to carry the children's too, keyed
     by the path they are reached through, or the child is loaded with nothing.
     """
-    found = {f"{prefix}{name}": value for name, value in loaded.constants.items()}
-    for child in getattr(loaded, "modules", ()) or ():
-        inner = getattr(loaded, child.name, None)
-        if inner is not None and hasattr(inner, "constants"):
-            found.update(nested_constants(inner, f"{prefix}{child.name}."))
+    found = {f"{prefix}{name}": loaded.resource.load(name) for name in loaded.module.weights}
+    for child in loaded.modules:
+        found.update(nested_constants(child, f"{prefix}{child.module.name}."))
     return found
 
 
@@ -319,22 +318,47 @@ def compared(
     dims: Mapping[str, int] | None = None,
     _refuse: bool = False,
 ):
-    """One ``check`` command: the shipped source against tensors produced here.
+    """Compare shipped HIR through the CLI, or host orchestration in this test.
 
-    The oracle is run by the caller and written into *work*, so nothing long-lived
-    holds a frozen truth: a comparison that stopped agreeing cannot be made to pass
-    by an artifact somebody recorded once.
-
-    The weights travel as a checkpoint rather than as activations, because that is
-    the only door ``check`` has for them -- ``--input`` names the non-const
-    parameters, in the order the function declares them.
+    The oracle is written into *work*, so a stale artifact cannot hide disagreement.
+    Weights travel as a checkpoint because ``check`` accepts non-const parameters
+    only through ``--inputs files:...``. An empty selector names host orchestration;
+    this test invokes it explicitly and applies the same public comparison layer.
     """
+    if not selector:
+        if _refuse:
+            raise ValueError("an orchestration comparison cannot request a CLI refusal")
+        module = case.build()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        def move(value):
+            if isinstance(value, torch.Tensor):
+                return value.to(device)
+            if isinstance(value, (tuple, list)):
+                return type(value)(move(item) for item in value)
+            return value
+
+        loaded = module.load(DictResource({name: value.to(device) for name, value in weights.items()}))
+        got = loaded.forward(*(move(value) for value in activations))
+        want = move(expected[0] if len(expected) == 1 else tuple(expected))
+        expect = {
+            ("output" if len(expected) == 1 else f"output[{position}]"): (
+                PREDICATES[predicate](**bounds),
+            )
+            for position, (predicate, bounds) in enumerate(held)
+        }
+        report = check(lambda *_args: got, lambda *_args: want, tuple(activations), expect=expect)
+        assert report.passed, report
+        return report
+
     room = Path(tempfile.mkdtemp(dir=work))
     argv = ["check", static(source, case, selector)]
+    input_paths = []
     for position, tensor in enumerate(activations):
         path = room / f"in{position}.pt"
         torch.save(tensor, path)
-        argv += ["--input", str(path)]
+        input_paths.append(str(path))
+    argv += ["--inputs", f"files:{','.join(input_paths)}"]
 
     if weights:
         save_file(
@@ -344,7 +368,9 @@ def compared(
             },
             str(room / "model.safetensors"),
         )
-        argv += ["--ckpt", str(room)]
+        argv += ["--weights", f"ckpt:{room}"]
+    else:
+        argv += ["--weights", "random"]
     argv += dim_args(dims)
     for position, tensor in enumerate(expected):
         path = room / f"want{position}.pt"

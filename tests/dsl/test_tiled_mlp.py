@@ -12,6 +12,7 @@ from tests.models.decode_oracle import agrees_to_one_rounding
 from tilefoundry import func, module
 from tilefoundry.dsl import ConstTensor, Tensor, tf  # noqa: F401 — tf used by @func bodies
 from tilefoundry.dsl.tf import *  # noqa: F401, F403 — bare op bindings for @func bodies
+from tilefoundry.evaluator import evaluate
 from tilefoundry.runtime.resource import DictResource
 
 S = 1
@@ -174,4 +175,7 @@ def test_the_tiled_mlp_computes_what_the_naive_one_does() -> None:
     """The blocked K walk reassociates the reduction and changes nothing else."""
     loaded, x = _drawn()
 
-    agrees_to_one_rounding(loaded.tiled_mlp(x), loaded.naive_mlp(x))
+    agrees_to_one_rounding(
+        evaluate(loaded.tiled_mlp, x),
+        evaluate(loaded.naive_mlp, x),
+    )

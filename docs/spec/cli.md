@@ -125,16 +125,17 @@ when there is one, its reference, and says of every output whether it meets the
 bounds the caller stated.
 
 - constraints:
-  - Repeated `--input` values MUST bind the function's inputs in parameter
-    declaration order. Output names MUST come from return position: one tensor is
+  - `--inputs random` draws one activation per non-constant parameter in
+    declaration order. `--inputs files:A.pt,B.pt` reads one file per activation
+    parameter in that same order. Output names MUST come from return position: one tensor is
     `output`; a tuple's tensors are `output[0]`, `output[1]`, and so on in return
     order. These are positions, not names authored in the function.
-  - One `--input` file MUST bind one parameter. Its value MAY be a bare tensor or
+  - One input file MUST bind one parameter. Its value MAY be a bare tensor or
     an arbitrarily nested tuple or list of tensors; every leaf MUST be a tensor.
   - A target whose step is an orchestration method rather than a `@func` MUST
-    refuse `--inputs random` and `--inputs real`, because its activation shapes
-    and dtypes are not declared. The refusal MUST name the parameter count and
-    names in order, and say that one `--input` file binds each parameter.
+    be refused, naming the method and the HIR functions that may be checked
+    instead. Orchestration is host Python reused verbatim on both sides; `check`
+    compares HIR, not one Python function object against itself.
   - Every output MUST be judged by at least one predicate the caller states, and
     there MUST be no default predicate and no default bound. A bound nobody can
     meet is worse than none: a single `f32`→`bf16` rounding already measures
@@ -159,13 +160,18 @@ bounds the caller stated.
   - Inputs MUST be stated: random, real weights from a checkpoint, or files, and
     no form MAY be the default. Weights MUST come from the same draw on both
     sides, and the report MUST say which form was used and what seed drew it.
-    It MUST also say the actual and declared dtype of every activation and of
-    every weight the selected Module declares, plus the tensor count and shape
-    tree each `--input` file supplied.
+    It MUST also say the actual and declared dtype of every activation, plus the
+    tensor count and shape tree each input
+    file supplied.
+  - `--device DEVICE` names where inputs and weights are built, and so where the
+    run happens. Omitted, it is the device the selection's Target declares. Given,
+    it is honoured as stated: a Target declaring CUDA no longer refuses a machine
+    without one, because the caller has said where to run. The evaluator picks no
+    device of its own ([evaluator §2](docs/spec/evaluator.md#2-parameters-and-inputs)).
   - A FAIL with `--inputs random` MUST state that the draw makes each activation
     independently; a target that relies on semantic relationships between
     activations MAY differ at ulp scale without either implementation being wrong,
-    and `--inputs real` is the re-run that decides the comparison.
+    and a file-backed `--inputs files:...` run is the re-run that decides the comparison.
   - A FAIL measured against a reference MUST state that it proves disagreement,
     not which side is closer to truth. A reference MAY carry its own rounding, and
     establishing accuracy needs an independent high-precision reference that
@@ -179,14 +185,12 @@ bounds the caller stated.
     subset the selected function names; the selector's child segments MUST scope
     the checkpoint by the same names they resolve the Module by, so the two cannot
     be addressed differently.
-  - A dimension the target states as a range MUST be reported, along with the
-    extent this run pinned it to; several extents MAY be stated for one dimension,
-    and each MUST be run and reported. Where the extents select an implementation,
+  - A dimension the target states as a range MUST be bound by `--dim`; a run
+    MUST NOT choose an extent on the caller's behalf. Several extents MAY be
+    stated for one dimension, and each MUST be run and reported. Where the extents select an implementation,
     the report MUST name the one selected and the range it covers. Naming it is what
     separates "it ran" from "it ran the intended program", so a run that only passed
     is not evidence that dispatch landed where the author meant.
-  - Reporting a pin MUST also state both ways out of it: binding the dimension, and
-    declaring a variant that covers the size.
   - An extent no declared variant covers MUST fail, naming the ranges that are
     covered. Choosing a neighbouring implementation instead would answer about a
     program nobody selected, and the failure is only actionable if the reader can
