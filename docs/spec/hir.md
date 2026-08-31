@@ -111,6 +111,11 @@ parser-lexical mesh binding; `ShardLayout.mesh` MUST point at an active
 binding on the lexical path. A `Mesh` MAY map fewer levels than the domain
 declares, but it MUST NOT create a level or change one's extent.
 
+**Return type.** `Function.return_type` is the HIR result `Type`: a
+`TensorType` for one result or a `TupleType` for multiple results. It is part of
+the function signature and is the result component projected into
+`Function.type`.
+
 **Value type.** `Function.type` is the IR-level `CallableType`
 ([types §7](./types.md#7-callabletype)) projected from `params` +
 `return_type`. The projection is fixed at construction and stays

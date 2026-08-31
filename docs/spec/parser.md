@@ -17,15 +17,43 @@ def parse_function(
 ) -> hir.Function | tir.PrimFunction: ...
 ```
 
-- Every parser-authored `Call` reachable from a Function body carries `SourceSpanMetadata` for
-  the AST expression that constructed it. A parent match fills only Calls without a span, so it
-  cannot replace a more precise child span. Traversal follows `Call` operands and IR `Tuple`
-  values, but does not assign source identity to shared lexical `Var` values. Source spans use
-  physical source-file coordinates with a one-based start column.
-- For `a, b = producer(...)`, detached `TupleGetItem(index=0)` and
-  `TupleGetItem(index=1)` lexical values carry the respective target Name spans (`a` and `b`) and
-  matching `BindingMetadata`; later reads do not replace that identity. A multi-carry loop's
-  derived projections carry the `for` statement span and their carry binding name.
+### 1.1 HIR Return Contracts
+
+An ordinary HIR function and a specialization variant MAY omit `-> return-type`;
+an ordinary function then records its inferred `body.type` as `Function.return_type`.
+When either declares an annotation, the parser MUST require
+`types_compatible(annotation, body.type)`. This is directional compatibility,
+not a parser-only equality relation: an annotation with `layout=None` leaves
+layout unconstrained according to the shared type rule.
+
+A `pass` HIR function is a dispatch prototype and MUST declare `-> return-type`.
+That annotation is its `Function.return_type` and callable return type. Every
+variant body MUST be compatible with that base return type; its own IR return
+type remains the exact base type so all variants share one dispatch signature.
+
+`Tensor[...]` without a storage slot constructs `storage=GMEM`, including in a
+return annotation. It is not an unspecified-storage spelling. Consequently an
+SMEM body under `-> Tensor[...]` must explicitly return a GMEM result; the
+parser reports both the annotation and inferred body type, with the authored
+function location, when they are incompatible. `tuple[...]` annotations are
+accepted and apply this same compatibility rule recursively to every field.
+
+### 1.2 Source Span Metadata
+
+Every parser-authored `Call` reachable from a Function body carries `SourceSpanMetadata` for
+the AST expression that constructed it. A parent match fills only Calls without a span, so it
+cannot replace a more precise child span. Traversal follows `Call` operands and IR `Tuple`
+values, but does not assign source identity to shared lexical `Var` values. Source spans use
+physical source-file coordinates with a one-based start column.
+
+### 1.3 Tuple Binding Metadata
+
+For `a, b = producer(...)`, detached `TupleGetItem(index=0)` and
+`TupleGetItem(index=1)` lexical values carry the respective target Name spans (`a` and `b`) and
+matching `BindingMetadata`; later reads do not replace that identity. A multi-carry loop's
+derived projections carry the `for` statement span and their carry binding name.
+
+### 1.4 Context and Diagnostics
 
 `FuncParserContext` carries the dialect, Function role, closure, topology scope, target, and
 optional base/key for one parse. `FunctionRole` is `ROOT`, `VARIANT`, or `CONVERTER`.
@@ -105,8 +133,11 @@ tensor-optional-slot  ::= layout
 tensor                ::= tensor-head '[' '(' (tensor-shape-layout ',' dtype | tensor-shape-layout
                           ',' dtype ',' tensor-optional-slot | tensor-shape-layout ',' dtype ','
                           tensor-optional-slot ',' tensor-optional-slot) ')' ']'
+tuple-type            ::= 'tuple' '[' '(' type-annotation (',' type-annotation)* ')' ']'
+                          | 'tuple' '[' type-annotation ']'
 scalar-type           ::= primary
 type-annotation       ::= tensor
+                          | tuple-type
                           | scalar-type
 signature             ::= (name ':' type-annotation (',' name ':' type-annotation)*)?
 return-type           ::= type-annotation
@@ -194,6 +225,7 @@ function              ::= 'def' name '(' signature ')' ('->' return-type)? ':' b
 | explicit_layout, layout, placed_layout, plain_layout | layout_shape, tensor_optional_slot, tensor_shape | LayoutShapeRule | A layout must have a valid non-boolean shape. | src/tilefoundry/parser/ast_pattern.py |
 | function | function | FunctionDialectRule | A function kind and constructed value must agree with the active dialect. | src/tilefoundry/parser/pattern_nodes.py |
 | function | function | FunctionRegistrationRule | A validated function must be registered exactly once in its owning scope. | src/tilefoundry/parser/pattern_nodes.py |
+| function | function | FunctionReturnCompatibilityRule | A HIR body with a return annotation must satisfy that annotation; a dispatch prototype must declare one, and each variant body must satisfy the prototype return contract. | src/tilefoundry/parser/pattern_nodes.py |
 | function | function | FunctionRoleValidationRule | A root, variant, or converter must satisfy its role before registration. | src/tilefoundry/parser/pattern_nodes.py |
 | function | function | FunctionSignatureRule | A function must construct an ordered parameter tuple. | src/tilefoundry/parser/pattern_nodes.py |
 | index_slice | subscript_index | TileWindowSliceBoundRule | A tile window cannot be used as a slice bound. | src/tilefoundry/parser/pattern_nodes.py |
