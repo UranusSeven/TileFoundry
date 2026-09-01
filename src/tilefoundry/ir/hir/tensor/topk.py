@@ -44,9 +44,9 @@ from tilefoundry.visitor_registry.access_relation import (
     AccessRelations,
     AffineAccess,
     BoundaryRelation,
-    coordinates_of,
     iterating,
     register_access_relation,
+    relations_of,
 )
 from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
 
@@ -89,18 +89,18 @@ def _static_dim_value(d) -> "int | None":
 
 
 class _DimUpperBoundVisitor(ExprVisitor[int | None]):
-    def visit_Constant(self, d: Constant) -> int | None:
+    def visit_Constant(self, d: Constant, ctx=None) -> int | None:
         value = d.value
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
-    def visit_DimVar(self, d: DimVar) -> int:
+    def visit_DimVar(self, d: DimVar, ctx=None) -> int:
         return d.hi - 1
 
-    def visit_Call(self, d: Call) -> int | None:
+    def visit_Call(self, d: Call, ctx=None) -> int | None:
         target = d.target
         if isinstance(target, (DimMin, DimMax, DimAdd, DimMul)):
-            a_hi = self.visit(d.args[0])
-            b_hi = self.visit(d.args[1])
+            a_hi = self.visit(d.args[0], ctx)
+            b_hi = self.visit(d.args[1], ctx)
             if a_hi is None or b_hi is None:
                 return None
             if isinstance(target, DimMin):
@@ -111,14 +111,14 @@ class _DimUpperBoundVisitor(ExprVisitor[int | None]):
                 return a_hi + b_hi
             return None if a_hi < 0 or b_hi < 0 else a_hi * b_hi
         if isinstance(target, (DimFloorDiv, DimMod)):
-            a_hi = self.visit(d.args[0])
+            a_hi = self.visit(d.args[0], ctx)
             b_val = _static_dim_value(d.args[1])
             if a_hi is None or b_val is None or b_val <= 0:
                 return None
             return a_hi // b_val if isinstance(target, DimFloorDiv) else b_val - 1
         return None
 
-    def default_visit(self, d) -> int | None:
+    def default_visit(self, d, ctx=None) -> int | None:
         return None
 
 
@@ -205,7 +205,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
         else Layout(shape=out_shape, strides=try_c_order_strides(out_shape))
     )
     if source_shard is not None:
-        relation = coordinates_of(call, ctx)
+        relation = relations_of(call, ctx)
         derived = derive_output_shard_layout((x_ty,), relation, out_shape, fresh_strides=True)
 
         new_layout = derived if derived is not None else _canonical_shard(source_shard, out_shape)

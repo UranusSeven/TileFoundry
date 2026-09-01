@@ -7,7 +7,6 @@ import torch
 
 from tests.ops.cost_utils import CostCase, run_cost_case
 from tilefoundry import func
-from tilefoundry.analysis.walk import postorder
 from tilefoundry.dsl import DimVar, Tensor, tf
 from tilefoundry.evaluator import evaluate
 from tilefoundry.ir.core import Call
@@ -16,6 +15,7 @@ from tilefoundry.ir.hir.tensor.shape_of import ShapeOf
 from tilefoundry.ir.types import TensorType, make_tensor_type
 from tilefoundry.ir.types.shard.layout import EMPTY_LAYOUT
 from tilefoundry.ir.types.storage import StorageKind
+from tilefoundry.ir.visitor import collect_exprs
 from tilefoundry.visitor_registry.contexts import TrafficBytes
 
 _S = DimVar("runtime_shape", 1, 9)
@@ -42,11 +42,11 @@ def test_shape_metadata_cost(case):
 
 
 def test_shape_metadata_uses_runtime_shape_and_host_types() -> None:
-    actual_shape, actual_rank = evaluate(_shape_metadata, torch.zeros(3, 4), device="cpu")
+    actual_shape, actual_rank = evaluate(_shape_metadata, torch.zeros(3, 4))
 
     torch.testing.assert_close(actual_shape, torch.tensor([3, 4], dtype=torch.int64))
     torch.testing.assert_close(actual_rank, torch.tensor(2, dtype=torch.int64))
-    calls = [expr for expr in postorder(_shape_metadata.body) if isinstance(expr, Call)]
+    calls = [expr for expr in collect_exprs(_shape_metadata.body) if isinstance(expr, Call)]
     metadata_calls = [
         call
         for call in calls
@@ -64,5 +64,5 @@ def _shape_element_paths(x: Tensor[(_S, 4), "f32"]):
 
 def test_shape_element_path_has_the_canonical_type() -> None:
     assert _shape_element_paths.body.type == TensorType.umat_scalar()
-    actual = evaluate(_shape_element_paths, torch.zeros(3, 4), device="cpu")
+    actual = evaluate(_shape_element_paths, torch.zeros(3, 4))
     torch.testing.assert_close(actual, torch.tensor(4, dtype=torch.int64))

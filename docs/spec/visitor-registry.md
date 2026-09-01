@@ -177,41 +177,21 @@ class FunctionScope:
 
 
 @dataclass
-class CallFeed(Generic[T]):
-    """Values supplied to one callee, keyed by formal parameter identity."""
-
-    by_param: Mapping[int, T]
-
-    def value_for(self, param: Param) -> T: ...
-
-
-class CallFeedProvider(Protocol[T]):
-    def build_call_feed(self, callee: Function, supplied: tuple[T, ...]) -> CallFeed[T]: ...
-    def scope_for(self, callee: Function) -> FunctionScope | None: ...
-
-
-@dataclass
 class TypeInferContext:
-    """Walk-local type cache, mesh scope, and elaboration cache.
-
-    Attributes:
-        scope: attribute; where the walk is reading, or ``None`` when it was
-            given no scope.
-        cache: attribute; memoized ``id(expr)`` to inferred ``Type``.
-        mesh_scope: attribute; enclosing mesh scope tuple.
-        elaboration_cache: attribute; memoized specialization instances.
-    """
+    """Walk location and type-inference memo state."""
 
     scope: FunctionScope | None = None
-    cache: dict[int, Type] = field(default_factory=dict)
     mesh_scope: tuple = ()
-    elaboration_cache: dict[tuple, Any] = field(default_factory=dict)
-    call_feed_provider: CallFeedProvider[Type] | None = None
-    feed: CallFeed[Type] | None = None
+    memo: dict[int, tuple[Expr, Type]] = field(default_factory=dict, repr=False, compare=False)
+    instantiated_memo: dict[tuple[int, tuple[Type, ...]], Type] = field(
+        default_factory=dict, repr=False, compare=False
+    )
 
-    def type_of(self, expr: Expr) -> Type: ...
-    def build_call_feed(self, callee: Function, supplied: tuple[Type, ...]) -> CallFeed[Type]: ...
+    def child_for(self, callee: Function) -> Module | None: ...
     def scope_for(self, callee: Function) -> FunctionScope | None: ...
+    def for_callee(self, callee: Function) -> TypeInferContext: ...
+    def type_of(self, expr: Expr) -> Type: ...
+    def local_type_of(self, expr: Expr) -> Type: ...
     def error(self, node: Expr | Stmt, msg: str) -> NoReturn: ...
 ```
 
@@ -226,16 +206,21 @@ nothing of that kind rather than guessing.
   - `scope` MUST be the only context state describing where a walk is reading,
     and the pair MUST be reachable from the package root together, since one is
     how the other is constructed.
-  - A `CallFeed` MUST contain only the formal parameter identity to value mapping;
-    it MUST NOT carry a Module, scope, reading, or parser metadata.
-  - `CallFeedProvider` is context-owned: Parser, Type Inference, and function-level
-    Evaluator provide their own value type and ownership rules. HIR consumes
-    `TypeInferContext.build_call_feed()` and does not own a resolver.
-  - `type_of` is a walk-local cache only — it holds no dispatch rule of its
-    own. A cache miss delegates to `TypeInferVisitor(self).visit(expr)`
-    (below), whose `visit_Call` is what consults
-    `typeinfer_registry.lookup(type(target))`; an unregistered Op call
-    routes through `ctx.error`.
+  - Crossing a Function boundary uses `dataclasses.replace` so a context
+    subclass retains its analysis-specific state.
+  - `memo` is the current scope's identity-pinned type table. Crossing a
+    Function boundary creates a fresh context table; a region keeps its scope
+    and seeds a nested visitor table from the enclosing one.
+  - `instantiated_memo` is the traversal-wide Function-call result table,
+    keyed by `(id(callee), argument_types)`. Crossing a Function boundary MUST
+    preserve the same table object. It stores Types only and never introduces
+    a derived Function into the IR.
+  - The two tables have opposite lifetimes: `memo` is replaced at a Function
+    boundary, while `instantiated_memo` is shared by the complete traversal.
+  - `type_of` only looks up `memo` and otherwise returns `expr.type`; it never
+    starts a traversal or infers a type on demand.
+  - `local_type_of` is the same read in a context without a topology window;
+    contexts with a window override it to project the read type.
 
 Registry + decorator:
 
@@ -258,46 +243,53 @@ Visitor:
 
 ```python
 class TypeInferVisitor(ExprVisitor[Type]):
-    def __init__(self, ctx: TypeInferContext): ...   # ctx carries the cache and helpers
-    def visit_Var(self, var: Var): ...               # return the Var's type
-    def visit_Constant(self, c: Constant): ...       # the node's own declared type
-    def visit_Call(self, call: Call): ...            # typeinfer_registry.lookup(type(call.target))
-    def visit_Tuple(self, tup: Tuple): ...            # structural: TupleType over each element's type
-    def visit_GridRegionExpr(self, grid): ...         # carry/body — hir §1.2
-    def visit_ShapeOf(self, shape_of: ShapeOf) -> Type: ...
+    def __init__(self, *, memo=None, owns_body=True): ...
+    def visit(self, expr: Expr, ctx: TypeInferContext) -> Type: ...
+    def visit_leaf_Var(self, var: Var, operands, ctx): ...
+    def visit_leaf_Constant(self, c: Constant, operands, ctx): ...
+    def visit_leaf_Call(self, call: Call, arg_types, ctx): ...
+    def visit_leaf_Tuple(self, tup: Tuple, field_types, ctx): ...
+    def visit_GridRegionExpr(self, grid, ctx): ...
+    def visit_leaf_ShapeOf(self, shape_of: ShapeOf, operands, ctx) -> Type: ...
+
+def inference_type(expr: Expr, ctx: TypeInferContext | None = None) -> Type: ...
 ```
 
 - constraints:
-  - one `visit_<Kind>` rule per `Expr` subclass reachable from a `hir.Function`
+  - one `visit_leaf_<Kind>` rule per `Expr` subclass reachable from a `hir.Function`
     body or a tir `Expr` field — there is no `isinstance` fallback. An `Expr`
-    subclass with no rule raises via `ctx.error` in `generic_visit` rather than
-    trusting a possibly-stale `Expr.type` field.
-  - `visit_Call` is the sole registry-dispatch point: it looks up
-    `typeinfer_registry.lookup(type(call.target))` and invokes the handler: an
-    unregistered `Op` call routes through `ctx.error`.
-  - `visit_Tuple` derives a structural `TupleType` from `ctx.type_of` of each
-    element — never the `Tuple` node's own stamped `.type`.
-  - `visit_ShapeOf` returns the node's declared rank-0 i32 type.
-  - `hir.Function` is itself a valid `Call.target` ([§4](#4-instance-1--typeinfer) above): its registered
-    typeinfer handler elaborates the callee under the call's actual argument
-    types ([hir §1.1](./hir.md#11-function)) rather than reading the target's
-    own `.type`.
+    subclass with no rule raises via `ctx.error` in `default_visit_leaf` rather
+    than trusting a possibly-stale `Expr.type` field.
+  - `visit_leaf_Call` branches on its target. An `Op` looks up
+    `typeinfer_registry.lookup(type(target))`; an unregistered Op routes through
+    `ctx.error`. Handlers read operand types through `ctx.type_of`, which sees
+    the current scope's memo bindings. A `Function` binds parameters into a new visitor memo and walks
+    its body in a replaced child context ([hir §1.1](./hir.md#11-function)); repeated calls to the same
+    callee with equal argument types reuse the result in `instantiated_memo`.
+  - `visit_leaf_Tuple` derives a structural `TupleType` directly from its
+    already-derived operands, never the Tuple node's stamped `.type`.
+  - `visit_GridRegionExpr` derives init values outside the region, then seeds a
+    new visitor with induction and phi bindings before body/yields are visited
+    ([hir §1.2](./hir.md#12-gridregionexpr)). It overrides the complete node
+    visit; the base has no per-kind operand hook.
+  - `visit_leaf_ShapeOf` returns the node's declared rank-0 i32 type.
+  - `inference_type` creates a fresh non-owning visitor and returns the inferred
+    type without writing it to `expr.type`; traversal-wide inference continues
+    to use its own shared visitor and memo.
 
-Lifecycle: parser builds a `TypeInferContext` and runs eager
-typeinfer at parse time (see [parser](./parser.md)). A `Module`
-entering the pass pipeline already has every `Expr.type` filled.
-There is no "first TypeInferPass". When a transform changes the
-expression structure and needs to recompute types, it calls
-`typeinfer_registry.lookup(...)` directly (see
-[passes](./passes.md)).
+Lifecycle: parser builds a `TypeInferContext` and infers each newly built call
+at parse time (see [parser](./parser.md)). The analysis preflight then walks
+each authored body and writes every `Expr.type` in place before
+consumers run. The visitor and its context share the current scope's memo;
+`type_of` is a constant-time lookup used to expose bindings to handlers.
 
 ### 4.1 Access relation service — `access_relation`
 
 One registry over the Op classes says where each Op reads and writes, and every
-reader asks it. Typeinfer asks it to derive the result's Type, the polyhedral
-model asks it for dependences, and the movement family asks it how much crossed
-each boundary. There is no second registry and no fallback: a boundary nobody
-can price is a boundary nobody can schedule.
+reader asks it. Typeinfer asks it to derive the result's Type, the loop
+footprint asks it for the bytes one authored loop touches, and the movement
+family asks it how much crossed each boundary. There is no second registry and
+no fallback: a boundary nobody can price is a boundary nobody can measure.
 
 ```python
 class AffineAccess:
@@ -380,11 +372,11 @@ def register_access_relation(op_cls: type): ...
 
 ## 5. Instance 2 — `verify`
 
-Context (extends `TypeInferContext` to share the type-of cache):
+Context (extends `TypeInferContext` with the active mesh stack):
 
 ```python
 @dataclass
-class VerifyContext(TypeInferContext):   # inherits scope / cache / type_of
+class VerifyContext(TypeInferContext):   # inherits scope / mesh_scope / child_for
     """Type inference context extended with the active mesh stack.
 
     Attributes:
@@ -396,7 +388,7 @@ class VerifyContext(TypeInferContext):   # inherits scope / cache / type_of
 ```
 
 - constraints:
-  - shares typeinfer's type-of cache; adds a mesh-scope stack.
+  - adds a mesh-scope stack for verification traversal.
 
 Registry + decorator:
 
@@ -576,13 +568,15 @@ class CostContext(TypeInferContext):
     level: str | None = None
     topologies: tuple[Topology, ...] = ()
 
-    def local_type_of(self, expr: Expr) -> Type: ...
+    def local_type_of(self, expr: Expr) -> Type: ...  # read expr.type, then project
     def local_output_type(self, call: Call) -> Type: ...
 
 cost_evaluator_registry: AnalysisRegistry[type[Op]]
 def register_cost_evaluator(op_cls: type[Op]): ...
 
-class CostEvaluator(ExprVisitor[Cost]): ...
+class CostEvaluator(ExprWalker[Cost]):
+    def __init__(self, registry: AnalysisRegistry = cost_evaluator_registry): ...
+    def visit_Call(self, call: Call, ctx: CostContext) -> Cost: ...
 ```
 
 - constraints:
@@ -697,8 +691,8 @@ needed.
 ```python
 # example
 class AliasVisitor(ExprVisitor[None]):
-    def __init__(self, ctx: LivenessContext, registry: AnalysisRegistry = liveness_registry): ...   # explicit binding
-    def visit_Call(self, call: Call) -> None: ...   # look up type(call.target), invoke, then recurse
+    def __init__(self, registry: AnalysisRegistry = liveness_registry): ...
+    def visit_Call(self, call: Call, ctx: LivenessContext) -> None: ...
 ```
 
 ### Step 4 — register handlers in the Op files

@@ -18,13 +18,15 @@ from tilefoundry import func, module
 from tilefoundry.analysis.api import analyze
 from tilefoundry.analysis.errors import AnalysisError
 from tilefoundry.analysis.metadata import ComputeCostMetadata, TrafficMetadata
-from tilefoundry.analysis.walk import postorder, reachable_functions, tensor_types
 from tilefoundry.dsl import ConstTensor, DimVar, Tensor, Topology, tf
 from tilefoundry.ir.core import Call, get_metadata
+from tilefoundry.ir.core.module import reachable_functions
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.nn.matmul import MatMul
+from tilefoundry.ir.types import tensor_types
 from tilefoundry.ir.types.shard.layout import ComposedLayout
 from tilefoundry.ir.types.shard.shard_layout import ShardLayout
+from tilefoundry.ir.visitor import collect_exprs
 from tilefoundry.target import CudaTarget
 
 _H200 = "nvidia.h200_sxm"
@@ -34,7 +36,7 @@ _CTA = (Topology("cta", 132),)
 def _matmul_records(result) -> tuple[tuple[ComputeCostMetadata, TrafficMetadata], ...]:
     """Both halves of the record on each inlined MatMul occurrence."""
     records = []
-    for expr in postorder(result.function.body):
+    for expr in collect_exprs(result.function.body):
         if not isinstance(expr, Call) or not isinstance(expr.target, MatMul):
             continue
         record = get_metadata(expr, ComputeCostMetadata)
@@ -185,7 +187,7 @@ def test_each_reference_program_is_one_analysable_kernel(name, root) -> None:
 def _placed_primitives(fn) -> list[tuple[str, object]]:
     """Each costed primitive result in *fn* that a sliced Mesh reached."""
     found: list[tuple[str, object]] = []
-    for expr in postorder(fn.body):
+    for expr in collect_exprs(fn.body):
         if not isinstance(expr, Call) or isinstance(expr.target, Function):
             continue
         for leaf in tensor_types(expr.type):

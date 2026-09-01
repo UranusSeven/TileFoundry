@@ -1,8 +1,8 @@
 """DeepSeek-V4-Flash as IR Modules: the sliding-window MLA attention submodule,
 the two MoE blocks, the decoder layer that composes them, and the causal-LM root.
 
-One authored source at two configurations: the corpus analyses and schedules the
-attention submodule at the real checkpoint's dimensions, and
+One authored source at two configurations: the corpus analyses the attention
+submodule at the real checkpoint's dimensions, and
 `test_causal_lm_e2e.py` runs the whole tree at a shape small enough to be
 affordable. The class bodies sit inside functions rather than at file scope, so
 each is evaluated once per configuration, and ``build_deepseek_v4_flash`` is how a
@@ -1285,12 +1285,12 @@ def build_deepseek_v4_flash(config: DSV4Config):
 
         def forward(self, hidden, cos_pos, sin_pos, kv_cache, scale, ones_head_dim, token_ids):
             attn_in = self.pre_attn_rms_norm(hidden)
-            attn_out, kv_new = self.attention(
+            attn_out, kv_new = self.attention.forward(
                 attn_in, cos_pos, sin_pos, kv_cache, scale, ones_head_dim,
             )
             h1 = self.residual_add(hidden, attn_out)
             moe_in = self.pre_moe_rms_norm(h1)
-            moe_out = self.moe(moe_in, token_ids)
+            moe_out = self.moe.forward(moe_in, token_ids)
             out = self.residual_add(h1, moe_out)
             return out, kv_new
 
@@ -1344,7 +1344,7 @@ def build_deepseek_v4_flash(config: DSV4Config):
             fresh = []
             for i in range(config.n_layers):
                 layer = getattr(self, f"layer{i}")
-                hidden, kv_new = layer(
+                hidden, kv_new = layer.forward(
                     hidden, cos_pos, sin_pos, past_key_values[i], scale, ones_head_dim, token_ids,
                 )
                 fresh.append(kv_new)

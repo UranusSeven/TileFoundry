@@ -26,18 +26,19 @@ from tilefoundry.ir.constraints.layout import _LAYOUT_WILDCARD
 from tilefoundry.ir.core import (
     BindingMetadata,
     ExecutionDomainMetadata,
+    attach_metadata,
     get_metadata,
-    replace_metadata,
 )
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.tir.launch import launch_call
 from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.dim import DimVar
 from tilefoundry.ir.types.shard import Broadcast, Layout, Partial, Split
+from tilefoundry.ir.types.substitute import canonicalize_dims
+from tilefoundry.ir.types.utils import types_compatible
 
 from .ast_pattern import (
     _BINARY_OPERATORS,
-    _RETURN_TYPE,
     _TYPE_INFER_CONTEXT,
     _UNARY_OPERATORS,
     AstChild,
@@ -80,6 +81,7 @@ from .ast_pattern import (
     _resolve_reference,
     _slice_size,
     attach_authored_metadata,
+    authored_source_range,
     parse_node,
     runtime,
 )
@@ -459,7 +461,8 @@ class MeshAxisPattern(ElementPattern):
         mesh = context.lexical_scope.lookup(binding)
         if mesh is None:
             try:
-                mesh = _resolve_reference(node.value, context)
+                reference = node if isinstance(node, ast.Name) else node.value
+                mesh = _resolve_reference(reference, context)
             except ParseError:
                 mesh = None
         if not isinstance(mesh, runtime.Mesh):
@@ -962,11 +965,94 @@ class ScalarTypePattern(ElementPattern):
     RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
 
 
+class TupleTypePattern(ElementPattern):
+    """Parse ``tuple[T, U, ...]`` as a parser-only type annotation value."""
+
+    element_name = "tuple_type"
+    syntax = LazyPattern(
+        lambda: ChoicePattern(
+            BranchPattern(
+                "tuple",
+                AstNodePattern(
+                    ast.Subscript,
+                    FieldPattern(
+                        "value",
+                        AstNodePattern(
+                            ast.Name,
+                            FieldPattern("id", LiteralPattern("tuple")),
+                        ),
+                    ),
+                    FieldPattern(
+                        "slice",
+                        AstNodePattern(
+                            ast.Tuple,
+                            CapturePattern("field_count", lambda node, context: len(node.elts)),
+                            FieldPattern(
+                                "elts",
+                                RepeatPattern(
+                                    ChildPattern(
+                                        "field_{index}",
+                                        lambda: TypeAnnotationPattern(),
+                                        "type_annotation",
+                                        "tuple_field",
+                                    ),
+                                    minimum=1,
+                                ),
+                            ),
+                        ),
+                    ),
+                ),
+                pattern_id="tuple.annotation",
+            ),
+            BranchPattern(
+                "tuple_single",
+                AstNodePattern(
+                    ast.Subscript,
+                    FieldPattern(
+                        "value",
+                        AstNodePattern(
+                            ast.Name,
+                            FieldPattern("id", LiteralPattern("tuple")),
+                        ),
+                    ),
+                    FieldPattern(
+                        "slice",
+                        ChildPattern(
+                            "field_0",
+                            lambda: TypeAnnotationPattern(),
+                            "type_annotation",
+                            "tuple_field",
+                        ),
+                    ),
+                ),
+                pattern_id="tuple.annotation",
+            ),
+        )
+    )
+
+    @staticmethod
+    def construct(match, children, context):
+        fields = tuple(
+            children[f"field_{index}"]
+            for index in range(match.captures.get("field_count", 1))
+        )
+        if not all(isinstance(field, (runtime.TensorType, runtime.TupleType)) for field in fields):
+            raise ParseError.from_node(
+                match.node,
+                context,
+                "tuple annotation fields must resolve to Tensor or tuple types",
+            )
+        return runtime.TupleType(fields=fields)
+
+    RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
+
+
 class TypeAnnotationPattern(ElementPattern):
     element_name = "type_annotation"
     syntax = LazyPattern(
         lambda: ChoicePattern(
             TensorPattern(),
+            TupleTypePattern(),
             ScalarTypePattern(),
         )
     )
@@ -1090,14 +1176,8 @@ class WhereAnnotationPattern(ElementPattern):
     @staticmethod
     def construct(match, children, context):
         node = match.node
-        source = context.function.source_filename if context.function else "<string>"
-        location = SourceLocation(
-            filename=source,
-            line=getattr(node, "lineno", 0),
-            column=getattr(node, "col_offset", 0),
-            end_line=getattr(node, "end_lineno", None),
-            end_column=getattr(node, "end_col_offset", None),
-        )
+        source_range = authored_source_range(node, context)
+        location = SourceLocation(*source_range) if source_range is not None else SourceLocation()
         if node.args:
             raise ParseError.from_node(node, context, "where(...) accepts keyword arguments only")
         if not node.keywords:
@@ -1165,9 +1245,7 @@ class ReturnTypePattern(ElementPattern):
 
     @staticmethod
     def construct(match, children, context):
-        value = children["type"]
-        context.lexical_scope.define(_RETURN_TYPE, value)
-        return value
+        return children["type"]
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
 
@@ -1802,29 +1880,11 @@ class CallBindingRule:
         if not isinstance(value.args, tuple):
             raise ParseError.from_node(match.node, context, "call arguments are not a tuple")
         if context.function is not None and context.function.state.mesh_stack:
-            value = replace_metadata(
+            attach_metadata(
                 value,
                 ExecutionDomainMetadata(tuple(context.function.state.mesh_stack)),
             )
         return value
-
-
-def _types_compatible(actual: object, expected: object) -> bool:
-    if actual == expected:
-        return True
-    if isinstance(actual, runtime.TensorType) and isinstance(expected, runtime.TensorType):
-        try:
-            actual_shape = tuple(runtime.normalize_dim(dim) for dim in actual.shape)
-            expected_shape = tuple(runtime.normalize_dim(dim) for dim in expected.shape)
-        except (TypeError, ValueError):
-            actual_shape = actual.shape
-            expected_shape = expected.shape
-        return actual_shape == expected_shape and actual.dtype == expected.dtype
-    if isinstance(actual, runtime.TupleType) and isinstance(expected, runtime.TupleType):
-        return len(actual.fields) == len(expected.fields) and all(
-            _types_compatible(left, right) for left, right in zip(actual.fields, expected.fields)
-        )
-    return False
 
 
 @dataclass(frozen=True)
@@ -1834,26 +1894,11 @@ class CallTypeInferenceRule:
     def apply(self, value, *, match, context):
         if not isinstance(value, runtime.Call):
             return value
-        value = attach_authored_metadata(value, match.node, context)
         infer_context = context.lexical_scope.lookup(_TYPE_INFER_CONTEXT)
         if not isinstance(infer_context, runtime.TypeInferContext):
             infer_context = runtime.TypeInferContext()
-        computed = runtime.TypeInferVisitor(infer_context).visit(value)
-        return dataclasses.replace(value, type=computed)
-
-
-class CallExpectedTypeRule:
-    STATEMENT: ClassVar[str] = "A call's inferred type must satisfy the expected expression type."
-
-    def apply(self, value, *, match, context):
-        expected = context.expected_type
-        actual = getattr(value, "type", None)
-        if expected is not None and not _types_compatible(actual, expected):
-            raise ParseError.from_node(
-                match.node,
-                context,
-                f"expression type {actual!r} does not match expected type {expected!r}",
-            )
+        computed = runtime.TypeInferVisitor().visit(value, infer_context)
+        value.type = computed
         return value
 
 
@@ -2316,10 +2361,11 @@ class CallPattern(ElementPattern):
                 operation = schema.builder(**attrs)
             except (TypeError, ValueError) as error:
                 raise ParseError.from_node(match.node, context, str(error)) from error
-            placeholder_type = context.expected_type
-            if placeholder_type is None:
-                placeholder_type = runtime.TensorType.scalar(runtime.DType.f32)
-            return runtime.Call(type=placeholder_type, target=operation, args=inputs)
+            return runtime.Call(
+                type=runtime.TensorType.scalar(runtime.DType.f32),
+                target=operation,
+                args=inputs,
+            )
         elif match.branch_id == "function_call":
             callee = match.captures["callee"]
             args = tuple(children.values())
@@ -2335,20 +2381,13 @@ class CallPattern(ElementPattern):
                 target=callee,
                 args=args,
             )
-            infer_context = context.lexical_scope.lookup(_TYPE_INFER_CONTEXT)
-            if not isinstance(infer_context, runtime.TypeInferContext):
-                infer_context = runtime.TypeInferContext()
-            instance = runtime.elaborate(
-                callee, tuple(arg.type for arg in args), infer_context, placeholder
-            )
-            return dataclasses.replace(placeholder, target=instance)
+            return placeholder
         raise RuntimeError(f"no constructor branch for {match.branch_id!r}")
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = (
         CallVariadicInputFormRule(),
         CallBindingRule(),
         CallTypeInferenceRule(),
-        CallExpectedTypeRule(),
     )
 
 
@@ -2383,7 +2422,6 @@ def _expression_operator_pattern(operator_type: type[ast.AST]) -> ChoicePattern:
 _CALL_RESULT_RULES: tuple[AstRule[Any], ...] = (
     CallBindingRule(),
     CallTypeInferenceRule(),
-    CallExpectedTypeRule(),
 )
 
 
@@ -2515,7 +2553,6 @@ class BinaryExpressionPattern(ElementPattern):
     RULES: ClassVar[tuple[AstRule[Any], ...]] = (
         CallBindingRule(),
         CallTypeInferenceRule(),
-        CallExpectedTypeRule(),
     )
 
 
@@ -2559,7 +2596,6 @@ class UnaryExpressionPattern(ElementPattern):
     RULES: ClassVar[tuple[AstRule[Any], ...]] = (
         CallBindingRule(),
         CallTypeInferenceRule(),
-        CallExpectedTypeRule(),
     )
 
 
@@ -3118,23 +3154,18 @@ class MeshContextPattern(ElementPattern):
                     context,
                     "Mesh topologies must be a tuple",
                 )
-            if all(isinstance(name, str) for name in topology_names):
-                try:
-                    topologies = tuple(context.function.topologies[name] for name in topology_names)
-                except KeyError as error:
-                    raise ParseError.from_node(
-                        match.node,
-                        context,
-                        f"topology {error.args[0]!r} not declared by @module",
-                    ) from error
-            elif all(hasattr(topology, "name") for topology in topology_names):
-                topologies = topology_names
-            else:
+            try:
+                topologies = runtime.resolve_mesh_topologies(
+                    topology_names, context.function.topologies
+                )
+            except KeyError as error:
                 raise ParseError.from_node(
                     match.node,
                     context,
-                    "Mesh topologies must be names or Topology objects",
-                )
+                    f"topology {error.args[0]!r} not declared by @module",
+                ) from error
+            except TypeError as error:
+                raise ParseError.from_node(match.node, context, str(error)) from error
             names = children.get("names", ())
             try:
                 mesh = runtime.Mesh(
@@ -3748,6 +3779,11 @@ class ForPattern(ElementPattern):
         else:
             for index, name in enumerate(frame.carry_names):
                 projection = _infer_call(runtime.TupleGetItem(index=index), (grid,), context)
+                attach_authored_metadata(
+                    projection,
+                    match.node,
+                    dataclasses.replace(context, binding_name=name),
+                )
                 context.lexical_scope.define(name, projection)
         return grid
 
@@ -3777,6 +3813,10 @@ class TupleAssignmentPattern(ElementPattern):
                     "names",
                     lambda node, context: tuple(item.id for item in node.targets[0].elts),
                 ),
+                CapturePattern(
+                    "target_nodes",
+                    lambda node, context: tuple(node.targets[0].elts),
+                ),
                 FieldPattern(
                     "value",
                     ChildPattern(
@@ -3795,6 +3835,7 @@ class TupleAssignmentPattern(ElementPattern):
     def construct(match, children, context):
         value = children["value"]
         names = match.captures["names"]
+        target_nodes = match.captures["target_nodes"]
         if not isinstance(value.type, runtime.TupleType):
             raise ParseError.from_node(
                 match.node, context, "tuple assignment requires a TupleType value"
@@ -3809,10 +3850,15 @@ class TupleAssignmentPattern(ElementPattern):
             else None
         )
         parent_name = getattr(schema, "name", None) or ", ".join(names)
-        value = replace_metadata(value, BindingMetadata(parent_name))
-        for index, name in enumerate(names):
+        attach_metadata(value, BindingMetadata(parent_name))
+        for index, (name, target_node) in enumerate(zip(names, target_nodes)):
+            assert isinstance(target_node, ast.Name)
             projection = _infer_call(runtime.TupleGetItem(index=index), (value,), context)
-            projection = replace_metadata(projection, BindingMetadata(name))
+            attach_authored_metadata(
+                projection,
+                target_node,
+                dataclasses.replace(context, binding_name=name),
+            )
             context.lexical_scope.define(name, projection)
         return value
 
@@ -3955,8 +4001,8 @@ class StatementPattern(ElementPattern):
                         context,
                         f"duplicate where annotation for Expr {label!r}",
                     )
-                value = replace_metadata(value, BindingMetadata(match.captures["name"]))
-                object.__setattr__(value, "metadata", (*value.metadata, annotation))
+                attach_metadata(value, BindingMetadata(match.captures["name"]))
+                value.metadata = (*value.metadata, annotation)
             elif annotation is not None and value.type != annotation:
                 raise ParseError.from_node(
                     match.node, context, "annotated assignment type mismatch"
@@ -3964,7 +4010,7 @@ class StatementPattern(ElementPattern):
             name = match.captures["name"]
             if context.function.dialect == "hir":
                 if isinstance(value, runtime.Call) and get_metadata(value, BindingMetadata) is None:
-                    value = replace_metadata(value, BindingMetadata(name))
+                    attach_metadata(value, BindingMetadata(name))
                 context.lexical_scope.define(name, value)
                 return value
             variable = runtime.Var(type=value.type, name=name)
@@ -4080,25 +4126,6 @@ class FunctionSignatureRule:
 
 
 @dataclass(frozen=True)
-class FunctionReturnRule:
-    STATEMENT: ClassVar[str] = "A HIR function body's inferred type must match its return type."
-
-    def apply(self, value, *, match, context):
-        if isinstance(value, runtime.Function) and value.body is not None:
-            infer_context = context.lexical_scope.lookup(_TYPE_INFER_CONTEXT)
-            if not isinstance(infer_context, runtime.TypeInferContext):
-                infer_context = runtime.TypeInferContext()
-            body_type = runtime.TypeInferVisitor(infer_context).visit(value.body)
-            if not _types_compatible(body_type, value.return_type):
-                raise ParseError.from_node(
-                    match.node,
-                    context,
-                    f"function body type {body_type!r} does not match return {value.return_type!r}",
-                )
-        return value
-
-
-@dataclass(frozen=True)
 class FunctionDialectRule:
     STATEMENT: ClassVar[str] = (
         "A function kind and constructed value must agree with the active dialect."
@@ -4118,6 +4145,60 @@ class FunctionDialectRule:
                 f"{context.function.dialect} context constructed {type(value).__name__}",
             )
         return value
+
+
+_AUTHORED_RETURN_ANNOTATION = "_tilefoundry_authored_return_annotation"
+_AUTHORED_BODY_TYPE = "_tilefoundry_authored_body_type"
+
+
+@dataclass(frozen=True)
+class FunctionReturnCompatibilityRule:
+    STATEMENT: ClassVar[str] = (
+        "A HIR body with a return annotation must satisfy that annotation; a "
+        "dispatch prototype must declare one, and each variant body must "
+        "satisfy the prototype return contract."
+    )
+
+    def apply(self, value, *, match, context):
+        if context.function is None:
+            raise ParseError.from_node(match.node, context, "function lacks parser context")
+        if context.function.dialect != "hir":
+            return value
+        declared = getattr(value, _AUTHORED_RETURN_ANNOTATION, None)
+        body_type = getattr(value, _AUTHORED_BODY_TYPE, None)
+        try:
+            if body_type is None:
+                if context.function.role is FunctionRole.ROOT and declared is None:
+                    raise ParseError.from_node(
+                        match.node,
+                        context,
+                        "HIR pass prototype requires a return annotation",
+                    )
+                return value
+            if declared is not None and not types_compatible(declared, body_type):
+                raise ParseError.from_node(
+                    match.node,
+                    context,
+                    "return annotation is not compatible with the inferred body type: "
+                    f"annotation {declared!r}, body {body_type!r}",
+                )
+            if context.function.role is FunctionRole.VARIANT:
+                base = context.function.base
+                if not isinstance(base, runtime.Function):
+                    raise ParseError.from_node(
+                        match.node, context, "variant lacks a HIR dispatch prototype"
+                    )
+                if not types_compatible(base.return_type, body_type):
+                    raise ParseError.from_node(
+                        match.node,
+                        context,
+                        f"variant body type {body_type!r} is not compatible with "
+                        f"dispatch return contract {base.return_type!r}",
+                    )
+            return value
+        finally:
+            delattr(value, _AUTHORED_RETURN_ANNOTATION)
+            delattr(value, _AUTHORED_BODY_TYPE)
 
 
 @dataclass(frozen=True)
@@ -4254,36 +4335,17 @@ class FunctionPattern(ElementPattern):
         specializations = context.function.specializations
         converter = context.function.converter
         if context.function.dialect == "hir":
-            if declared_return is None:
-                if body is None:
-                    raise ParseError.from_node(
-                        match.node,
-                        context,
-                        "HIR pass prototype requires a return annotation",
-                    )
-                declared_return = body.type
-            elif (
-                isinstance(declared_return, runtime.TensorType)
-                and isinstance(body, runtime.Expr)
-                and isinstance(body.type, runtime.TensorType)
-                and declared_return.shape == body.type.shape
-                and declared_return.dtype == body.type.dtype
-                and declared_return.storage == body.type.storage
-                and isinstance(declared_return.layout, runtime.ShardLayout)
-                and isinstance(body.type.layout, runtime.ShardLayout)
-                and isinstance(declared_return.layout.layout, runtime.Layout)
-                and isinstance(body.type.layout.layout, runtime.Layout)
-                and declared_return.layout.attrs == body.type.layout.attrs
-                and declared_return.layout.mesh == body.type.layout.mesh
-                and declared_return.layout.layout.strides is None
-                and body.type.layout.layout.strides is not None
-            ):
-                declared_return = runtime.TensorType(
-                    shape=declared_return.shape,
-                    dtype=declared_return.dtype,
-                    layout=body.type.layout,
-                    storage=declared_return.storage,
-                )
+            declared_return = (
+                None if declared_return is None else canonicalize_dims(declared_return)
+            )
+            if body is None:
+                return_type = declared_return or runtime.UnitType()
+            elif context.function.role is FunctionRole.VARIANT:
+                base = context.function.base
+                assert isinstance(base, runtime.Function)
+                return_type = base.return_type
+            else:
+                return_type = body.type
             function_name = (
                 getattr(context.function.base, "name", None)
                 or context.function.base_name
@@ -4293,14 +4355,16 @@ class FunctionPattern(ElementPattern):
                 name=function_name,
                 params=params,
                 body=body,
-                return_type=declared_return,
+                return_type=return_type,
                 specializations=specializations,
             )
+            setattr(function, _AUTHORED_RETURN_ANNOTATION, declared_return)
+            setattr(function, _AUTHORED_BODY_TYPE, None if body is None else body.type)
             if context.function.role is FunctionRole.VARIANT:
-                object.__setattr__(function, runtime.DISPLAY_NAME, match.captures["name"])
-                object.__setattr__(function, "name", function_name)
+                setattr(function, runtime.DISPLAY_NAME, match.captures["name"])
+                function.name = function_name
             elif context.function.role is FunctionRole.CONVERTER:
-                object.__setattr__(function, "name", f"{function_name}.converter[{converter}]")
+                function.name = f"{function_name}.converter[{converter}]"
             binding = context.function.binding_name or match.captures["name"]
             define = getattr(context.function.module_scope, "define", None)
             if callable(define):
@@ -4325,8 +4389,8 @@ class FunctionPattern(ElementPattern):
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = (
         FunctionSignatureRule(),
-        FunctionReturnRule(),
         FunctionDialectRule(),
+        FunctionReturnCompatibilityRule(),
         FunctionRoleValidationRule(),
         FunctionRegistrationRule(),
     )
@@ -4350,7 +4414,6 @@ __all__ = [
     "BinaryExpressionPattern",
     "BlockPattern",
     "CallBindingRule",
-    "CallExpectedTypeRule",
     "CallPattern",
     "CallTypeInferenceRule",
     "ConstantPattern",
@@ -4362,7 +4425,7 @@ __all__ = [
     "FunctionDialectRule",
     "FunctionPattern",
     "FunctionRegistrationRule",
-    "FunctionReturnRule",
+    "FunctionReturnCompatibilityRule",
     "FunctionRoleValidationRule",
     "FunctionSignatureRule",
     "IndexEndpointPattern",
@@ -4401,6 +4464,7 @@ __all__ = [
     "TensorShapeLayoutPattern",
     "TupleAssignmentPattern",
     "TupleExpressionPattern",
+    "TupleTypePattern",
     "TypeAnnotationPattern",
     "UnaryExpressionPattern",
     "CallVariadicInputFormRule",

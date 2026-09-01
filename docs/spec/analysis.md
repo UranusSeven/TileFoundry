@@ -1,310 +1,23 @@
-# TileFoundry Spec — analysis (polyhedral model + per-stage target facts)
+# TileFoundry Spec — analysis (authored-HIR metrics + per-stage target facts)
 
 This spec owns TileFoundry's fact layer: everything a later stage decides
 *over*, and nothing that decides anything itself. It has two surfaces:
 
 | Surface | Entry | What it states |
 |---|---|---|
-| Polyhedral model | `extract(hir) -> TileGraph` | one HIR `Function` body as isl domains, access relations and auto-inferred dependences — target-independent |
 | Program check | `check_program(module, function, level=..., budget=..., analyzers=...)` | an inlined Function view after validating one authored program, its declared topology, and what each requested analysis needs of it |
 | Composed measurement | `analyze(module, function, analysis=...)` | one or more root analyses and their union dependency closure, leaving typed Metadata on the IR |
 
 Per-Op semantic derivation — typeinfer, the forward access relation, shard
 propagation — is owned by [semantic-analysis](./semantic-analysis.md), and the
-registries behind it by [visitor-registry](./visitor-registry.md); the
-polyhedral model consumes the forward relation
+registries behind it by [visitor-registry](./visitor-registry.md); the families
+below consume the forward relation
 ([visitor-registry §4.1](./visitor-registry.md#41-access-relation-service--access_relation))
 rather than restating it.
 
-**Layering.** The decisions taken over these facts are owned by
-[schedule](./schedule.md#4-kernel-schedule-construction). The dependency is
-one-way: the schedule layer reads this layer's facts, and this layer MUST NOT
-import or otherwise depend on the schedule layer. The atom catalogue and the
-store a tile lives in are the schedule layer's own inputs and are owned there
-([schedule §5](./schedule.md#5-scheduling-facts)).
+## 1. Authored-HIR metrics
 
-## 1. Polyhedral model
-
-One extraction models one HIR `Function` body as a set of *statements* at
-**element** granularity. A statement is one compute op at one call site; its
-iteration domain is the op's own element domain, prefixed by one dimension per
-authored loop enclosing it. Nothing here retiles, reorders, or searches: the
-model states what the authored program accesses, and what must run before what.
-
-### 1.1 `TileUnit`
-
-```python
-class TileUnit:
-    """One statement's identity.
-
-    Attributes:
-        name: attribute; isl tuple name shared by this statement's domain, reads, writes and deps pieces.
-        op: attribute; The HIR Call (one op at one call site) that produced this statement.
-    """
-
-    name: str
-    op: object
-```
-
-- constraints:
-  - The structure MUST be immutable.
-  - `name` MUST be a valid isl identifier and MUST be the tuple name of every
-    `TileGraph` piece belonging to this statement.
-  - `name` MUST be unique within one extraction: a name two statements would
-    share MUST be disambiguated with a numeric suffix, and a statement
-    contributed by a penetrated nested `Function` MUST additionally carry that
-    call site's own prefix.
-  - `op` MUST be the `Call` node itself, so a consumer can recover
-    `op.target`, `op.args` and `op.type`; it MUST NOT be the bare `Op`.
-
-### 1.2 `TileGraph`
-
-```python
-class TileGraph:
-    """Provide the polyhedral model of one HIR Function body.
-
-    Attributes:
-        domain: attribute; Union of every statement's iteration domain, one named tuple per statement.
-        deps: attribute; Auto-inferred read-after-write must-dependence between statement instances.
-        reads: attribute; Union of every statement's read access relations, statement tuple to buffer tuple.
-        writes: attribute; Union of every statement's write access relations.
-        units: attribute; One TileUnit per statement, in dependence-respecting order.
-        params: attribute; isl parameter name to the ShapeDim it stands for.
-        buffer_dtypes: attribute; Buffer tuple name to the DType its elements carry.
-        parallel_dims: attribute; Statement name to one flag per own domain dimension, set when that dimension carries no dependence.
-    """
-
-    domain: "isl.union_set"
-    deps: "isl.union_map"
-    reads: "isl.union_map"
-    writes: "isl.union_map"
-    units: tuple[TileUnit, ...]
-    params: dict
-    buffer_dtypes: dict = field(default_factory=dict)
-    parallel_dims: dict = field(default_factory=dict)
-```
-
-- constraints:
-  - The structure MUST be immutable; a stage that adds a fact MUST return a
-    replaced copy rather than mutate one.
-  - `domain`, `reads` and `writes` MUST be unions of per-statement pieces with
-    one isl tuple name per statement (the domain, and the input side of the
-    access relations) or per accessed buffer (their output side). The domain
-    MUST NOT be a single unnamed set: the schedule tree needs one named tuple
-    per statement.
-  - `deps` MUST relate statement *instances* and MUST be derived from
-    `reads` / `writes` by the extraction itself ([§1.3](#13-extract)), never supplied by a
-    caller.
-  - `units` MUST be ordered so that every dependence runs forwards: the order
-    is the body's SSA-DAG postorder, which makes sequencing the statements in
-    that order legal by construction.
-  - `params` MUST resolve every isl parameter name appearing in `domain` back
-    to its `ShapeDim`. One parameter name resolving to two different
-    `ShapeDim`s across statements MUST raise.
-  - `buffer_dtypes` MUST record an element `DType` for every buffer an access
-    relation names, so a byte count over an access relation needs no second
-    walk of the HIR.
-  - `parallel_dims` MUST carry exactly one flag per own domain dimension of
-    every statement, and MUST be measured from `domain` + `deps` ([§1.7](#17-parallel-dimensions)) rather
-    than reported by a scheduler.
-  - Schedule trees, ring depths, and decisions MUST remain schedule-owned state
-    outside `TileGraph`; schedule program views pair those values with the
-    immutable analysis graph without mutating it
-    ([schedule §4](./schedule.md#4-kernel-schedule-construction)).
-
-### 1.3 `extract`
-
-```python
-def extract(hir: Function) -> TileGraph: ...
-
-class ExtractError(NotImplementedError):
-    """A construct the polyhedral extraction does not model."""
-```
-
-`extract` walks `hir.body` in SSA-DAG postorder (dependencies before
-dependents) and classifies every node it meets:
-
-| Body node | How `extract` models it |
-|---|---|
-| `Call` of a compute op | one statement; or one statement per output branch when the outputs cannot share one domain (`RoPE`'s grouped-query `q` / `k`, whose head counts differ) |
-| `Call` of `TupleGetItem` / `Reshape` / `IndexSelect` / `Slice` | structural view — no statement. It resolves to its source's buffer name, and the coordinate change it expresses is folded into every consumer's access map |
-| `Call` of `Zeros` / `FullLike` | buffer declaration — no statement and no access relation: it names a fresh buffer and gives it a starting value |
-| `Call` whose target is a `Function` | penetrated, not rejected: the callee's params bind to the caller's already-resolved argument expressions, its body is walked in place, and every statement and buffer it contributes is prefixed with the callee name plus a per-call-site index |
-| `GridRegionExpr` | not a statement — it contributes one leading domain dimension to every statement it encloses ([§1.4](#14-authored-loops)) |
-| `Tuple` | resolved through the same substitution table; no statement |
-
-- constraints:
-  - Each statement's access relations MUST come from the forward
-    (input-type-driven) relation service
-    ([visitor-registry §4.1](./visitor-registry.md#41-access-relation-service--access_relation)).
-    `extract` MUST stamp the statement and buffer tuple names onto each
-    returned map and restrict it to the paired domain, and MUST reuse each
-    access map's own formula unchanged — no retiling happens here.
-  - Before the relation is built, every argument type MUST be narrowed to its
-    per-shard local shape when it carries a `ShardLayout`: each mesh `Split`'s
-    target *tensor* axis divided by that mesh axis's extent, tensor rank
-    preserved. A `Partial` / `Broadcast` / `Dynamic` mesh axis consumes no
-    tensor axis. Narrowing is centralized in the extraction, so every
-    registered relation is sharding-aware without knowing sharding exists.
-  - A `Split`-sharded axis whose extent is not a static integer, or is not
-    evenly divisible by its mesh extent, MUST raise `ExtractError`.
-  - A loop-indexed `Slice` read MUST map result coordinate `u` to source
-    coordinate `start + u * stride`. Its consumer statement domain contains
-    only full windows (`start + size * stride <= source_extent`). No residual
-    tail domain is returned. A non-affine start or non-static window step MUST
-    raise `ExtractError`.
-  - An op with no registered forward relation MUST raise `ExtractError` naming
-    the op and the registration remedy. `extract` MUST NOT guess an access
-    pattern and MUST NOT carry a per-op fallback.
-  - A statement MUST write at least one value; a relation that produced no
-    output map MUST raise `ExtractError`.
-  - A statement with several outputs MUST write them under its own buffer name
-    suffixed `_<index>`, matching what a downstream `TupleGetItem` read
-    resolves to.
-  - An output access map that is **not** injective MUST also be recorded as a
-    read of the same buffer: two domain points writing one output cell is only
-    sound as a read-modify-write accumulation, and recording that self-read is
-    what lets the dependence inference discover a reduction carry. An injective
-    output map MUST stay a pure write.
-  - `deps` MUST be inferred by isl dependence analysis over `reads` (sink),
-    `writes` (must-source) and an initial total execution order, keeping the
-    resulting read-after-write must-dependence. That initial order MUST place
-    the authored loop coordinates *before* the per-statement postorder index, so
-    a value written at one iteration is seen by a read at the next; a
-    statement-first order would lose every loop carry.
-  - `extract` MUST raise `ExtractError`, naming the offender, for: a body that
-    is `None`; a body with no compute op; a self-recursive nested call; a
-    dispatch prototype (a callee carrying variants or no body); a nested call
-    whose arity does not match the callee's params; and a `DimVar` that binds to
-    conflicting shapes at one call site.
-
-### 1.4 Authored loops
-
-An authored loop is a `GridRegionExpr` ([hir §1.2](./hir.md#12-gridregionexpr)).
-It is modelled as a domain dimension, not as a statement.
-
-- constraints:
-  - Each enclosing loop MUST prefix one dimension to the domain of every
-    statement it encloses, outermost loop first, so the loop axes are the
-    leading dimensions of that domain.
-  - The dimension MUST range over the loop's own half-open `[start, extent)`
-    and MUST carry the raw induction value rather than a normalised trip
-    counter; a `step` other than `1` MUST appear as a stride constraint on it.
-  - `start` and `step` MUST be static integers. `extent` MAY be a bare
-    `DimVar`, which becomes a same-name isl parameter bound to its own
-    `[lo, hi)` range — the same treatment a dynamic tensor axis gets.
-  - Which statements a loop encloses MUST be decided by **variance**, not
-    reachability: a value is inside a loop only when it transitively reads that
-    loop's induction variable or one of its carried args. A loop-invariant value
-    MUST lift out, and a value read after the loop MUST be outside it even
-    though the loop's yield produced it.
-  - A carried arg and the value yielded into it MUST share one buffer name. The
-    dependence inference then reports the loop carry as a distance-1 dependence
-    along that loop's dimension, read at iteration `i` and written at `i - 1`;
-    nothing states the carry separately.
-  - An `IndexSelect` whose one-element index is an enclosing loop's induction
-    variable reshaped to `(1,)` MUST fold into the consumer's access map at the
-    selected dim, so iteration `i` addresses slice `i`. Any other index MUST
-    raise `ExtractError`: a data-dependent selection has no affine access map
-    and MUST NOT be approximated.
-
-### 1.5 Facts over a time relation
-
-Four measurements take the time relation as data — one `isl.union_map` from
-statement coordinates to a common time space, which the schedule layer owns and
-this layer only reads.
-
-```python
-def time_extents(tg: TileGraph, time_map: "isl.union_map") -> tuple[int, ...]: ...
-
-def statement_time_dims(tg: TileGraph, time_map: "isl.union_map") -> dict[str, tuple[int, ...]]: ...
-
-def carried_distances(tg: TileGraph, time_map: "isl.union_map", n_dims: int) -> dict[str, tuple[int, ...]]: ...
-
-def access_footprints(tg: TileGraph, time_map: "isl.union_map") -> tuple[AccessFootprint, ...]: ...
-```
-
-- constraints:
-  - `time_extents` MUST return the per-dimension extent of the time relation's
-    range over `tg.domain`. Every statement MUST share one time space, and every
-    time dimension MUST start at `0` — tile counting assumes an origin-based
-    extent — otherwise it MUST raise `ExtractError`.
-  - `statement_time_dims` MUST report, per statement and per time dimension, the
-    statement's own domain dimension that time dimension travels with, or `-1`
-    where it is constant there. A time dimension mixing two domain dimensions (a
-    skewed band) MUST raise `ExtractError`: no per-axis tile size describes it.
-  - `carried_distances` MUST report, per buffer, the largest dependence distance
-    isl reports along each of the first `n_dims` time dimensions. A dependence
-    MUST be attributed to every buffer its source writes and its sink reads,
-    which for a read-after-write must-dependence is exactly the memory it
-    travels through.
-  - `access_footprints` MUST return one `AccessFootprint` per read and per write
-    of `tg`, expressed against the time relation's range so that a size per time
-    dimension sizes it.
-
-### 1.6 `AxisExtent` / `AccessFootprint`
-
-```python
-class AxisExtent:
-    """One buffer dimension's reach inside one statement's whole access.
-
-    Attributes:
-        axes: attribute; Time dimensions that reach this dimension; empty when none does.
-        extent: attribute; Number of elements of this dimension the access reaches.
-    """
-
-    axes: tuple[int, ...]
-    extent: int
-
-class AccessFootprint:
-    """One (statement, buffer) access, sized per buffer dimension.
-
-    Attributes:
-        statement: attribute; isl tuple name of the accessing statement.
-        buffer: attribute; isl tuple name of the accessed buffer.
-        is_read: attribute; True for a read access, False for a write.
-        dims: attribute; One AxisExtent per buffer dimension.
-        elem_bytes: attribute; Bytes one element of the buffer occupies.
-    """
-
-    statement: str
-    buffer: str
-    is_read: bool
-    dims: tuple[AxisExtent, ...]
-    elem_bytes: int
-```
-
-- constraints:
-  - Both structures MUST be immutable.
-  - `extent` MUST be measured off the access relation, never derived from a tile
-    size: a dimension read at a rate reaches fewer elements than the iterations
-    that reach it.
-  - `axes` carries no size, only the reuse fact. An empty `axes` MUST mean no
-    time dimension reaches that dimension — it is re-read in full by every
-    iteration.
-  - The element count of one access MUST be the product over `dims`. That count
-    is the bounding box of the access's range: exact for a box-shaped access, an
-    upper bound for one that leaves holes inside its own box.
-  - `elem_bytes` MUST be the buffer's element size in whole bytes, resolved from
-    `TileGraph.buffer_dtypes`. A buffer with no recorded dtype MUST raise
-    `ExtractError`.
-
-### 1.7 Parallel dimensions
-
-`TileGraph.parallel_dims` is the fact isl names `coincident`, measured here
-rather than obtained from a scheduler.
-
-- constraints:
-  - Only a statement's **self**-dependence MAY constrain its own dimensions: the
-    schedule layer sequences statements, so every cross-statement dependence is
-    already satisfied by that order.
-  - A dimension MUST be reported parallel when every self-dependence has
-    distance `0` there, and MUST NOT be otherwise. A statement with no
-    self-dependence MUST have every dimension reported parallel.
-
-## 2. Authored-HIR metrics
-
-The measurement entry is the composed operation ([§3](#3-composed-analysis)).
+The measurement entry is the composed operation ([§2](#2-composed-analysis)).
 Each family below owns its record, field derivation, target facts, and rendered
 forms. The command line composes one call per requested family and renders those
 results together ([cli §Analyze](./cli.md#analyze)).
@@ -320,7 +33,7 @@ they describe: a record on a `Call` describes that call, while a record on a
     inherently carries. It states what one analysis found for one invocation,
     and there MUST be no cross-call cache behind it.
 
-### 2.2 Analysis families
+### 1.2 Analysis families
 
 The first families are `compute-cost`, `memory`, `roofline`, and `performance`.
 Each owns its record types and declares its dependencies and output additions.
@@ -411,8 +124,8 @@ layer settles is which type a field holds and what its keys name:
     metadata-free traversal of the derived program answers all of them.
     Performance readiness requires a positive `ParallelCapacityFacts` value for
     the selected topology, rates stated for that same level, and one valid
-    execution placement for every occurrence that will take time. Where the buffers
-    go is not a readiness question: it is decided with the schedule.
+    execution placement for every occurrence that will take time. Where the
+    buffers go is not a readiness question: nothing here decides it.
     Failing performance readiness MUST NOT make the same unplaced program invalid
     for `compute-cost`, `memory`, or `roofline`.
   - Global logical work, per-unit work, and lifetime order MUST remain
@@ -423,7 +136,7 @@ layer settles is which type a field holds and what its keys name:
   - A rendering MUST report what the caller requested. Dependency records nobody
     requested MUST stay on the IR and MUST NOT be reported except for roofline's
     bounded evidence defined below. Record ownership MUST come from the
-    Target-selected descriptor ([§3.1](#31-target-selected-analyzers)).
+    Target-selected descriptor ([§2.2](#22-target-selected-analyzers)).
   - Every rendering of one run MUST select records through one shared decision
     and MUST show only records actually written.
   - Every reported quantity MUST come from a record, except a total that is the
@@ -445,11 +158,11 @@ layer settles is which type a field holds and what its keys name:
     facts MUST stay on their annotated equations; JSON MAY retain operand names
     and types in its structured projection.
 
-#### 2.2.1 `compute-cost`
+#### 1.2.1 `compute-cost`
 
 `compute-cost` measures the logical work of each authored `Call` without reading
 target hardware facts. What an occurrence moves is the memory family's answer
-([§2.2.2](#222-memory)), read off the same registered evaluator.
+([§1.2.2](#122-memory)), read off the same registered evaluator.
 
 ```python
 class ComputeCostMetadata(IRMetadata):
@@ -508,7 +221,7 @@ Each reported Call's JSON projection is under its `compute-cost` key:
   - Downstream families MUST read the already-scaled record and MUST NOT apply
     authored loop trip counts a second time.
 
-#### 2.2.2 `memory`
+#### 1.2.2 `memory`
 
 `memory` measures whole-Function value lifetimes and footprints, decides where
 each value's bytes live, and states what every occurrence moves and at which
@@ -668,7 +381,7 @@ of this analysis.
   - A capacity conclusion MUST NOT correct or invent a movement number. What an
     occurrence moves is counted once from its own boundaries, so a function with
     no `allocation` still carries traffic -- a different question from whether a
-    time may be reported for it ([§2.2.4](#224-performance)) -- and a window
+    time may be reported for it ([§1.2.4](#124-performance)) -- and a window
     whose start arrives at run time reads that start rather than becoming a full
     read of its source and a write of its result.
 
@@ -863,7 +576,7 @@ attached only to the Function. Its full JSON projection is under
     implicit cache capacity MUST instead produce an advisory and MUST NOT fail
     the call.
 
-#### 2.2.3 `roofline`
+#### 1.2.3 `roofline`
 
 `roofline` converts recorded work into a lower time bound at the target's
 published compute and memory rates.
@@ -945,7 +658,7 @@ standing an instruction rate in for one.
 Requesting roofline adds this verdict and the two quantities the bound divides
 -- the summed `flops` and the bandwidth-level bytes -- as `totals`. Nothing else
 its dependencies wrote is promoted; asking for `memory` is what states those
-([§2.2.2](#222-memory)).
+([§1.2.2](#122-memory)).
 
 ```text
 roofline ideal-ns=<int> bound-by=<resource>
@@ -1021,11 +734,11 @@ as defined in that family's section.
     reports only what roofline and that dependency wrote. No other family's
     conclusion is promoted into it.
 
-#### 2.2.4 `performance`
+#### 1.2.4 `performance`
 
 `performance` places compute-cost-priced occurrences on a CTA-local nominal
 timeline, holds the buffers they keep live to the levels this model addresses,
-and scales the root schedule by a fixed physical parallel capacity. The records
+and scales the root timeline by a fixed physical parallel capacity. The records
 it owns are named for the prediction they carry rather than for the selector, so
 that the interval stays one nested value with one meaning wherever it appears.
 
@@ -1075,7 +788,7 @@ Occurrence fields are:
 
 | Field | How it is computed | Reads the target |
 |---|---|---|
-| `start_ns` | Start of one occurrence in the authored-order local schedule, after its producers end and after the last occurrence sharing any of its participants. | No |
+| `start_ns` | Start of one occurrence on the authored-order local timeline, after its producers end and after the last occurrence sharing any of its participants. | No |
 | `end_ns` | End of that occurrence's first execution. | No |
 | `trips` | One outside a loop; within a loop, the enclosing loop trip count represented by the interval. | No |
 | `stride_ns` | Zero outside a loop; within a loop, the makespan of one body execution. | No |
@@ -1084,7 +797,7 @@ Function summary fields are:
 
 | Field | How it is computed | Reads the target |
 |---|---|---|
-| `timeline` | `[0, local makespan * waves)`, where the local makespan is the end of the CTA-local schedule, or zero with no work. Its duration is the prediction. | Through `waves` |
+| `timeline` | `[0, local makespan * waves)`, where the local makespan is the end of the CTA-local timeline, or zero with no work. Its duration is the prediction. | Through `waves` |
 | `waves` | `ceil(N / P)`, where `N` is the static extent of the root topology selected by `ParallelCapacityFacts.topology` and `P` is `parallel_units`. | `ParallelCapacityFacts` |
 
 Occurrence intervals remain CTA-local. They are not copied once per wave, and
@@ -1100,7 +813,7 @@ class ParallelCapacityFacts:
     """Carry the parallel capacity assumed by performance analysis.
 
     Attributes:
-        topology: attribute; Topology level being scheduled.
+        topology: attribute; Topology level being measured over.
         parallel_units: attribute; Instances admitted concurrently.
     """
 
@@ -1192,7 +905,7 @@ model.
     bytes is a plan's decision and no plan has been made -- and no occurrence is
     held back for a write nobody proved happens in place.
   - Occurrences MUST be laid out in inline occurrence order. Reordering
-    independent work is a schedule's decision, not an analysis's: what overlaps
+    independent work is a later decision, not an analysis's: what overlaps
     is what the program's own placement made independent, and the reported time
     is the time of the program as written. On a `Function`, the summary's
     `timeline` MUST start at zero and span the whole local plan, scaled by
@@ -1210,10 +923,10 @@ model.
   - Performance is a modeled plan and MUST NOT be read as a guarantee about
     lowering, physical occupancy, or runtime performance.
 
-## 3. Composed analysis
+## 2. Composed analysis
 
 `tilefoundry.analysis.check_program` is the shared, reusable gate before an
-analysis or schedule algorithm runs.
+analysis runs.
 
 ```python
 def check_program(
@@ -1237,27 +950,27 @@ class AnalysisCheckContext:
     function: "Function"
     target: "Target"
     level: str | None
-    whole: CostEvaluator
-    local: CostEvaluator
+    whole: CostContext
+    local: CostContext
 
 ```
 
 - constraints:
   - The operation MUST infer types over the full reachable Function graph and
     validate its caller/callee execution context, and MUST NOT run an analysis
-    or schedule algorithm or attach derived Metadata to the authored IR.
+    or attach derived Metadata to the authored IR.
   - The reachable Function and Mesh geometry and every effective Module
-    topology extent MUST be concrete before this operation runs. Public Analyze
-    and Schedule calls with `dims` MUST resolve all three through one binding
-    pass before calling this gate; a residual dimension expression MUST fail
-    before any consuming algorithm runs.
+    topology extent MUST be concrete before this operation runs. A public
+    Analyze call with `dims` MUST resolve all three through one binding pass
+    before calling this gate; a residual dimension expression MUST fail before
+    any consuming algorithm runs.
   - Every effective Module topology MUST name a level the resolved Target
     supports. A resolved static extent MUST be positive and within that level's
     finite hardware limit. A rejection MUST name the level, its extent, and the
     reason.
   - A non-`None` `level` MUST name exactly one effective Module topology.
-  - Analyze and Schedule MUST call this operation before any consuming
-    algorithm. Analyze MUST pass the whole resolved dependency closure as
+  - Analyze MUST call this operation before any consuming algorithm, and
+    MUST pass the whole resolved dependency closure as
     `analyzers`, so every analysis about to run states its input contract here.
   - The `analyzers` checkers MUST be bound to the derived Function and run in
     closure order: every `check_target`, then every `check_call` over one
@@ -1281,10 +994,12 @@ class AnalysisCheckContext:
   - `budget` MUST be a non-negative integer limiting the number of unique body
     expression nodes after inlining. An oversized view MUST fail with both its
     size and the limit and MUST NOT return a partial Function.
-  - Authored-analysis readiness is not a program-level check. Analyze MUST
-    separately reject schedule constraints and unresolved local layouts before
-    running an analyzer; Schedule MAY consume or diagnose those inputs under
-    its own algorithm contract.
+  - Authored-analysis readiness is not a program-level rejection. Analyze MUST
+    NOT reject an authored `where(...)` constraint: it is an input to a later
+    decision, and a program carrying one is measured as written. A value whose
+    placement is deferred contributes its whole-program figures to the per-unit
+    total, because a deferred layout states no distribution to project through;
+    values with a resolved layout still project.
 
 `tilefoundry.analysis.api.analyze` is the dependency-composed measurement
 operation. One call selects one or more root analyses by name; the operation
@@ -1410,11 +1125,35 @@ def analyze(
     renderings of it and of the Metadata on the IR, and MUST NOT be fields of
     it.
 
-### 3.1 Target-selected Analyzers
+### 2.1 Shared Scope and Access
+
+The normalized HIR is visited once per `analyze()` call. That visit produces a
+`Scope` tree parallel to Function/GridRegionExpr nesting and `Access` relations
+for the narrow and device views. `Scope.domain` is the accumulated authored
+loop domain; `Scope.accesses` and `Scope.refused` are the only family inputs for
+loop footprints, movement, and placement. An `Access` stores only its relation
+and allocation expression; storage level and element width are read from the
+allocation type. A refused descendant makes its owning scope unknown for that
+view. Non-affine runtime indices retain the widest legal access approximation.
+Normalization clones each reached Function call site independently. Within one
+call site, source expressions shared by identity remain one shared expression
+in the clone; sharing never aliases the independently cloned body of another
+call site.
+
+### 2.2 Target-selected Analyzers
 
 ```python
+class AnalyzeContext:
+    module: Module
+    target: Target
+    level: str | None
+    options: object | None
+    root: Scope
+    current: Scope
+
+
 AnalysisCallable = Callable[
-    [Module, Function, Target, str | None, object | None], None
+    [Function, AnalyzeContext], None
 ]
 
 class Analyzer:
@@ -1452,9 +1191,10 @@ class Target:
 ```
 
 - constraints:
-  - `AnalysisCallable` MUST receive the Module, Function, exact Target, resolved
-    topology level, and caller options in that order. The level MAY be `None`
-    only when the Module declares no topology; options MAY be `None`.
+  - `AnalysisCallable` MUST receive the normalized Function graph and one
+    `AnalyzeContext` carrying the exact Module, Target, resolved topology level,
+    caller options, and the shared root/current `Scope` view. The level MAY be
+    `None` only when the Module declares no topology; options MAY be `None`.
   - Analyze MUST obtain every root and dependency from the same exact Target
     instance through `get_analyzer`.
   - A Target subclass MUST inherit its base Analyzers through normal Python

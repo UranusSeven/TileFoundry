@@ -65,7 +65,6 @@ class Module:
     def resolve_topology(self, name: str) -> Topology: ...
     def owns(self, function: object, *, derived: bool = False) -> bool: ...
     def load(self, resource) -> "LoadedModule": ...
-    def forward(self, *args): ...
     def prepare(
         self, raw, out_dir: str, *, device: str = "cpu"
     ) -> None: ...
@@ -169,9 +168,9 @@ through its owner chain.
   - A Module reused as an owned child and as an independently analysed root
     declares a target only in the latter role.
   - A Module published as an independently analysable root MUST declare both
-    its target and the topology levels it is aimed at, so that Analyze and
-    Schedule answer it as it is published rather than after an edit. Naming the
-    device is enough; the architecture is derived from that device's document
+    its target and the topology levels it is aimed at, so that Analyze answers
+    it as it is published rather than after an edit. Naming the device is
+    enough; the architecture is derived from that device's document
     ([target §4](./target.md#4-cudatarget)).
   - Declaring a Module MUST NOT require a target. Whether a Module becomes an
     owned child is decided by the owner, after the child has been constructed,
@@ -189,12 +188,28 @@ step.
     and the emitter MUST start there. Other functions enter the output only when
     reachable from `entry`.
   - When `entry` is omitted (`None`), the Module MUST have no default step.
-    `entry_function()` and a bare call MUST be refused, naming the Module's
-    functions and explaining that one is selected with `lookup('<name>')`.
+    `entry_function()` and an unqualified evaluator call MUST be refused,
+    naming the Module's functions and explaining that one is selected by name.
     Each function remains reachable by name. A Module that composes children in
-    an orchestration method has no single step to nominate.
+    an orchestration method has no single step to nominate; that host Python
+    method is invoked by name rather than selected as an evaluator target.
   - A bare `@func` / `@prim_func` MUST become an implicit single-function
     Module whose `entry` names that function.
+
+The shared HIR call-graph queries are:
+
+```python
+def called_functions(function: HirFunction) -> tuple[HirFunction, ...]: ...
+def reachable_functions(root: HirFunction) -> tuple[HirFunction, ...]: ...
+```
+
+- constraints:
+  - `called_functions` MUST return each direct Function-call target in the
+    body's operand-before-consumer definition order. Repeated call sites remain
+    repeated entries.
+  - `reachable_functions` MUST return the root followed by its transitively
+    called Functions, callers before callees and deduplicated by Function
+    identity.
 
 ### 1.1 Function access
 
@@ -219,18 +234,15 @@ shape-specialization variants live inside that entry's `Function.variants`
   - Python attribute access `mod.<name>` resolves, in order, a function, a
   child module, or a method named `<name>`, and MUST raise `AttributeError`
   when none match or when more than one same-kind entry shares the name. A
-  **function** name resolves to a callable that runs it — not to the
-  `Function` / `PrimFunction` node itself (reach that with `lookup` /
-  `function_named` above). A `Module` holds no constants, so that callable
-  takes **one argument per declared param**, a `ConstTensor` one included; the
-  callable that fills constants from bindings instead belongs to
-  `LoadedModule`, which runs on the one device its bindings and activations
-  agree on ([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)). A **child module** name
-  resolves to that child `Module`. A **method** name resolves to the
-  class-body function bound like an instance method (`m.forward(...)`). Names
-  beginning with `_` are never functions, modules, or methods and resolve by
-  normal attribute rules. This lets a module read like the model it mirrors —
-  `decoder.layer0.attention(...)`.
+  **function** name resolves to the `Function` / `PrimFunction` node itself,
+  like `lookup` and `function_named`; an HIR `Function` is callable as one
+  `evaluator.evaluate` step. A `Module` is likewise callable when it declares
+  an `entry`, with one argument for every declared parameter. A **child module** name resolves to that child
+  `Module`. A **method** name
+  resolves to the class-body function bound like an instance method
+  (`m.forward(...)`). Names beginning with `_` are never functions, modules, or
+  methods and resolve by normal attribute rules. This lets a module read like
+  the model it mirrors — `decoder.layer0.attention`.
 
 ### 1.2 Selecting a node by path
 
@@ -303,6 +315,9 @@ class SourceSpanMetadata(IRMetadata):
     `loc=` syntax and inferred assignment names to this metadata; there is no
     parallel `Expr.loc` field.
   - `SourceSpanMetadata` records the parser source range before type inference.
+    Its file, line, and start column identify the physical authored file position;
+    the start column is one-based. `end_column`, when present, is the physical
+    source-file offset using Python AST's exclusive-end convention.
   - `ExecutionDomainMetadata` records the `with Mesh(...)` scopes a `Call` was
     written inside, outermost first
     ([parser §2.1](./parser.md#21-syntax)). `at(level)` returns the
@@ -316,7 +331,7 @@ class SourceSpanMetadata(IRMetadata):
 
 ```python
 class Expr:
-    """Provide the immutable base for every typed expression.
+    """Provide the mutable base for every typed expression.
 
     Attributes:
         type: attribute; Expression type.
@@ -330,6 +345,8 @@ class Expr:
 - constraints:
   - base of every expression node; concrete subclasses are dialect-owned, not
     introduced per Op (value-producing Ops appear as `Call` nodes).
+  - `type` and `metadata` may be updated by the authorised typing and analysis
+    passes; expression equality remains structural and metadata is excluded.
   - `metadata` contains only `IRMetadata` values and contains at most one value
     of each exact concrete metadata class; invalid entries or duplicate classes
     raise `VerifyError`, including `SourceSpanMetadata` or `BindingMetadata`
@@ -338,26 +355,30 @@ class Expr:
 
 ```python
 def get_metadata(expr: "Expr", cls: type[T]) -> T | None: ...
-def replace_metadata(expr: "Expr", value: IRMetadata) -> "Expr": ...
 def remove_metadata(expr: "Expr", cls: type[IRMetadata]) -> "Expr": ...
+def attach_metadata(expr: "Expr", value: IRMetadata) -> None: ...
+def detach_metadata(expr: "Expr", cls: type[IRMetadata]) -> None: ...
 def binding_name(expr: "Expr") -> str | None: ...
+def describe_expr(expr: "Expr") -> str: ...
 def diagnostic_location(expr: "Expr") -> str | None: ...
 def source_metadata(expr: "Expr") -> tuple[IRMetadata, ...]: ...
 ```
 
 - constraints:
-  - all three helpers match an exact concrete class, not subclasses, and never
-    mutate the input expression.
+  - `get_metadata` and `remove_metadata` match an exact concrete class, not
+    subclasses, and never mutate the input expression.
   - `get_metadata` returns the unique matching value or `None`.
-  - `replace_metadata` returns a copy with the matching value replaced in its
-    existing position; every other value keeps its relative order, and a value
-    whose class is absent is appended.
   - `remove_metadata` returns a copy without the matching value; when the class
     is absent it returns the input expression unchanged.
+  - `attach_metadata` and `detach_metadata` perform those exact-class updates
+    in place for passes that annotate the caller's IR. Attaching replaces any
+    existing value and appends the new value after the retained metadata.
   - `binding_name` returns the authored SSA label. `diagnostic_location`
     prefers a source span and falls back to that label. `source_metadata`
     copies only binding/span metadata when a compiler pass synthesizes a
     replacement expression.
+  - `describe_expr` returns one diagnostic line with the source span when
+    present, the binding name or `<unnamed>`, and the Call target or Expr class.
 
 `Expr` always carries a `type`. The runtime class of `Expr.type` is
 one of `TensorType` / `TupleType` / `UnitType`

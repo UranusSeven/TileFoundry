@@ -14,10 +14,8 @@ round-off, each with perturbation tests establishing that those comparisons can
 fail: two for MLA, and three for the MoE covering the router bias, the order the
 routed scaling is applied in, and the shared expert's contribution.
 
-Schedule admits one function per execution Module, so it selects each child's
-entry and not its leaves; analyze selects everything the tree defines. What is not
-selected is untested, and the report derives that from the model's own function
-inventory.
+Analyze selects everything the tree defines. What is not selected is untested,
+and the report derives that from the model's own function inventory.
 """
 
 from __future__ import annotations
@@ -88,24 +86,6 @@ CASE = ModelCase(
         FunctionCase(
             id="kimi_linear_48b_a3b/analyze/shared_expert",
             selector="moe.shared_expert",
-        ),
-    ),
-    schedule=(
-        FunctionCase(
-            id="kimi_linear_48b_a3b/schedule/kda_attention",
-            selector="kda.kda_attention",
-            topology="cta",
-        ),
-        FunctionCase(
-            id="kimi_linear_48b_a3b/schedule/mla_attention",
-            selector="mla.mla_attention",
-            topology="cta",
-            dims=ANALYZED_AT,
-        ),
-        FunctionCase(
-            id="kimi_linear_48b_a3b/schedule/moe",
-            selector="moe.moe",
-            topology="cta",
         ),
     ),
     #: Only MLA leaves a dimension open. KDA's state is fixed-size and the MoE's

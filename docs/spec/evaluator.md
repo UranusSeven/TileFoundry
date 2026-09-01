@@ -1,6 +1,6 @@
 # TileFoundry Spec — evaluator (HIR reference interpreter)
 
-The evaluator executes a HIR `Function`'s SSA-DAG on a tensor backend
+The evaluator executes a HIR `Function`'s SSA-DAG on torch tensors
 and returns concrete values. It is a codegen-independent reference
 oracle for parser output, type inference, and op value semantics; it
 does not lower to TIR or invoke codegen / runtime.
@@ -8,9 +8,9 @@ does not lower to TIR or invoke codegen / runtime.
 ```mermaid
 flowchart TB
     evaluate["<b>evaluate()</b><br/>entry"]
-    Evaluator["<b>Evaluator</b><br/>ExprVisitor[Value]"]
+    Evaluator["<b>EvaluatorVisitor</b><br/>ExprVisitor[Value]"]
     registry["<b>eval_registry</b><br/>register_eval(Op)"]
-    handler["per-op handler<br/>(EvalContext → Value)"]
+    handler["per-op handler<br/>(EvaluateContext → Value)"]
     Value["<b>Value</b>"]
     TensorValue["<b>TensorValue</b><br/>(data, type)"]
     TupleValue["<b>TupleValue</b><br/>(elements)"]
@@ -26,20 +26,23 @@ flowchart TB
 
 ```python
 def evaluate(
-    fn_or_call: "Function | Call",
+    target: "Function | LoadedModule",
     *inputs: "torch.Tensor",
-    backend: str = "torch",
-    device: str | None = None,
 ) -> "torch.Tensor | tuple[torch.Tensor, ...]":
     ...
 ```
 
-`evaluate` binds `inputs` to the entry `Function`'s parameters in
+`evaluate` binds `inputs` to the selected `Function`'s parameters in
 order, walks the body, and returns the logical tensor for a single
-output or a tuple for a `TupleType` result. `backend` selects the
-tensor engine; `"torch"` is the defined backend.
-`device` selects the torch device; when omitted it chooses CUDA when available
-and otherwise CPU.
+output or a tuple for a `TupleType` result. When passed a `LoadedModule`,
+it binds only activation inputs; declared constants are loaded lazily from
+that reading at first use. A loaded module runs its declared `entry`; callers
+select another function or child on the `LoadedModule` before calling
+`evaluate`.
+The evaluator selects nothing on the caller's behalf: no tensor engine, and no
+device. It computes where its inputs already are, so what torch supports is what
+it supports. A run whose inputs carry no tensor leaves the device to torch's own
+default.
 
 ## 1. `Value`
 
@@ -99,7 +102,7 @@ class TupleValue(Value):
 `evaluate` binds each entry-`Function` parameter `Var` to the
 corresponding positional input:
 
-- An input MUST be convertible to a backend tensor; it is cast to the
+- An input MUST be convertible to a torch tensor; it is cast to the
   parameter `TensorType`'s dtype.
 - Weights and activations are bound identically — a weight is an
   ordinary `Function` parameter, not a distinct constant carrier.
@@ -109,11 +112,18 @@ corresponding positional input:
   agree with the first binding.
 
 - constraints:
-  - `evaluate` is the exact public entry: it MUST take one input per declared
-    parameter and MUST take no resource context. A run whose constants come from
-    a loaded reading instead is `LoadedModule` execution
-    ([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)),
-    not this entry.
+  - A `Function` or `Call` entry takes no resource context and requires one
+    input per declared parameter. A `LoadedModule` entry takes activation inputs
+    only and supplies each `ConstTensor` lazily by name. A loaded module MUST
+    have an `entry`; otherwise the evaluator refuses the call as having no
+    default step. Another function or child is selected as a `LoadedModule`
+    value before evaluation; orchestration methods are host Python and are not
+    evaluator targets.
+  - the run happens where the inputs already are. Inputs on more than one device
+    MUST be refused, naming which input is where. For a loaded reading, a weight
+    somewhere other than the inputs MUST be refused at its first use, naming the
+    weight. Evaluation moves neither kind of tensor implicitly, and it never
+    picks a device the caller did not express.
 
 ## 3. `register_eval` and the eval context
 
@@ -131,34 +141,44 @@ def register_eval(op_cls: type[Op]):
     ...
 ```
 
-A handler receives an `EvalContext` and returns a `Value`:
+A handler receives an `EvaluateContext` and returns a `Value`:
 
 ```python
-class EvalContext:
-    """Carry one registered evaluator invocation.
+class EvaluateContext:
+    """Carry one recursive evaluation and registered evaluator invocation.
 
     Attributes:
         op: attribute; Operation instance.
         args: attribute; Evaluated operands in Call-argument order.
         result_type: attribute; Call result type.
-        device: attribute; Backend device name.
+        loaded_module: attribute; Runtime module reading, when one is active.
+        device: attribute; Where the inputs are, or None to leave it to torch.
         dim_bindings: attribute; concrete values for symbolic ShapeDims.
     """
 
-    op: Any
-    args: tuple[Any, ...]
-    result_type: Any
-    device: str = "cpu"
-    dim_bindings: dict[str, int] | None = None
+    op: Any = None
+    args: tuple[Any, ...] = ()
+    result_type: Any = None
+    loaded_module: Any | None = None
+    device: str | None = None
+    dim_bindings: Mapping[str, int] = field(default_factory=dict)
 
-def handler(ctx: EvalContext) -> Value:
+    def for_op(self, op: Any, args: tuple[Any, ...], result_type: Any) -> EvaluateContext: ...
+
+def handler(ctx: EvaluateContext) -> Value:
     """Evaluate one registered Op invocation."""
     ...
 ```
 
 A `Call` whose op class has no registered handler raises an error that
-names the op class. Backend dtype promotion follows the backend's own
+names the op class. Dtype promotion follows torch's own
 rules; a handler MUST NOT depend on type inference having run.
+
+Every failed `Op` dispatch, including a missing handler and an exception from
+the handler, MUST surface as `EvalError` prefixed by `describe_expr(call)`.
+When parser provenance is available, that prefix identifies the authored
+physical source location, binding, and op. Function-call, `GridRegionExpr`,
+and `Var` failures retain their own contracts.
 
 ## 4. Node evaluation
 
@@ -167,20 +187,20 @@ Evaluation is an `ExprVisitor[Value]`
 a shared sub-DAG ([hir §1.1](./hir.md#11-function)) is evaluated once:
 
 ```python
-class Evaluator(ExprVisitor):
+class EvaluatorVisitor(ExprVisitor):
     """Evaluate expressions with identity-based memoization."""
 
-    def visit(self, expr: Expr) -> Value: ...
-    def visit_GridRegionExpr(self, region: GridRegionExpr) -> Value: ...
+    def visit(self, expr: Expr, ctx: EvaluateContext) -> Value: ...
+    def visit_GridRegionExpr(self, region: GridRegionExpr, ctx: EvaluateContext) -> Value: ...
 ```
 
 - A `Var` resolves to its binding in the current environment; a
-  `Constant` ([core-ir §2](./core-ir.md#2-expr)) materialises to a backend
+  `Constant` ([core-ir §2](./core-ir.md#2-expr)) materialises to a torch
   tensor of its `TensorType` (a scalar becomes a rank-0 tensor).
 - A `Call` whose `target` is an `Op` evaluates its operands, then
   dispatches through `eval_registry`
   ([§3](#3-register_eval-and-the-eval-context)).
-- `EvalContext` carries evaluated operands and concrete `dim_bindings` for
+- `EvaluateContext` carries evaluated operands and concrete `dim_bindings` for
   call-invariant `ShapeDim` attributes. Expr-valued runtime data MUST be a Call
   operand; handlers MUST NOT re-enter the evaluator through an attribute.
 - `Slice` consumes its evaluated `starts` tuple and resolves `sizes/strides`
@@ -194,13 +214,16 @@ class Evaluator(ExprVisitor):
   evaluated arguments to the callee's parameters in a fresh environment
   and evaluates the callee `body` — the same value semantics a call site
   has under type inference.
+  Each evaluated argument's HIR type MUST be compatible with its parameter
+  annotation under the Function-boundary rules in HIR; an incompatible value
+  raises `EvalError` before the callee body is evaluated.
 
 ## 5. `GridRegionExpr`
 
 A `GridRegionExpr` ([hir §1.2](./hir.md#12-gridregionexpr)) is a loop over its iteration
 domain whose carry chain starts from `init_args`:
 
-`Evaluator.visit_GridRegionExpr(region)` implements the loop; there is no
+`EvaluatorVisitor.visit_GridRegionExpr(region)` implements the loop; there is no
 separate `eval_grid` function.
 
 - The first iteration binds each `carried_args` phi to the matching
@@ -236,5 +259,8 @@ values:
 - `Reshard` ([hir §1.3](./hir.md#13-op)) preserves the logical value and MAY
   reshape it into the target layout's shape; it performs no
   cross-participant data movement.
-- `Local` ([hir §1.3](./hir.md#13-op)) returns its operand's value for the
-  single modelled participant.
+- `Local` ([hir §1.3](./hir.md#13-op)) returns its operand's value only when
+  its input `ShardLayout` has no `Split` attribute. For a split axis it MUST
+  raise `EvalError` saying that the evaluator models one mesh participant and
+  linking to this section, until the mesh evaluator models that path. An
+  unmodelled path MUST identify itself rather than leaking a torch exception.

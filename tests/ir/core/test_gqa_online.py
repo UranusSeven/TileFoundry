@@ -24,6 +24,7 @@ from tests.fixtures.placed.gqa_decode import (
     gqa_online_attend,
 )
 from tilefoundry.evaluator import evaluate
+from tilefoundry.evaluator.value import EvalError
 from tilefoundry.inspection import as_script
 from tilefoundry.ir.core import Call, Tuple
 from tilefoundry.ir.hir.grid_region import GridRegionExpr
@@ -70,7 +71,7 @@ EVALUATED = [
 @pytest.mark.parametrize(("selected", "ctx"), EVALUATED)
 def test_what_is_selected_matches_the_reference(selected, ctx):
     step = _inputs(ctx)
-    out = evaluate(selected, *step, device="cpu")
+    out = evaluate(selected, *step)
 
     assert out.shape == (1, 1, Hq, D)
     assert torch.allclose(out.float(), _ref(*step), atol=2e-2, rtol=2e-2)
@@ -80,8 +81,8 @@ def test_context_variant_fails_closed_on_unaligned_ctx():
     ctx = NUM_SPLITS + 1
     assert ctx % NUM_SPLITS != 0
     step = _inputs(ctx)
-    with pytest.raises(RuntimeError, match="invalid for input of size"):
-        evaluate(_CTX_VARIANT, *step, device="cpu")
+    with pytest.raises(EvalError, match=r"op=Reshape: shape .*invalid for input of size"):
+        evaluate(_CTX_VARIANT, *step)
 
 
 def _walk_ir(expr, seen=None):

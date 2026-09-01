@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
-import sys
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -38,7 +36,6 @@ def test_builtin_targets_own_their_facts_projections() -> None:
         "gmem": "target",
         "smem": "cta",
         "rmem": "thread",
-        "tmem": "cta",
     }
     assert AmxTarget().get_facts(ThroughputFacts).bandwidth_level == "gmem"
     assert {
@@ -53,15 +50,15 @@ def test_two_cuda_products_project_the_hardware_each_one_is() -> None:
     One projection serves both products, so what separates them is what their
     documents record rather than a branch per architecture.
 
-    Tensor memory is the case that matters: a level with no capacity says the
-    architecture has no such store, and a capacity says a CTA's accumulators live
-    in one. A projection that reported the same for both would price a Blackwell
-    kernel against Hopper's registers.
+    Tensor memory is the case that matters: an absent level says the architecture
+    has no such store, and a capacity says a CTA's accumulators live in one. A
+    projection that reported the same for both would price a Blackwell kernel
+    against Hopper's registers.
     """
     hopper = CudaTarget("nvidia.h200_sxm")
     blackwell = CudaTarget("nvidia.b200_sxm")
 
-    assert hopper.get_facts(MemoryHierarchyFacts).explicit("tmem").capacity_bytes is None
+    assert hopper.get_facts(MemoryHierarchyFacts).explicit("tmem") is None
     tmem = blackwell.get_facts(MemoryHierarchyFacts).explicit("tmem")
     assert (tmem.capacity_bytes, tmem.scope) == (262_144, "cta")
 
@@ -108,22 +105,6 @@ def test_topology_limits_are_target_facts_and_base_validation_is_inherited() -> 
     _DirectTarget().validate_program_topology(Topology("unit", 4))
     with pytest.raises(ValueError, match="1 <= extent <= 4"):
         _DirectTarget().validate_program_topology(Topology("unit", 5))
-
-
-def test_cuda_throughput_projection_leaves_scheduler_families_unloaded() -> None:
-    source = """
-import sys
-from tilefoundry.analysis.facts import ThroughputFacts
-from tilefoundry.target import CudaTarget
-
-CudaTarget(\"nvidia.h200_sxm\").get_facts(ThroughputFacts)
-assert \"tilefoundry.schedule.partition\" not in sys.modules
-assert \"tilefoundry.schedule.pipeline\" not in sys.modules
-"""
-    completed = subprocess.run(
-        (sys.executable, "-c", source), text=True, capture_output=True, check=False
-    )
-    assert completed.returncode == 0, completed.stderr
 
 
 def test_projection_results_are_still_immutable_aggregates_of_the_requested_type() -> None:

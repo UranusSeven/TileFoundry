@@ -3,28 +3,37 @@
 from __future__ import annotations
 
 import argparse
-import inspect
 import json
 import sys
 import textwrap
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Sequence
 
 import torch
 
-from tilefoundry.cli.source import load_namespace, parse_dims, select_ir, suggested_extents
-from tilefoundry.evaluator.value import to_torch_dtype
+from tilefoundry.cli.source import load_namespace, parse_dims
+from tilefoundry.evaluator import evaluate
+from tilefoundry.evaluator.value import from_torch_dtype
 from tilefoundry.ir.core.module import Module
-from tilefoundry.ir.hir.function import Function, canonical_specialization_signature
+from tilefoundry.ir.core.module import select as select_module
+from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.specialize import (
-    dim_vars_reached,
+    canonical_specialization_signature,
     display_name,
-    specialize_concretely,
+    residual_dims,
     variant_for,
 )
-from tilefoundry.runtime import PREDICATES, RuntimeModule, SafetensorsResource, check
-from tilefoundry.runtime.measure import Predicate
-from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
+from tilefoundry.ir.types.substitute import substitute_dims
+from tilefoundry.runtime import PREDICATES, RuntimeModule
+from tilefoundry.runtime.measure import Predicate, check, flatten_outputs
+from tilefoundry.runtime.resource import (
+    DictResource,
+    DrawnResource,
+    RuntimeResource,
+    SafetensorsResource,
+    draw_tensor,
+)
 
 SEED = 0
 
@@ -51,21 +60,21 @@ class Ordered(argparse.Action):
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
     """Declare `check`'s own arguments, bounds included, off the registry."""
-    parser.add_argument("source", metavar="SOURCE", help="FILE.py:Selector — a Module, a leaf, or a twin")
     parser.add_argument(
-        "--inputs",
-        choices=("random", "real"),
-        help="how activations and weights are made: random, or real from --ckpt",
+        "source", metavar="SOURCE", help="FILE.py:Selector — a Module, a leaf, or a twin"
     )
-    parser.add_argument(
-        "--input",
-        action="append",
-        metavar="PATH",
-        help="an activation file; repeat per input, in the parameter's declared order",
-    )
-    parser.add_argument("--ckpt", metavar="DIR", help="a prepared checkpoint directory")
     parser.add_argument(
         "--expected", action="append", metavar="PATH", help="compare against this file"
+    )
+    parser.add_argument(
+        "--inputs",
+        metavar="random|files:A.pt,B.pt",
+        help="draw activations, or supply one file per parameter in its declared order",
+    )
+    parser.add_argument(
+        "--weights",
+        metavar="random|ckpt:DIR",
+        help="draw weights lazily, or read them from a safetensors checkpoint directory",
     )
     parser.add_argument(
         "--out",
@@ -73,8 +82,8 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="OUTPUT",
         help=(
             "which output the following --fn apply to: `output` when the function "
-            "returns one tensor, `output[0]` `output[1]` ... in return order when "
-            "it returns a tuple -- positions, not the names your code gives them"
+            "returns one tensor, `output[0]` `output[1]` ... in return order when it "
+            "returns a tuple -- positions, not the names your code gives them"
         ),
     )
     parser.add_argument(
@@ -83,11 +92,20 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     for bound in BOUNDS:
         parser.add_argument(f"--{bound}", action=Ordered, type=float, help=argparse.SUPPRESS)
     parser.add_argument(
-        "--dim", action="append", metavar="NAME=V[,V...]", help="bind a dimension; several values check dispatch"
+        "--dim",
+        action="append",
+        metavar="NAME=V[,V...]",
+        help="bind a dimension; several values check dispatch",
     )
     parser.add_argument(
-        "--json", metavar="PATH", help="write the machine-readable report to PATH"
+        "--device",
+        metavar="DEVICE",
+        help=(
+            "where inputs and weights are built, and so where the run happens; "
+            "defaults to the device the selection's Target declares"
+        ),
     )
+    parser.add_argument("--json", metavar="PATH", help="write the machine-readable report to PATH")
 
 
 def guidance() -> str:
@@ -154,7 +172,7 @@ def expectations(stated: Sequence[tuple[str, Any]] | None) -> dict[str, tuple[Pr
         if not predicates:
             raise ValueError(
                 f"--out {path!r} states no --fn. There is no default bound: one that "
-                f"cannot be met trains you to ignore FAIL"
+                "cannot be met trains you to ignore FAIL"
             )
         made = []
         for name, bounds in predicates:
@@ -169,81 +187,145 @@ def expectations(stated: Sequence[tuple[str, Any]] | None) -> dict[str, tuple[Pr
 
 
 def _combinations(dims: dict[str, tuple[int, ...]]) -> list[dict[str, int]]:
-    """Each combination of the stated values, in the order they were stated."""
+    """Each combination of stated dimension values, in declaration order."""
     combinations: list[dict[str, int]] = [{}]
     for name, values in dims.items():
         combinations = [{**chosen, name: value} for chosen in combinations for value in values]
     return combinations
 
 
-class Target:
-    """What a `SOURCE` resolved to: something to run, and the Module behind it.
-
-    `children` is the child-module part of the selector, which the resource is
-    scoped by. `module` is that node in the tree, not the re-entered copy
-    `ir.core.module.select` returns for a terminal function.
-    """
-
-    def __init__(self, source: str) -> None:
-        path_text, _, selector = source.partition(":")
-        self.path = Path(path_text).expanduser().resolve()
-        namespace, _ = load_namespace(source)
-        segments = selector.split(".") if selector else []
-        first = namespace.get(segments[0]) if segments else None
-
-        self.twin: RuntimeModule | None = None
-        if isinstance(first, type) and issubclass(first, RuntimeModule):
-            (
-                self.twin, self.top, self.module, self.children, self.function_name
-            ) = _walk_twin(first, segments)
-        else:
-            self.top = select_ir(namespace, segments[0] if segments else None)
-            self.module, self.children, self.function_name = _walk_ir(self.top, segments[1:])
-        self.selector = selector
-
-    @property
-    def function(self) -> Function | None:
-        """The one HIR function this target runs, when it runs exactly one."""
-        if self.function_name is None:
-            return None
-        return self.module.lookup(self.function_name)
+@dataclass(frozen=True)
+class Selection:
+    module: Module
+    twin: RuntimeModule | None
+    children: tuple[str, ...]
+    root: Module
+    source: str
 
 
-def _walk_ir(top: Module, path: Sequence[str]) -> tuple[Module, tuple[str, ...], str | None]:
-    """*path* below *top*, as (the Module, the child names walked, the function named).
+@dataclass(frozen=True)
+class CheckRequest:
+    module: Module
+    twin: RuntimeModule | None
+    inputs: tuple[Any, ...]
+    weights: RuntimeResource
+    expected: tuple[Any, ...] | None
+    device: str
+    expectations: dict[str, tuple[Predicate, ...]]
 
-    *path* below *top*, as (the Module, the child names walked, the function
-    named). A non-child segment must be last and must name one of the reached
-    Module's functions.
-    """
-    reached = top
+
+def _refuse_orchestration(module: Module, method: str) -> None:
+    functions = ", ".join(fn.name for fn in module.functions) or "none"
+    raise ValueError(
+        f"check targets HIR functions, not orchestration method "
+        f"{module.name}.{method}; select one of its HIR functions instead: {functions}"
+    )
+
+
+def _module_selection(root: Module, path: Sequence[str]) -> tuple[Module, tuple[str, ...]]:
+    node = root
     children: list[str] = []
-    for index, name in enumerate(path):
-        below = {child.name: child for child in reached.modules}
-        if name in below:
-            reached = below[name]
-            children.append(name)
+    for index, segment in enumerate(path):
+        child = next((item for item in node.modules if item.name == segment), None)
+        if child is not None:
+            node = child
+            children.append(segment)
             continue
         if index != len(path) - 1:
-            raise ValueError(
-                f"selector {'.'.join(path)!r}: Module {reached.name!r} has no child "
-                f"module {name!r}"
-            )
-        reached.lookup(name)
-        return reached, tuple(children), name
-    if reached.methods.get("forward") is not None:
-        return reached, tuple(children), None
-    return reached, tuple(children), reached.entry
+            raise ValueError(f"selector {'.'.join(path)!r}: {segment!r} is not a child module")
+        if segment in node.methods:
+            _refuse_orchestration(node, segment)
+        node.lookup(segment)
+        return select_module(root, ".".join(path)), tuple(children)
+    return node, tuple(children)
+
+
+def select(source: str) -> Selection:
+    """Resolve one authored Module or runtime twin without hiding source I/O."""
+    namespace, selector = load_namespace(source)
+    segments = selector.split(".") if selector else []
+    if segments:
+        root = namespace.get(segments[0])
+        if isinstance(root, type) and issubclass(root, RuntimeModule):
+            twin, _top, module, children = _walk_twin(root, segments)
+            return Selection(module, twin, children, _top, source)
+        if not isinstance(root, Module):
+            raise TypeError(f"selector {segments[0]!r} is not a Module or runtime twin")
+        chosen, children = _module_selection(root, segments[1:])
+        return Selection(chosen, None, children, root, source)
+
+    modules = tuple(value for value in namespace.values() if isinstance(value, Module))
+    twins = tuple(
+        value for value in namespace.values()
+        if isinstance(value, type) and issubclass(value, RuntimeModule) and value is not RuntimeModule
+    )
+    if len(modules) == 1:
+        return Selection(modules[0], None, (), modules[0], source)
+    if len(twins) == 1:
+        twin, top, module, children = _walk_twin(twins[0], (twins[0].__name__,))
+        return Selection(module, twin, children, top, source)
+    raise ValueError("source must identify exactly one Module or runtime twin")
+
+
+def read_inputs(paths: Sequence[str], device: str) -> tuple[Any, ...]:
+    return tuple(_read(path, device) for path in paths)
+
+
+def draw_inputs(module: Module, dims: dict[str, int], seed: int, device: str):
+    function = module.entry_function()
+    residual_dims(function)
+    concrete = replace(
+        function,
+        params=tuple(
+            replace(param, type=substitute_dims(param.type, dims)) for param in function.params
+        ),
+    )
+    generator = torch.Generator(device=device).manual_seed(seed)
+    return _random_activations(concrete, generator, device)
+
+
+def build_resource(
+    spec: str | None, module: Module, device: str, generator=None
+) -> RuntimeResource:
+    if spec is None:
+        return DictResource({})
+    if spec == "random":
+        generator = generator or torch.Generator(device=device).manual_seed(SEED)
+        return DrawnResource(module, generator, device)
+    if spec.startswith("ckpt:"):
+        return SafetensorsResource(spec[5:], device=device)
+    raise ValueError("--weights takes random or ckpt:DIR")
+
+
+def _scope(resource: RuntimeResource, children: Sequence[str]) -> RuntimeResource:
+    for child in children:
+        resource = resource.subtree(child)
+    return resource
+
+
+def check_concrete(request: CheckRequest):
+    loaded = request.module.load(request.weights)
+    def reference_run(*args):
+        return evaluate(loaded, *args)
+    if request.expected is not None:
+        expected = request.expected[0] if len(request.expected) == 1 else request.expected
+        def expected_run(*_args):
+            return expected
+        reference = expected_run
+    else:
+        reference = reference_run if request.twin is not None else None
+    if request.twin is None:
+        candidate = reference_run
+    else:
+        request.twin.load(request.weights)
+        candidate = getattr(request.twin, request.module.entry_function().name)
+    return check(candidate, reference, request.inputs, expect=request.expectations)
 
 
 def _walk_twin(
     root: type, segments: Sequence[str]
-) -> tuple[RuntimeModule, Module, Module, tuple[str, ...], str | None]:
-    """A twin class and a dotted path into it.
-
-    A twin class and a dotted path into it, as (node, the top Module, the
-    node's Module, the child names walked, the function named).
-    """
+) -> tuple[RuntimeModule, Module, Module, tuple[str, ...]]:
+    """Resolve a runtime twin and a dotted path into it."""
     top = root()
     node = top
     children: list[str] = []
@@ -259,20 +341,26 @@ def _walk_twin(
         if index != len(segments) - 2:
             raise ValueError(
                 f"selector {'.'.join(segments)!r}: {segment!r} is a function, so it "
-                f"can only be the last segment"
+                "can only be the last segment"
             )
-        return node, _authored(top), _authored(node), tuple(children), segment
-    return node, _authored(top), _authored(node), tuple(children), None
+        module = _authored(node)
+        if segment in module.methods:
+            _refuse_orchestration(module, segment)
+        chosen = select_module(module, segment)
+        return type(node)(ir=chosen), _authored(top), chosen, tuple(children)
+    module = _authored(node)
+    if module.methods.get("forward") is not None:
+        _refuse_orchestration(module, "forward")
+    return node, _authored(top), module, tuple(children)
 
 
 def _authored(node: RuntimeModule) -> Module:
-    """The Module a twin stands for, refusing one that stands for nothing."""
+    """The authored Module a runtime twin stands for."""
     module = node.module
     if module is None:
         raise ValueError(
             f"runtime module {node.name!r} names no authored Module, so there is "
-            f"nothing to check it against. `check` takes a @runtime_module twin, "
-            f"or the authored Module with --expected"
+            "nothing to check it against"
         )
     if not isinstance(module, Module):
         raise ValueError(
@@ -283,12 +371,7 @@ def _authored(node: RuntimeModule) -> Module:
 
 
 def _device(module: Module) -> str:
-    """Where to build the tensors.
-
-    A declared CUDA Target is a requirement -- its kernels run nowhere else. A
-    selection that declares no Target is a Module being compared through the
-    evaluator, which runs wherever there is a device.
-    """
+    """Choose the execution device declared by a Module, when one is present."""
     try:
         target = module.resolve_target()
     except Exception:
@@ -302,76 +385,17 @@ def _device(module: Module) -> str:
     return "cuda"
 
 
-def _draw(shape: Sequence[int], dtype, generator: torch.Generator, device: str) -> torch.Tensor:
-    """One tensor of *dtype*, drawn from *generator*."""
-    torch_dtype = to_torch_dtype(dtype)
-    if torch_dtype.is_floating_point:
-        drawn = torch.randn(tuple(shape), generator=generator, device=device)
-        return drawn.to(torch_dtype)
-    if torch_dtype == torch.bool:
-        return torch.randint(0, 2, tuple(shape), generator=generator, device=device).to(torch_dtype)
-    return torch.randint(0, 8, tuple(shape), generator=generator, device=device).to(torch_dtype)
-
-
-def _extents(type_) -> tuple[int, ...]:
-    """A concrete shape, refusing one still stated as a range."""
-    shape = []
-    for extent in type_.shape:
-        if not isinstance(extent, int):
-            raise ValueError(
-                f"shape {type_.shape} still states {extent} as a range; bind it with --dim"
-            )
-        shape.append(extent)
-    return tuple(shape)
-
-
 def _random_activations(function: Function, generator, device: str) -> tuple[torch.Tensor, ...]:
-    """One seeded draw of everything the function takes that is not a weight."""
+    """Draw the non-constant parameters of a concrete function."""
     return tuple(
-        _draw(_extents(param.type), param.type.dtype, generator, device)
+        draw_tensor(param.type, generator, device)
         for param in function.params
         if not param.is_const
     )
 
 
-class RandomWeights:
-    """Each weight drawn the first time it is asked for, from its declared type.
-
-    Drawn rather than pre-built so a leaf never materialises the tensors its
-    siblings declare, and cached so the two sides of a comparison are handed the
-    same draw rather than two draws of the same shape.
-    """
-
-    def __init__(self, module: Module, generator, device: str, drawn=None, prefix: str = "") -> None:
-        self._module = module
-        self._generator = generator
-        self._device = device
-        self._drawn: dict[str, torch.Tensor] = {} if drawn is None else drawn
-        self._prefix = prefix
-
-    def load(self, name: str) -> torch.Tensor:
-        key = f"{self._prefix}{name}"
-        if key not in self._drawn:
-            declared = self._module.weights[name]
-            self._drawn[key] = _draw(
-                _extents(declared), declared.dtype, self._generator, self._device
-            )
-        return self._drawn[key]
-
-    def load_group(self, name: str):
-        return None
-
-    def subtree(self, seg: str) -> "RandomWeights":
-        for child in self._module.modules:
-            if child.name == seg:
-                return RandomWeights(
-                    child, self._generator, self._device, self._drawn, f"{self._prefix}{seg}."
-                )
-        raise KeyError(seg)
-
-
 def _read(path: str, device: str):
-    """One parameter tree from a file, moving every tensor leaf to *device*."""
+    """Load one tensor tree from a file and move each leaf to *device*."""
     found = Path(path).expanduser()
     if found.suffix == ".npy":
         import numpy  # noqa: PLC0415 -- only this path needs it
@@ -393,62 +417,30 @@ def _read(path: str, device: str):
     return visit(loaded, path)
 
 
-def _tensor_leaves(value):
-    """Every tensor in one activation tree, in its written order."""
-    if isinstance(value, torch.Tensor):
-        yield value
-        return
-    for item in value:
-        yield from _tensor_leaves(item)
-
-
-def _tensor_structure(value):
-    """The JSON-safe shape tree that an activation file supplied."""
-    if isinstance(value, torch.Tensor):
-        return {"dtype": str(value.dtype), "shape": list(value.shape)}
-    return [_tensor_structure(item) for item in value]
-
-
-def _dtype_names(values: Sequence[Any]) -> list[str]:
-    """Actual torch dtypes of every tensor across the supplied values."""
-    return [str(tensor.dtype) for value in values for tensor in _tensor_leaves(value)]
-
-
 def _input_files(paths: Sequence[str], activations: Sequence[Any]) -> list[dict[str, Any]]:
-    """The leaf count and structure that each stated activation file supplied."""
-    return [
-        {
-            "path": path,
-            "tensor_count": sum(1 for _ in _tensor_leaves(activation)),
-            "structure": _tensor_structure(activation),
-        }
-        for path, activation in zip(paths, activations, strict=True)
-    ]
-
-
-def _weights_needed(module: Module) -> tuple[str, ...]:
-    """Every weight the selected Module declares, which is what a run binds."""
-    return tuple(module.weights)
-
-
-def _resource(target: Target, generator, device: str, ckpt: str | None):
-    """Where both sides read their weights.
-
-    Where both sides read their weights: one seeded draw, or the checkpoint,
-    rooted at the top-level Module and scoped by *target*'s child names.
-    """
-    resource = (
-        RandomWeights(target.top, generator, device)
-        if ckpt is None
-        else SafetensorsResource(ckpt, device=device)
-    )
-    for name in target.children:
-        resource = resource.subtree(name)
-    return resource
+    """Describe the tensor count and structure supplied by each file."""
+    files = []
+    for path, activation in zip(paths, activations, strict=True):
+        leaves = flatten_outputs(activation)
+        files.append(
+            {
+                "path": path,
+                "tensor_count": len(leaves),
+                "structure": [
+                    {
+                        "path": position,
+                        "dtype": from_torch_dtype(tensor.dtype).name,
+                        "shape": list(tensor.shape),
+                    }
+                    for position, tensor in leaves
+                ],
+            }
+        )
+    return files
 
 
 def _variant(function: Function, dims: dict[str, int]) -> dict[str, Any] | None:
-    """Which implementation this size dispatches to, and over what range."""
+    """Describe the implementation selected for concrete dimensions."""
     if not function.variants:
         return None
     chosen = variant_for(function, dims)
@@ -464,206 +456,22 @@ def _variant(function: Function, dims: dict[str, int]) -> dict[str, Any] | None:
     }
 
 
-def _pin(function: Function, stated: dict[str, int]) -> tuple[dict[str, int], list[dict[str, Any]]]:
-    """Every dimension this function states as a range, bound to one extent.
-
-    A dimension the caller named keeps that extent; one nobody named is pinned to
-    the first value of its declared range and reported, because a run happened at
-    one size whether or not anybody chose it.
-    """
-    declared = dim_vars_reached(function)
-    bound: dict[str, int] = {}
-    unstated: list[dict[str, Any]] = []
-    for name, dim_var in declared.items():
-        if name in stated:
-            bound[name] = stated[name]
-            continue
-        bound[name] = dim_var.lo
-        unstated.append(
-            {
-                "dim": name,
-                "pinned": dim_var.lo,
-                "lo": dim_var.lo,
-                "hi": dim_var.hi,
-                "spread": suggested_extents(dim_var.lo, dim_var.hi),
-            }
-        )
-    unknown = sorted(set(stated) - set(declared))
-    if unknown:
-        raise ValueError(
-            f"--dim {unknown} name no dimension of {function.name!r}; it states "
-            f"{sorted(declared)}"
-        )
-    return bound, unstated
-
-
-def _sides(target: Target, resource, expected: Sequence[str] | None, device: str):
-    """The two callables to compare, and how to say what the reference was.
-
-    The reference is the selected Module loaded whole, then its function.
-    """
-    name = target.function_name
-    loaded = target.module.load(resource)
-    evaluator = getattr(loaded, name) if name else loaded.forward
-
-    if target.twin is not None:
-        target.twin.load(resource)
-        candidate = getattr(target.twin, name) if name else target.twin.forward
-    else:
-        candidate = evaluator
-
-    if expected:
-        tensors = tuple(_read(path, device) for path in expected)
-        one = tensors[0] if len(tensors) == 1 else tensors
-        return candidate, (lambda *_: one), ", ".join(expected), loaded.constants
-
-    if target.twin is None:
-
-
-        return candidate, None, None, loaded.constants
-    authored = target.module.name if name is None else f"{target.module.name}.{name}"
-    return candidate, evaluator, f"evaluator on {authored}", loaded.constants
-
-
-def _orchestration_parameter_names(target: Target) -> tuple[str, ...]:
-    """The activations the selected orchestration method actually accepts."""
-    method = target.twin.forward if target.twin is not None else target.module.methods["forward"]
-    return tuple(name for name in inspect.signature(method).parameters if name != "self")
-
-
-def _one_run(
-    target: Target,
-    stated: dict[str, int],
-    expect: dict[str, tuple[Predicate, ...]],
-    arguments: argparse.Namespace,
-    device: str,
-) -> dict[str, Any]:
-    """One comparison at one set of extents, as the facts both outputs carry."""
-    function = target.function
-    pinned: dict[str, int] = {}
-    unstated: list[dict[str, Any]] = []
-    concrete = function
-    if function is not None:
-        pinned, unstated = _pin(function, stated)
-        if pinned:
-            concrete = specialize_concretely(
-                function,
-                pinned,
-                TypeInferContext(scope=FunctionScope(target.module, function)),
-            )
-    elif stated:
-        raise ValueError(
-            f"--dim was given, but {target.module.name!r} runs an orchestration "
-            f"method rather than one function, so there is no signature to bind"
-        )
-
-    needed = _weights_needed(target.module)
-    if needed and arguments.ckpt is None and arguments.inputs != "random":
-        raise ValueError(
-            f"{target.module.name!r} needs weights {list(needed)} and no source was "
-            f"given; draw them with --inputs random or read them with --ckpt DIR"
-        )
-
-    generator = torch.Generator(device=device).manual_seed(SEED)
-    activations: tuple[Any, ...]
-    if arguments.input:
-        activations = tuple(_read(path, device) for path in arguments.input)
-        provided = f"{len(activations)} file(s): {', '.join(arguments.input)}"
-    elif arguments.inputs is None:
-        raise ValueError(
-            "no inputs stated. Give exactly one form and no default: --inputs random, "
-            "--inputs real --ckpt DIR, or --input=PATH per activation"
-        )
-    else:
-        if concrete is None:
-            names = _orchestration_parameter_names(target)
-            raise ValueError(
-                f"--inputs {arguments.inputs} cannot make activations for "
-                f"{target.module.name!r}: it runs an orchestration method whose "
-                f"parameters have no declared shapes or dtypes. It takes {len(names)} "
-                f"activation parameters in order: {', '.join(names)}. Give one "
-                "--input=PATH per parameter; each file holds one tensor or a nested "
-                "tuple/list of tensors, for example torch.save((...), \"mixer_args.pt\")"
-            )
-        activations = _random_activations(concrete, generator, device)
-        provided = f"random, seed {SEED}"
-
-    resource = _resource(target, generator, device, arguments.ckpt)
-    if not needed:
-        weights_from = "none declared"
-    else:
-        weights_from = "the checkpoint" if arguments.ckpt else f"random, seed {SEED}"
-
-    candidate, reference, reference_label, loaded_weights = _sides(
-        target, resource, arguments.expected, device
-    )
-    report = check(candidate, reference, activations, expect=expect)
-    return {
-        "dims": dict(stated),
-        "pinned": unstated,
-        "variant": None if concrete is None else _variant(function, pinned),
-        "inputs": {
-            "activations": {
-                "source": provided,
-                "actual_dtypes": _dtype_names(activations),
-                "declared_dtypes": (
-                    []
-                    if concrete is None
-                    else [
-                        parameter.type.dtype.name
-                        for parameter in concrete.params
-                        if not parameter.is_const
-                    ]
-                ),
-                "files": _input_files(arguments.input, activations) if arguments.input else [],
-            },
-            "weights": {
-                "source": weights_from,
-                "actual_dtypes": _dtype_names(tuple(loaded_weights.values())),
-                "declared_dtypes": [type_.dtype.name for type_ in target.module.weights.values()],
-            },
-        },
-        "reference": reference_label,
-        "outputs": [
-            {
-                "path": output.path,
-                "shape": list(output.shape),
-                "dtype": output.dtype,
-                **({} if output.ref_norm is None else {"ref_norm": output.ref_norm}),
-                "fns": [
-                    {
-                        "fn": result.predicate.name,
-                        **{
-                            bound: getattr(result.predicate, bound)
-                            for bound in result.predicate.bounds
-                        },
-                        **result.values,
-                        "passed": result.passed,
-                        **({} if result.note is None else {"note": result.note}),
-                    }
-                    for result in output.results
-                ],
-            }
-            for output in report.outputs
-        ],
-        "passed": report.passed,
-    }
-
-
 def _shown_dtypes(dtypes: Sequence[str]) -> str:
     """Dtypes as one readable field, including an honest empty declaration."""
     return ", ".join(dtypes) if dtypes else "none"
 
 
 def _shown_structure(structure) -> str:
-    """One recursively-loaded input tree, compactly enough for the inputs line."""
-    if isinstance(structure, dict):
-        return f"{structure['dtype']}[{', '.join(str(extent) for extent in structure['shape'])}]"
-    return "(" + ", ".join(_shown_structure(item) for item in structure) + ")"
+    """Render one flattened input tree compactly."""
+    shown = [
+        f"{item['dtype']}[{', '.join(str(extent) for extent in item['shape'])}]"
+        for item in structure
+    ]
+    return shown[0] if len(shown) == 1 else "(" + ", ".join(shown) + ")"
 
 
 def _shown_files(files: Sequence[dict[str, Any]]) -> str:
-    """Every file's count plus its tensor shape tree, for the text report."""
+    """Render every input file's count and tensor shape tree."""
     if not files:
         return ""
     descriptions = [
@@ -672,6 +480,28 @@ def _shown_files(files: Sequence[dict[str, Any]]) -> str:
         for file in files
     ]
     return "; files " + "; ".join(descriptions)
+
+
+def _output_dict(output) -> dict[str, Any]:
+    """Make a Report output JSON-safe while retaining every measured fact."""
+    results = []
+    for measured in output.results:
+        item = {
+            "fn": measured.predicate.name,
+            **{bound: getattr(measured.predicate, bound) for bound in measured.predicate.bounds},
+            **dict(measured.values),
+            "passed": measured.passed,
+        }
+        if measured.note is not None:
+            item["note"] = measured.note
+        results.append(item)
+    return {
+        "path": output.path,
+        "shape": list(output.shape),
+        "dtype": output.dtype,
+        "ref_norm": output.ref_norm,
+        "fns": results,
+    }
 
 
 def _failure_warnings(runs: Sequence[dict[str, Any]], input_kind: str | None) -> list[str]:
@@ -684,7 +514,7 @@ def _failure_warnings(runs: Sequence[dict[str, Any]], input_kind: str | None) ->
         warnings.append(
             "--inputs random makes each activation independently. A target that relies on "
             "semantic relationships between activations can differ at ulp scale without either "
-            "implementation being wrong. Rerun with --inputs real to decide the comparison."
+            "implementation being wrong. Rerun with --inputs files:... to decide the comparison."
         )
     if any(run["reference"] is not None for run in runs):
         warnings.append(
@@ -696,69 +526,47 @@ def _failure_warnings(runs: Sequence[dict[str, Any]], input_kind: str | None) ->
     return warnings
 
 
-def _render(
-    target: Target,
-    runs: list[dict[str, Any]],
-    warnings: Sequence[str],
-) -> str:
-    """The runs as a person reads them: what ran, what it measured, the verdict."""
-    where = f"{target.path.name}:{target.selector}" if target.selector else str(target.path.name)
-    lines = [where]
+def _render(source: str, runs: Sequence[dict[str, Any]], warnings: Sequence[str]) -> str:
+    lines = [source]
     for run in runs:
-        if run["dims"]:
-            lines.append("")
-            lines.append(f"  {', '.join(f'{k}={v}' for k, v in run['dims'].items())}")
-        lines.append(f"  reference: {run['reference'] or 'none — the candidate alone'}")
+        if run.get("dims"):
+            lines += ["", "  " + ", ".join(f"{k}={v}" for k, v in run["dims"].items())]
+        lines.append(f"  reference: {run.get('reference', 'none')}")
         activations = run["inputs"]["activations"]
-        weights = run["inputs"]["weights"]
         lines.append(
             f"  inputs:    {activations['source']}; activations actual "
             f"{_shown_dtypes(activations['actual_dtypes'])} (declared "
-            f"{_shown_dtypes(activations['declared_dtypes'])}); weights "
-            f"{weights['source']} actual {_shown_dtypes(weights['actual_dtypes'])} "
-            f"(declared {_shown_dtypes(weights['declared_dtypes'])})"
-            f"{_shown_files(activations['files'])}"
+            f"{_shown_dtypes(activations['declared_dtypes'])})"
+            f"{_shown_files(activations.get('files', []))}"
         )
-        if run["variant"] is not None:
+        if run.get("variant") is not None:
+            variant = run["variant"]
             ranges = ", ".join(
-                f"{r['dim']} in [{r['lo']}, {r['hi']})" for r in run["variant"]["ranges"]
+                f"{item['dim']} in [{item['lo']}, {item['hi']})" for item in variant["ranges"]
             )
-            named = run["variant"].get("display_name")
-            shown = run["variant"]["signature"]
-            lines.append(
-                f"  variant:   {shown if named is None else f'{named}  {shown}'}  ({ranges})"
-            )
-        for pinned in run["pinned"]:
-            lines.append(
-                f"  note: {pinned['dim']} is a range [{pinned['lo']}, {pinned['hi']}) that "
-                f"nothing bound; this run pinned it to {pinned['pinned']}."
-            )
-            spread = ",".join(str(value) for value in pinned["spread"])
-            lines.append(f"        tilefoundry check ... --dim {pinned['dim']}={spread}")
-            lines.append(
-                "        to make the size a declared variant instead of a pin, see "
-                "`tilefoundry spec parser 1.1`"
-            )
+            label = variant.get("display_name")
+            shown = variant["signature"]
+            lines.append(f"  variant:   {shown if label is None else f'{label}  {shown}'}  ({ranges})")
         lines.append("")
         for output in run["outputs"]:
+            output = output if isinstance(output, dict) else _output_dict(output)
             shape = ",".join(str(extent) for extent in output["shape"])
-            norm = "" if "ref_norm" not in output else f"   ref_norm {output['ref_norm']:.6g}"
+            norm = "" if output.get("ref_norm") is None else f"   ref_norm {output['ref_norm']:.6g}"
             lines.append(f"  {output['path']}   {output['dtype']}[{shape}]{norm}")
-            for measured in output["fns"]:
+            for result in output["fns"]:
                 bounds = " ".join(
-                    f"{bound}={getattr(PREDICATES[measured['fn']], bound, None) or measured[bound]:g}"
-                    for bound in PREDICATES[measured["fn"]].bounds
+                    f"{bound}={result[bound]:g}"
+                    for bound in PREDICATES[result["fn"]].bounds
                 )
                 values = " ".join(
                     f"{key} {value:g}"
-                    for key, value in measured.items()
-                    if key not in ("fn", "passed", "note", *PREDICATES[measured["fn"]].bounds)
+                    for key, value in result.items()
+                    if key not in {"fn", "passed", "note", *PREDICATES[result["fn"]].bounds}
                 )
-                verdict = "PASS" if measured["passed"] else "FAIL"
-                stated = f"{measured['fn']}({bounds})" if bounds else measured["fn"]
-                lines.append(f"    {stated:<34} {values:<26} {verdict}")
-                if "note" in measured:
-                    lines.append(f"      {measured['note']}")
+                stated = f"{result['fn']}({bounds})" if bounds else result["fn"]
+                lines.append(f"    {stated:<34} {values:<26} {'PASS' if result['passed'] else 'FAIL'}")
+                if result.get("note"):
+                    lines.append(f"      {result['note']}")
         lines.append("")
     passed = all(run["passed"] for run in runs)
     tally = f"  {sum(1 for run in runs if run['passed'])}/{len(runs)}" if len(runs) > 1 else ""
@@ -770,41 +578,112 @@ def _render(
 
 
 def run_check(arguments: argparse.Namespace) -> int:
-    """Compare one target against its reference and report every output."""
+    """Compare one selected implementation against its semantic reference."""
     expect = expectations(getattr(arguments, "comparison", None))
+    selection = select(arguments.source)
     stated = parse_dims(arguments.dim) or {}
-    if arguments.input and arguments.inputs is not None:
-        raise ValueError(
-            f"--input names the activations and --inputs {arguments.inputs} makes them; "
-            f"give exactly one form. Weights alongside --input come from --ckpt DIR"
+    if arguments.inputs is None:
+        raise ValueError("no inputs stated")
+    device = arguments.device or _device(selection.module)
+    runs = []
+    for dims in _combinations(stated):
+        concrete = None
+        selected_variant = None
+        if arguments.inputs == "random":
+            fn = selection.module.entry_function()
+            variant_dims = {
+                pattern.dim_var
+                for variant in fn.variants
+                for pattern in variant.specializations
+            }
+            if variant_dims and variant_dims <= dims.keys():
+                selected_variant = _variant(fn, dims)
+            concrete = replace(
+                fn,
+                params=tuple(
+                    replace(p, type=substitute_dims(p.type, dims)) for p in fn.params
+                ),
+            )
+            inputs = draw_inputs(selection.module, dims, SEED, device)
+        elif arguments.inputs.startswith("files:"):
+            inputs = read_inputs(arguments.inputs[6:].split(","), device)
+        else:
+            raise ValueError("--inputs takes random or files:A.pt,B.pt")
+        generator = torch.Generator(device=device).manual_seed(SEED)
+        resource = build_resource(arguments.weights, selection.root, device, generator)
+        resource = _scope(resource, selection.children)
+        expected = None
+        if arguments.expected:
+            expected_values = read_inputs(arguments.expected, device)
+            expected = expected_values
+        report = check_concrete(
+            CheckRequest(
+                selection.module,
+                selection.twin,
+                inputs,
+                resource,
+                expected,
+                device,
+                expect,
+            )
         )
-    if arguments.ckpt and arguments.inputs == "random":
-        raise ValueError("--inputs random draws its own weights; --ckpt would not be read")
-    if arguments.inputs == "real" and not arguments.ckpt:
-        raise ValueError("--inputs real reads real weights, so it needs --ckpt DIR")
-
-    target = Target(arguments.source)
-    device = _device(target.module)
-    runs = [
-        _one_run(target, combination, expect, arguments, device)
-        for combination in _combinations(stated)
-    ]
+        declared = tuple(
+            param.type.dtype.name
+            for param in (concrete.params if concrete is not None else ())
+            if not param.is_const
+        )
+        if arguments.expected:
+            reference = ", ".join(arguments.expected)
+        elif selection.twin is not None:
+            fn_name = selection.module.entry_function().name
+            qualified = ".".join((*selection.children, fn_name))
+            if not selection.children:
+                qualified = f"{selection.module.name}.{fn_name}"
+            reference = f"evaluator on {qualified}"
+        else:
+            reference = "none — the candidate alone"
+        runs.append({
+            "passed": report.passed,
+            "outputs": [_output_dict(output) for output in report.outputs],
+            "dims": dims,
+            "reference": reference,
+            "variant": selected_variant,
+            "inputs": {
+                "activations": {
+                    "source": f"{arguments.inputs} (seed {SEED})" if arguments.inputs == "random" else arguments.inputs,
+                    "actual_dtypes": [
+                        from_torch_dtype(tensor.dtype).name
+                        for _path, tensor in flatten_outputs(inputs)
+                    ],
+                    "declared_dtypes": list(declared),
+                    "files": _input_files(arguments.inputs[6:].split(","), inputs)
+                    if arguments.inputs.startswith("files:") else [],
+                },
+            },
+        })
     warnings = _failure_warnings(runs, arguments.inputs)
-
+    passed = all(run["passed"] for run in runs)
     if arguments.json:
-        payload = {
-            "target": f"{target.path.name}:{target.selector}" if target.selector else target.path.name,
-            "runs": runs,
-            "passed": all(run["passed"] for run in runs),
-        }
+        payload = {"target": arguments.source, "runs": runs, "passed": passed}
         if warnings:
             payload["warnings"] = warnings
-        Path(arguments.json).write_text(
-            json.dumps(payload, indent=2, sort_keys=False) + "\n", encoding="utf-8"
-        )
+        Path(arguments.json).write_text(json.dumps(payload, default=str, indent=2) + "\n", encoding="utf-8")
     else:
-        sys.stdout.write(_render(target, runs, warnings))
-    return 0 if all(run["passed"] for run in runs) else 1
+        sys.stdout.write(_render(arguments.source, runs, warnings))
+    return 0 if passed else 1
 
 
-__all__ = ["add_arguments", "expectations", "guidance", "parse_dims", "run_check"]
+__all__ = [
+    "Selection",
+    "CheckRequest",
+    "add_arguments",
+    "build_resource",
+    "check_concrete",
+    "draw_inputs",
+    "expectations",
+    "guidance",
+    "parse_dims",
+    "read_inputs",
+    "run_check",
+    "select",
+]

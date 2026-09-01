@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import os
+import sys
 import textwrap
+import threading
+import time
 from pathlib import Path
 from typing import Mapping
 
 from tilefoundry.analysis import analyze, check_program
-from tilefoundry.analysis.check import _program_dim_vars, _resolve_program_geometry
-from tilefoundry.analysis.preflight import validate_authored
-from tilefoundry.analysis.walk import reachable_functions
+from tilefoundry.analysis.check import (
+    _program_dim_vars,
+    _resolve_program_geometry,
+)
 from tilefoundry.cli.source import load_authored_ir, suggested_extents
 from tilefoundry.inspection import PythonPrintOptions, as_script
 from tilefoundry.inspection.analysis_report import (
@@ -29,6 +34,22 @@ EVIDENCE: dict[str, str] = {
 
 
 ANALYSES: tuple[str, ...] = tuple(EVIDENCE)
+_ANALYSIS_TIMEOUT_SECONDS = 300.0
+
+
+def _watch(limit: float) -> None:
+    """Bound the whole analyze command by wall clock."""
+
+    def stop() -> None:
+        time.sleep(limit)
+        sys.stderr.write(
+            "tilefoundry: error: analysis too complex, "
+            f"timed out after {limit:.0f}s\n"
+        )
+        sys.stderr.flush()
+        os._exit(1)
+
+    threading.Thread(target=stop, daemon=True).start()
 
 
 def guidance() -> str:
@@ -80,10 +101,10 @@ def guidance() -> str:
             is an observation, not a bound.
 
         Each family's record, how every field is computed, and what it prints:
-          tilefoundry spec analysis 2.2.1    compute-cost
-          tilefoundry spec analysis 2.2.2    memory
-          tilefoundry spec analysis 2.2.3    roofline
-          tilefoundry spec analysis 2.2.4    performance
+          tilefoundry spec analysis 1.2.1    compute-cost
+          tilefoundry spec analysis 1.2.2    memory
+          tilefoundry spec analysis 1.2.3    roofline
+          tilefoundry spec analysis 1.2.4    performance
         """
     )
 
@@ -104,6 +125,7 @@ def run_authored_analysis(
     runs once on one view, and Metadata ownership keeps one family from changing
     another's records.
     """
+    _watch(_ANALYSIS_TIMEOUT_SECONDS)
     module = load_authored_ir(source)
     function = module.entry_function()
     stated = {} if dims is None else dims
@@ -130,7 +152,6 @@ def run_authored_analysis(
         except SpecializationError as error:
             raise ValueError(f"analyze: {error}") from None
         expanded = check_program(checked_module, checked)
-        validate_authored(reachable_functions(checked))
         annotated = as_script(expanded, options=PythonPrintOptions(show_types=True))
         Path(out_path).write_text(annotated, encoding="utf-8")
         return 0

@@ -16,7 +16,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from types import FrameType, SimpleNamespace
-from typing import Any, ClassVar, Generic, Protocol, TypeVar
+from typing import Any, ClassVar, Generic, Protocol, TypeVar, cast
 from typing import Literal as TypingLiteral
 
 from tilefoundry.ir.core import (
@@ -28,13 +28,14 @@ from tilefoundry.ir.core import (
     SourceSpanMetadata,
     Var,
     VerifyError,
-    replace_metadata,
+    attach_metadata,
+    get_metadata,
 )
 from tilefoundry.ir.core.expr import Tuple as IrTuple
 from tilefoundry.ir.core.kinds import BinaryKind, UnaryKind
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.core.op_schema import OpSchema
-from tilefoundry.ir.hir.function import Function, elaborate
+from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.grid_region import GridRegionExpr
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
@@ -65,18 +66,42 @@ from tilefoundry.ir.types.shard import (
     Mesh,
     ShardLayout,
     Split,
+    Topology,
     c_order_strides,
     canonical_shard_layout,
     composed,
 )
 from tilefoundry.ir.types.shard.layout import LayoutBase
 from tilefoundry.ir.types.storage import StorageKind, resolve_storage
-from tilefoundry.visitor_registry.contexts import CallFeed, FunctionScope, TypeInferContext
+from tilefoundry.target import MemoryHierarchyFacts, Target, UnsupportedCapabilityError
+from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 from tilefoundry.visitor_registry.visitors import TypeInferVisitor
 
 T = TypeVar("T")
-_RETURN_TYPE = "<return_type>"
 _TYPE_INFER_CONTEXT = "<type_infer_context>"
+
+
+def _hardware_context(target: Target | None) -> dict[str, object]:
+    if target is None:
+        return {}
+    try:
+        facts = target.get_facts(MemoryHierarchyFacts)
+    except UnsupportedCapabilityError:
+        return {}
+    allowed = tuple(resolve_storage(level.name) for level in facts.explicit_levels)
+    return {"allowed_storage": (*allowed, StorageKind.UMAT)}
+
+
+def _resolve_mesh_topologies(
+    topologies: tuple[Topology | str, ...],
+    declared: Mapping[str, Topology],
+) -> tuple[Topology, ...]:
+    """Resolve string topology names against one function's declared hierarchy."""
+    if all(isinstance(topology, str) for topology in topologies):
+        return tuple(declared[topology] for topology in topologies)
+    if all(hasattr(topology, "name") for topology in topologies):
+        return cast(tuple[Topology, ...], topologies)
+    raise TypeError("Mesh topologies must be names or Topology objects")
 
 
 class MatchFailure:
@@ -131,27 +156,66 @@ def is_matched(result: object) -> bool:
     return isinstance(result, AstMatch)
 
 
-def attach_authored_metadata(value: object, node: ast.AST, context: "MatchContext") -> object:
-    """Attach source identity without copying lexical values such as parameter Vars."""
-    if not isinstance(value, Expr):
-        return value
+def authored_source_range(
+    node: ast.AST, context: "MatchContext"
+) -> tuple[str, int, int, int | None, int | None] | None:
+    """The source-file range for *node*, using zero-based AST columns."""
     owner = context.function or context.module
     source_filename = owner.source_filename if owner is not None else "<string>"
     line = getattr(node, "lineno", None)
     column = getattr(node, "col_offset", None)
-    if isinstance(line, int) and isinstance(column, int):
-        value = replace_metadata(
-            value,
-            SourceSpanMetadata(
-                source_filename,
-                line,
-                column + 1,
-                getattr(node, "end_lineno", None),
-                getattr(node, "end_col_offset", None),
-            ),
-        )
-    if context.binding_name:
-        value = replace_metadata(value, BindingMetadata(context.binding_name))
+    if not isinstance(line, int) or not isinstance(column, int):
+        return None
+    end_line = getattr(node, "end_lineno", None)
+    end_column = getattr(node, "end_col_offset", None)
+    return (
+        source_filename,
+        line,
+        column,
+        end_line if isinstance(end_line, int) else None,
+        end_column if isinstance(end_column, int) else None,
+    )
+
+
+def _unsourced_calls(value: Call) -> tuple[Call, ...]:
+    """Calls reachable through Call operands and IR Tuples without a source span."""
+    found: list[Call] = []
+    pending: list[Expr] = [value]
+    seen: set[int] = set()
+    while pending:
+        expr = pending.pop()
+        if id(expr) in seen:
+            continue
+        seen.add(id(expr))
+        if isinstance(expr, Call):
+            if get_metadata(expr, SourceSpanMetadata) is not None:
+                continue
+            found.append(expr)
+            pending.extend(reversed(expr.args))
+        elif isinstance(expr, IrTuple):
+            pending.extend(reversed(expr.elements))
+    return tuple(found)
+
+
+def attach_authored_metadata(value: object, node: ast.AST, context: "MatchContext") -> object:
+    """Attach *node*'s source identity to each unmarked Call it constructs."""
+    if not isinstance(value, Call):
+        return value
+    source_range = authored_source_range(node, context)
+    if source_range is None:
+        return value
+    source_filename, line, column, end_line, end_column = source_range
+    span = SourceSpanMetadata(
+        source_filename,
+        line,
+        column + 1,
+        end_line,
+        end_column,
+    )
+    for call in _unsourced_calls(value):
+        attach_metadata(call, span)
+        if context.binding_name:
+            attach_metadata(call, BindingMetadata(context.binding_name))
     return value
 
 
@@ -207,11 +271,11 @@ runtime = SimpleNamespace(
     canonical_shard_layout=canonical_shard_layout,
     composed=composed,
     dim_expr=dim_expr,
-    elaborate=elaborate,
     normalize_dim=normalize_dim,
     slice_size=slice_size,
     simplify_dim=simplify_dim,
     resolve_storage=resolve_storage,
+    resolve_mesh_topologies=_resolve_mesh_topologies,
 )
 
 
@@ -573,7 +637,6 @@ class ChildPattern(CombinatorPattern):
         situation: str,
         role: str | None = None,
         *,
-        expected_type: object | Callable[[object, MatchContext], object] | None = None,
         values: Mapping[str, object]
         | Callable[[object, MatchContext], Mapping[str, object]]
         | None = None,
@@ -584,7 +647,6 @@ class ChildPattern(CombinatorPattern):
         self._pattern = pattern
         self.situation = situation
         self.role = role
-        self.expected_type = expected_type
         self.values = values
         self.isolated_scope = isolated_scope
         self.transform = transform
@@ -602,18 +664,12 @@ class ChildPattern(CombinatorPattern):
         if not isinstance(value, ast.AST):
             return None
         values = self.values(value, context) if callable(self.values) else self.values or {}
-        expected_type = (
-            self.expected_type(value, context)
-            if callable(self.expected_type)
-            else self.expected_type
-        )
         child = AstChild(
             self.name,
             self.pattern,
             value,
             self.situation,
             self.role,
-            expected_type=expected_type,
             values=values,
             isolated_scope=self.isolated_scope,
         )
@@ -737,6 +793,7 @@ class FuncParserContext:
     base: object | None = None
     key: object | None = None
     target: object | None = None
+    mesh: object | None = None
     output_count: int = 1
     hardware_context: Mapping[str, object] = field(default_factory=dict)
     binding_name: str | None = None
@@ -775,12 +832,12 @@ class FuncParserContext:
 
 
 @dataclass(frozen=True)
-class ParserCallFeedProvider:
-    """Build call feeds from the authored module scope during parsing."""
+class ParserChildModuleResolver:
+    """Resolve callees owned by authored child modules during parsing."""
 
     module_scope: object | None
 
-    def _child_for(self, callee: object):
+    def child_for(self, callee: object):
         if self.module_scope is None:
             return None
         for _name, child in self.module_scope.items():
@@ -788,27 +845,17 @@ class ParserCallFeedProvider:
                 return child
         return None
 
-    def build_call_feed(self, callee: object, supplied: tuple[object, ...]) -> CallFeed:
-        child = self._child_for(callee)
-        params = tuple(p for p in callee.params if not (child is not None and p.is_const))
-        if len(supplied) != len(params):
-            kind = "activation(s)" if child is not None else "parameter(s)"
-            raise VerifyError(
-                f"hir Function call {callee.name!r}: arity mismatch — "
-                f"callee declares {len(params)} {kind}, call passed {len(supplied)}"
-            )
-        given = iter(supplied)
-        return CallFeed(
-            {
-                id(param): param.type if child is not None and param.is_const else next(given)
-                for param in callee.params
-            }
-        )
 
-    def scope_for(self, callee: object) -> FunctionScope | None:
-        child = self._child_for(callee)
-        return None if child is None else FunctionScope(child, callee)
+@dataclass
+class ParserTypeInferContext(TypeInferContext):
+    """Type inference state with parser-local child-module resolution."""
 
+    child_resolver: ParserChildModuleResolver | None = None
+
+    def child_for(self, callee: object):
+        if self.child_resolver is not None:
+            return self.child_resolver.child_for(callee)
+        return super().child_for(callee)
 
 @dataclass(frozen=True)
 class ModuleFunctionValidationRule:
@@ -893,6 +940,7 @@ class ModuleBuildContext:
         closure: Mapping[str, object] | None = None,
         base: object | None = None,
         key: object | None = None,
+        mesh: object | None = None,
     ) -> FuncParserContext:
         topology_scope = {
             getattr(topology, "name", str(index)): topology
@@ -908,7 +956,9 @@ class ModuleBuildContext:
             module=self,
             base=base,
             key=key,
-            target=self.target if dialect == "tir" else None,
+            target=self.target,
+            mesh=mesh,
+            hardware_context=_hardware_context(self.target),
             binding_name=binding_name,
         )
 
@@ -1160,7 +1210,6 @@ class MatchContext:
     situation: str
     role: str | None = None
     binding_name: str | None = None
-    expected_type: object | None = None
     lexical_scope: LexicalScope = field(default_factory=LexicalScope)
     parent: MatchContext | None = None
     values: Mapping[str, object] = field(default_factory=dict)
@@ -1169,15 +1218,15 @@ class MatchContext:
     def from_function(cls, function: FuncParserContext) -> MatchContext:
         scope = LexicalScope()
         provider = (
-            ParserCallFeedProvider(function.module_scope)
+            ParserChildModuleResolver(function.module_scope)
             if function.module_scope is not None
             else None
         )
         scope.define(
             _TYPE_INFER_CONTEXT,
-            runtime.TypeInferContext(call_feed_provider=provider),
+            ParserTypeInferContext(child_resolver=provider),
         )
-        return cls(
+        context = cls(
             function=function,
             module=None,
             situation="function",
@@ -1185,6 +1234,25 @@ class MatchContext:
             lexical_scope=scope,
             values=function.hardware_context,
         )
+        if function.mesh is not None:
+            try:
+                topologies = _resolve_mesh_topologies(
+                    function.mesh.topologies, function.topologies
+                )
+            except KeyError as error:
+                raise ParseError.from_node(
+                    ast.Name(id=error.args[0]),
+                    context,
+                    f"topology {error.args[0]!r} not declared by @module",
+                ) from error
+            except TypeError as error:
+                raise ParseError.from_node(
+                    ast.Name(id="mesh"), context, str(error)
+                ) from error
+            mesh = dataclasses.replace(function.mesh, topologies=topologies)
+            scope.define("mesh", mesh)
+            function.state.mesh_stack.append(mesh)
+        return context
 
     def child(
         self,
@@ -1192,7 +1260,6 @@ class MatchContext:
         situation: str,
         role: str | None = None,
         binding_name: str | None = None,
-        expected_type: object | None = None,
         values: Mapping[str, object] | None = None,
         lexical_bindings: Mapping[str, object] | None = None,
         isolated_scope: bool = False,
@@ -1206,28 +1273,25 @@ class MatchContext:
         if switching_function:
             scope = LexicalScope()
             provider = (
-                ParserCallFeedProvider(function.module_scope)
+                ParserChildModuleResolver(function.module_scope)
                 if function is not None and function.module_scope is not None
                 else None
             )
             scope.define(
                 _TYPE_INFER_CONTEXT,
-                runtime.TypeInferContext(call_feed_provider=provider),
+                ParserTypeInferContext(child_resolver=provider),
             )
         else:
             scope = self.lexical_scope.fork() if isolated_scope else self.lexical_scope
         if lexical_bindings:
             for name, value in lexical_bindings.items():
                 scope.define(name, value)
-        if expected_type is None and role == "return_value":
-            expected_type = scope.lookup(_RETURN_TYPE)
         return MatchContext(
             function=function or self.function,
             module=module or self.module,
             situation=situation,
             role=role,
             binding_name=binding_name,
-            expected_type=expected_type,
             lexical_scope=scope,
             parent=self,
             values=merged,
@@ -1264,7 +1328,6 @@ class AstChild:
     node: ast.AST
     situation: str
     role: str | None = None
-    expected_type: object | None = None
     values: Mapping[str, object] = field(default_factory=dict)
     isolated_scope: bool = False
     function_context: FuncParserContext | None = None
@@ -1286,10 +1349,12 @@ class AstMatch(Generic[T]):
         pattern_constructor = getattr(self.pattern, "construct", None)
         if not callable(pattern_constructor):
             raise TypeError(f"Pattern {type(self.pattern).__name__} has no construct method")
-        value = pattern_constructor(self, children, context)
+        value = attach_authored_metadata(
+            pattern_constructor(self, children, context), self.node, context
+        )
         for rule in self.pattern.RULES:
             value = rule.apply(value, match=self, context=context)
-        return value
+        return attach_authored_metadata(value, self.node, context)
 
 
 class ParseError(VerifyError):
@@ -1302,15 +1367,12 @@ class ParseError(VerifyError):
         context: MatchContext,
         detail: str | None = None,
     ):
-        line = getattr(node, "lineno", None)
-        column = getattr(node, "col_offset", None)
         location = ""
-        owner = context.function or context.module
-        source_filename = owner.source_filename if owner is not None else "<string>"
-        if isinstance(line, int):
+        source_range = authored_source_range(node, context)
+        if source_range is not None:
+            source_filename, line, column, _end_line, _end_column = source_range
             location = f" at {source_filename}:{line}"
-            if isinstance(column, int):
-                location += f":{column + 1}"
+            location += f":{column + 1}"
         message = detail or f"no AST pattern matched situation {context.situation!r}"
         if context.role:
             message += f" (role {context.role!r})"
@@ -1368,7 +1430,6 @@ def parse_node(pattern: AstPattern[T], node: ast.AST, context: MatchContext) -> 
             situation=child.situation,
             role=child.role,
             binding_name=binding_name,
-            expected_type=child.expected_type,
             values=child.values,
             lexical_bindings=child.lexical_bindings,
             isolated_scope=child.isolated_scope,
@@ -1626,7 +1687,7 @@ def _infer_call(operation, args, context):
     infer_context = context.lexical_scope.lookup(_TYPE_INFER_CONTEXT)
     if not isinstance(infer_context, runtime.TypeInferContext):
         infer_context = runtime.TypeInferContext()
-    inferred = runtime.TypeInferVisitor(infer_context).visit(placeholder)
+    inferred = runtime.TypeInferVisitor().visit(placeholder, infer_context)
     return dataclasses.replace(placeholder, type=inferred)
 
 

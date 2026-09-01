@@ -179,6 +179,16 @@ def weighted_twin() -> Path:
 
 
 @pytest.fixture(scope="module")
+def mesh_slice_start() -> Path:
+    return _fixture_path("placed", "mesh_slice_start.py")
+
+
+@pytest.fixture(scope="module")
+def tuple_projection_diagnostic() -> Path:
+    return _fixture_path("diagnostics", "tuple_projection_diagnostic.py")
+
+
+@pytest.fixture(scope="module")
 def derived_prefill() -> Path:
     return _fixture_path("placed", "derived_prefill.py")
 
@@ -211,3 +221,23 @@ def mislabelled_twin() -> Path:
 @pytest.fixture
 def cwide() -> Path:
     return _fixture_path("placed", "square_cuda.py")
+
+
+@pytest.fixture(scope="module")
+def leaf_weights() -> Path:
+    return _fixture_path("placed", "leaf_weights.py")
+
+
+@pytest.fixture(scope="module")
+def square_cpu() -> Path:
+    return _fixture_path("placed", "square_cpu.py")
+
+
+@pytest.fixture(scope="module")
+def hir_composition() -> Path:
+    return _fixture_path("logical", "hir_composition.py")
+
+
+@pytest.fixture(scope="module")
+def specialize_through_call() -> Path:
+    return _fixture_path("placed", "specialize_through_call.py")

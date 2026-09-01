@@ -11,11 +11,9 @@ from dataclasses import replace
 
 import pytest
 
-from tilefoundry.analysis.preflight import validate_authored
 from tilefoundry.evaluator.dim import resolve_dim
 from tilefoundry.ir.core import Call, Constant, Tuple, TypeInferContext, Var
 from tilefoundry.ir.core.kinds import BinaryKind
-from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.tensor.slice import Slice, slice_size
 from tilefoundry.ir.types import DType, TupleType, make_shard_tensor_type, make_tensor_type
@@ -24,7 +22,7 @@ from tilefoundry.ir.types.dim_isl import normalize_dim
 from tilefoundry.ir.types.shard import ComposedLayout, Layout, make_mesh
 from tilefoundry.ir.types.shard.shard_layout import ShardLayout, Split, shard_layout_of
 from tilefoundry.visitor_registry.contexts import CostContext, TrafficBytes
-from tilefoundry.visitor_registry.visitors import CostEvaluator
+from tilefoundry.visitor_registry.visitors import CostEvaluator, TypeInferVisitor
 
 _F = DType.f32
 _M = make_mesh((4,))
@@ -48,7 +46,7 @@ def _slice_call(source, starts, sizes, strides, *, source_expr=None):
         target=Slice(sizes=sizes, strides=strides),
         args=(source_expr, starts_expr),
     )
-    return replace(call, type=TypeInferContext().type_of(call))
+    return replace(call, type=TypeInferVisitor().visit(call, TypeInferContext()))
 
 
 def _slice_type(source, starts, sizes, strides):
@@ -203,22 +201,12 @@ def test_fused_gqa_qkv_slices_keep_distribution_visible_to_consumers():
 
     add = Binary(kind=BinaryKind.ADD)
     q_used = Call(type=q.type, target=add, args=(q, q))
-    q_used = replace(q_used, type=TypeInferContext().type_of(q_used))
+    q_used = replace(q_used, type=TypeInferVisitor().visit(q_used, TypeInferContext()))
     kv_used = Call(type=k.type, target=add, args=(k, v))
-    kv_used = replace(kv_used, type=TypeInferContext().type_of(kv_used))
+    kv_used = replace(kv_used, type=TypeInferVisitor().visit(kv_used, TypeInferContext()))
 
     assert isinstance(q_used.type.layout, ShardLayout)
     assert isinstance(kv_used.type.layout, ShardLayout)
-    validate_authored(
-        (
-            Function.build(
-                name="consume_fused_qkv_views",
-                params=(source_expr,),
-                body=kv_used,
-                return_type=kv_used.type,
-            ),
-        )
-    )
 
 
 def test_slice_cost_charges_coordinates_but_not_the_view():
@@ -229,7 +217,7 @@ def test_slice_cost_charges_coordinates_but_not_the_view():
         (1, 1, 1, 1),
     )
 
-    cost = CostEvaluator(CostContext()).visit(call)
+    cost = CostEvaluator().visit(call, CostContext())
 
     assert cost.flops == {}
     assert cost.traffic == (
@@ -327,7 +315,7 @@ def _moved_reference(gu):
 def test_a_moved_window_reads_the_far_half_of_one_tensor():
     gu = torch.arange(2 * _HALF * _COLS, dtype=torch.float32).reshape(2 * _HALF, _COLS)
 
-    actual = evaluate(_MovedWindow.lookup("moved_copy"), gu, device="cpu")
+    actual = evaluate(_MovedWindow.lookup("moved_copy"), gu)
 
     torch.testing.assert_close(actual, _moved_reference(gu))
 

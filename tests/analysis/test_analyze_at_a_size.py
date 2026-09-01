@@ -1,9 +1,8 @@
-"""Analysing and scheduling a function authored for a range of sizes.
+"""Analysing a function authored for a range of sizes.
 
-An analysis counts elements and holds them against a machine; a solver lays
-work across a level by counting it. Neither has an answer for a dimension that
-is still a range, so the size is stated at the call and the program that gets
-measured is the one at that size.
+An analysis counts elements and holds them against a machine. It has no answer
+for a dimension that is still a range, so the size is stated at the call and the
+program that gets measured is the one at that size.
 
 What the call accepts stays narrow: a function this Module owns. Choosing the
 size happens after that, so nothing here widens which programs a Module will
@@ -34,8 +33,8 @@ from tilefoundry.analysis import (
 )
 from tilefoundry.analysis.compute_cost import _local_duration_ns
 from tilefoundry.analysis.errors import AnalysisError
-from tilefoundry.analysis.walk import describe, enclosing_trips, postorder
-from tilefoundry.ir.core import Call, get_metadata
+from tilefoundry.analysis.scope import build_scopes, walk_scopes
+from tilefoundry.ir.core import Call, describe_expr, get_metadata
 from tilefoundry.ir.core.metadata import ExecutionDomainMetadata
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.grid_region import GridRegionExpr
@@ -47,7 +46,7 @@ from tilefoundry.ir.hir.specialize import (
 from tilefoundry.ir.types.shard import (
     Topology,
 )
-from tilefoundry.schedule import ScheduleError, ScheduleOptions, schedule
+from tilefoundry.ir.visitor import collect_exprs
 from tilefoundry.target import CudaTarget, PerformanceServiceFacts, ThroughputFacts
 
 CONTEXT = 32
@@ -56,7 +55,6 @@ FAMILIES = ("compute-cost", "memory", "roofline", "performance")
 INVENTORY = [pytest.param(case, id=case.id) for case in placed_cases()]
 
 
-SOLVER = ScheduleOptions(timeout_seconds=60, workers=4, random_seed=0, stop_at_first_solution=True)
 
 
 def _aimed():
@@ -98,9 +96,9 @@ def assert_performance_contract(result: AnalysisResult) -> None:
     module_target = result.module.resolve_target()
     throughput = module_target.get_facts(ThroughputFacts)
     services = module_target.get_facts(PerformanceServiceFacts)
-    repeats = enclosing_trips(fn.body)
+    scopes = tuple(walk_scopes(build_scopes(result.module, fn)))
     timed = 0
-    for expr in postorder(fn.body):
+    for expr in collect_exprs(fn.body):
         if not isinstance(expr, Call) or isinstance(expr.target, Function):
             continue
         cost = get_metadata(expr, ComputeCostMetadata)
@@ -122,23 +120,38 @@ def assert_performance_contract(result: AnalysisResult) -> None:
         assert record.timeline.end_ns <= summary.timeline.end_ns
 
         span = record.timeline.end_ns - record.timeline.start_ns
-        assert span % duration == 0, describe(expr)
-        runs, available = span // duration, repeats.get(id(expr), 1)
-        assert 1 <= runs <= available and available % runs == 0, describe(expr)
+        assert span % duration == 0, describe_expr(expr)
+        runs = span // duration
+        available = 1
+        owner = next(
+            (
+                scope
+                for scope in scopes
+                if id(expr) in scope.accesses.get("narrow", {})
+            ),
+            None,
+        )
+        if owner is not None:
+            cursor = owner
+            while cursor.parent is not None:
+                if cursor.is_variant(expr):
+                    available *= max(1, cursor.trips())
+                cursor = cursor.parent
+        assert 1 <= runs <= available and available % runs == 0, describe_expr(expr)
         trips, stride = record.timeline.trips, record.timeline.stride_ns
-        assert 1 <= trips <= available and available % trips == 0, describe(expr)
-        assert (stride == 0) if trips == 1 else (stride >= span), describe(expr)
+        assert 1 <= trips <= available and available % trips == 0, describe_expr(expr)
+        assert (stride == 0) if trips == 1 else (stride >= span), describe_expr(expr)
         assert (
             record.timeline.end_ns + (trips - 1) * stride <= summary.timeline.end_ns
-        ), describe(expr)
+        ), describe_expr(expr)
     assert bool(timed) is bool(predicted_ns)
     _every_number_counts_something(result)
-    for expr in postorder(fn.body):
+    for expr in collect_exprs(fn.body):
         if not isinstance(expr, GridRegionExpr):
             continue
-        assert get_metadata(expr, PerformanceMetadata) is None, describe(expr)
-        assert get_metadata(expr, PerformanceSummaryMetadata) is None, describe(expr)
-        assert get_metadata(expr, LoopFootprintMetadata) is not None, describe(expr)
+        assert get_metadata(expr, PerformanceMetadata) is None, describe_expr(expr)
+        assert get_metadata(expr, PerformanceSummaryMetadata) is None, describe_expr(expr)
+        assert get_metadata(expr, LoopFootprintMetadata) is not None, describe_expr(expr)
 
 
 @pytest.mark.parametrize(
@@ -179,7 +192,7 @@ def _every_number_counts_something(result: AnalysisResult) -> None:
     added into a total that still looks plausible.
     """
     fn = result.function
-    for expr in (fn, *postorder(fn.body)):
+    for expr in (fn, *collect_exprs(fn.body)):
         for record, rows in (
             (ComputeCostMetadata, ("flops", "flops_per_unit", "service", "service_per_unit")),
             (TrafficMetadata, ()),
@@ -192,16 +205,16 @@ def _every_number_counts_something(result: AnalysisResult) -> None:
                 continue
             for field in rows:
                 for name, value in getattr(held, field):
-                    assert value >= 0, f"{describe(expr)}: {field}[{name}] = {value}"
+                    assert value >= 0, f"{describe_expr(expr)}: {field}[{name}] = {value}"
             if record is TrafficMetadata:
                 for field in ("whole", "per_unit"):
                     for level, moved in getattr(held, field):
                         assert moved.read >= 0 and moved.write >= 0, (
-                            f"{describe(expr)}: {field}[{level}] = {moved}"
+                            f"{describe_expr(expr)}: {field}[{level}] = {moved}"
                         )
                 for position, moved in enumerate(held.operands):
                     assert moved.read >= 0 and moved.write >= 0, (
-                        f"{describe(expr)}: operand {position} = {moved}"
+                        f"{describe_expr(expr)}: operand {position} = {moved}"
                     )
             if record is MemoryMetadata:
                 for level in held.footprint:
@@ -212,7 +225,7 @@ def _every_number_counts_something(result: AnalysisResult) -> None:
                 assert held.ideal_ns >= 0 and held.compute_ns >= 0 and held.memory_ns >= 0
             if record is PerformanceMetadata:
                 assert 0 <= held.timeline.start_ns <= held.timeline.end_ns
-    for expr in postorder(fn.body):
+    for expr in collect_exprs(fn.body):
         record = get_metadata(expr, LoopFootprintMetadata)
         if record is None:
             continue
@@ -236,8 +249,8 @@ def test_every_concrete_program_answers_for_where_it_runs(case: ConcreteCase) ->
     assert result.module is owner
     assert set(result.executed) == set(FAMILIES)
     undomained = [
-        describe(call)
-        for call in postorder(result.function.body)
+        describe_expr(call)
+        for call in collect_exprs(result.function.body)
         if isinstance(call, Call)
         and not isinstance(call.target, Function)
         and (get_metadata(call, ExecutionDomainMetadata) or ExecutionDomainMetadata())
@@ -353,21 +366,12 @@ def test_a_size_states_nothing_about_a_function_from_elsewhere() -> None:
 
 
 def test_the_entry_at_a_chosen_size_is_still_the_entry() -> None:
-    """The device-wide solver admits only the entry, and it decides that by name.
+    """Choosing a size does not rename the entry.
 
-    The device-wide solver admits only the entry, and it decides that by
-    name: a function specialised from the entry is a different object and the
-    same program.
+    A function specialised from the entry is a different object and the same
+    program, so anything that identifies the entry by name still finds it.
     """
     module = _aimed()
     variant = variant_for(module.entry_function(), DIMS)
 
     assert variant.name == module.entry_function().name
-    with pytest.raises(ScheduleError, match="requires the module entry"):
-        schedule(
-            module,
-            module.lookup("_ctx_partials"),
-            topology="cta",
-            options=SOLVER,
-            dims=DIMS,
-        )

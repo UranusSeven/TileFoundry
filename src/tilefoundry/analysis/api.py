@@ -15,15 +15,16 @@ from dataclasses import dataclass
 
 from tilefoundry.analysis.check import _resolve_program_geometry, check_program
 from tilefoundry.analysis.errors import AnalysisError
-from tilefoundry.analysis.preflight import validate_authored
 from tilefoundry.analysis.registry import Analyzer
 from tilefoundry.analysis.report import render_json, report_data
-from tilefoundry.analysis.walk import reachable_functions, values_of
+from tilefoundry.analysis.scope import ScopeBuilder
+from tilefoundry.analysis.visitor import AnalyzeContext
 from tilefoundry.dump import DumpFlags, dump
 from tilefoundry.ir.core import IRMetadata
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.specialize import SpecializationError
+from tilefoundry.ir.visitor import function_values
 from tilefoundry.target import Target, UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 
@@ -151,15 +152,16 @@ def analyze(
     closure = _closure(target, roots)
 
     function = check_program(module, function, level=level, analyzers=closure)
-    functions = reachable_functions(function)
-    validate_authored(functions)
+    functions = (function,)
+    scope = ScopeBuilder(module, function).build()
+    context = AnalyzeContext(module, target, level, options, root=scope, current=scope)
 
     order: list[type[IRMetadata]] = []
     written_records: set[tuple[int, type]] = set()
     for algorithm in closure:
         before = _metadata_snapshot(functions)
         try:
-            algorithm.run(module, function, target, level, options)
+            algorithm.run(function, context)
         except UnsupportedCapabilityError as error:
             raise AnalysisError(f"{algorithm.selector}: {error}") from None
         after = _metadata_snapshot(functions)
@@ -214,7 +216,7 @@ def _metadata_snapshot(
     """
     snapshot: dict[tuple[int, type], int] = {}
     for fn in functions:
-        for expr in values_of(fn):
+        for expr in function_values(fn):
             for item in expr.metadata:
                 snapshot[(id(expr), type(item))] = id(item)
     return snapshot

@@ -23,7 +23,7 @@ CASES = contract.model_cases(MODEL)
 ANALYSED = [
     pytest.param(case, selected, id=selected.id) for case in CASES for selected in case.analyze
 ]
-JSON_CASES = [pytest.param(case, case.schedule[0], id=case.id) for case in CASES]
+JSON_CASES = [pytest.param(case, case.analyze[0], id=case.id) for case in CASES]
 SIZED = [pytest.param(case, sized, id=sized.id) for case in CASES for sized in case.sized]
 
 
@@ -116,7 +116,7 @@ def test_the_decode_step_and_the_cache_entry_it_hands_back(
         case,
         "self_attention",
         activations=drawn.args,
-        weights=drawn.loaded.constants,
+        weights={name: drawn.loaded.resource.load(name) for name in drawn.loaded.module.weights},
         expected=(want_attention, entry_k, entry_v),
         held=(contract.one_rounding(want_attention), *entry),
         dims={"ctx_len": ctx_len},
@@ -130,7 +130,7 @@ def test_the_decode_step_and_the_cache_entry_it_hands_back(
         case,
         "decoder_layer",
         activations=drawn.args,
-        weights=drawn.loaded.constants,
+        weights={name: drawn.loaded.resource.load(name) for name in drawn.loaded.module.weights},
         expected=(want_out, entry_k, entry_v),
         held=(contract.one_rounding(want_out), *entry),
         dims={"ctx_len": ctx_len},
@@ -152,7 +152,7 @@ def test_the_placed_mlp_matches_the_reference(tf, shipped_source, tmp_path) -> N
         CASES[0],
         "placed_mlp",
         activations=(drawn.hidden_new,),
-        weights=drawn.loaded.constants,
+        weights={name: drawn.loaded.resource.load(name) for name in drawn.loaded.module.weights},
         expected=(want,),
         held=(contract.one_rounding(want),),
     )

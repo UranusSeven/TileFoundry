@@ -101,13 +101,14 @@ dispatch is described in
 
 ```python
 def local_type_of(
-    type: Type, *, level: str, topologies: tuple[Topology, ...]
+    type: Type, *, level: str | None = None, topologies: tuple[Topology, ...] = ()
 ) -> Type:
-    """Project every tensor leaf to what one unit of a topology level holds.
+    """Project every tensor leaf to what one unit holds.
 
     Args:
         type: Type to project.
-        level: Topology level whose unit is being projected.
+        level: Topology level whose unit is being projected. When omitted,
+            every Split divides and the logical rank is preserved.
         topologies: Ordered declared topology levels with resolved extents.
 
     Returns:
@@ -117,10 +118,12 @@ def local_type_of(
 ```
 
 - constraints:
-  - `local_type_of` MUST recursively project every tensor leaf and rebuild
-    `TupleType` structure.
-  - A `Split` at `level` or a coarser topology level MUST divide; a finer
-    `Split`, `Broadcast`, and `Partial` MUST NOT divide.
+  - With `level`, `local_type_of` MUST recursively project every tensor leaf and
+    rebuild `TupleType` structure. A `Split` at `level` or a coarser topology
+    level MUST divide; a finer `Split`, `Broadcast`, and `Partial` MUST NOT.
+  - Without `level`, every `Split` MUST divide, the returned tensor layout MUST
+    be `None`, and the tensor's logical rank MUST remain unchanged. This form
+    is the logical-axis projection used by relation construction.
   - Each resolved nested `ShardLayout` MUST be applied exactly once per layer.
     Every mesh axis MUST state its own extent, and local projection MUST use
     that extent without substituting a target or topology capacity. A stated
@@ -132,7 +135,7 @@ def local_type_of(
     rather than assign one of its layout axes to a guessed level
     ([shard §5](./shard.md#5-mesh)).
   - The result MUST remain an ordinary IR Type and MUST NOT introduce a
-    schedule-specific tensor type.
+    consumer-specific tensor type.
   - Unresolved layouts and local extents that are not concrete non-negative
     integers MUST raise at the projection boundary.
 
@@ -160,6 +163,10 @@ def tensor_bytes(type: Type) -> int:
         The logical byte size.
     """
     ...
+
+def tensor_types(type: Type) -> tuple[TensorType, ...]: ...
+def bytes_by_storage(type: Type, *, umat_level: str | None = None) -> dict[str, int]: ...
+def topology_extent(type: Type, name: str) -> int | None: ...
 ```
 
 - constraints:
@@ -172,6 +179,13 @@ def tensor_bytes(type: Type) -> int:
     because a leaf is addressed on its own.
   - These MUST be the logical size the type states, so they MUST be the same
     number for every backend and MUST NOT live in a target package.
+  - `tensor_types` MUST return those same tensor leaves in tuple field order.
+  - `bytes_by_storage` MUST group their logical bytes by storage name. A `UMAT`
+    leaf contributes nothing unless the caller supplies the level where it is
+    materialized.
+  - `topology_extent` MUST return the one positive static layout size stated for
+    `name`, `None` when no leaf states it, and reject a multi-topology layout or
+    conflicting extents rather than choose one.
 
 ### `StorageKind` and `resolve_storage`
 
@@ -699,4 +713,4 @@ TensorType.umat_tensor(shape, dtype)   # ranked: a shape vector
     equal to `umat_tensor`.
   - An operand carrying `UMAT` MUST NOT be charged to a memory level by the
     residency of its own type alone; what charges it is where it is consumed
-    ([analysis §2.2.1](./analysis.md#221-compute-cost)).
+    ([analysis §1.2.1](./analysis.md#121-compute-cost)).

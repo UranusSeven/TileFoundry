@@ -17,7 +17,60 @@ from .shard import (
     level_axes,
     shard_layout_of,
 )
+from .shard.layout_algebra import size
+from .shard.shard_layout import split_target_axes
 from .tensor_type import TensorType, TupleType, Type
+
+
+def types_compatible(declared: Type, actual: Type) -> bool:
+    """Return whether *actual* may bind a position declared as *declared*.
+
+    Every non-``None`` declared field constrains the corresponding actual
+    field. ``UMAT`` is the storage field's undecided value. Layout descriptors
+    apply the same rule recursively.
+    """
+    def field_compatible(declared_field, actual_field) -> bool:
+        return declared_field is None or declared_field == actual_field
+
+    def layout_compatible(declared_layout, actual_layout) -> bool:
+        if declared_layout is None:
+            return True
+        if isinstance(declared_layout, Layout):
+            return (
+                isinstance(actual_layout, Layout)
+                and field_compatible(declared_layout.shape, actual_layout.shape)
+                and field_compatible(declared_layout.strides, actual_layout.strides)
+            )
+        if isinstance(declared_layout, ShardLayout):
+            return (
+                isinstance(actual_layout, ShardLayout)
+                and field_compatible(declared_layout.mesh, actual_layout.mesh)
+                and field_compatible(declared_layout.attrs, actual_layout.attrs)
+                and layout_compatible(declared_layout.layout, actual_layout.layout)
+            )
+        return actual_layout == declared_layout
+
+    if isinstance(declared, TensorType):
+        return (
+            isinstance(actual, TensorType)
+            and declared.shape == actual.shape
+            and declared.dtype == actual.dtype
+            and (
+                declared.storage is StorageKind.UMAT
+                or declared.storage == actual.storage
+            )
+            and layout_compatible(declared.layout, actual.layout)
+        )
+    if isinstance(declared, TupleType):
+        return (
+            isinstance(actual, TupleType)
+            and len(declared.fields) == len(actual.fields)
+            and all(
+                types_compatible(declared_field, actual_field)
+                for declared_field, actual_field in zip(declared.fields, actual.fields)
+            )
+        )
+    return actual == declared
 
 
 def numel(type: Type) -> int:
@@ -27,22 +80,22 @@ def numel(type: Type) -> int:
     silently drops a dimension reads as a smaller tensor, not as an unknown
     one. A concrete zero extent is a zero-sized tensor.
     """
-    if isinstance(type, TensorType):
-        values = []
-        for dim in type.shape:
-            if not isinstance(dim, int) or isinstance(dim, bool):
-                from .substitute import dim_vars_by_name  # noqa: PLC0415
+    return sum(_leaf_numel(leaf) for leaf in tensor_types(type))
 
-                names = dim_vars_by_name(dim)
-                hint = f"; bind it with --dim {next(iter(names))}=EXTENT" if names else ""
-                raise ValueError(f"numel: tensor extent {dim!r} is not concrete{hint}")
-            if dim < 0:
-                raise ValueError(f"numel: tensor extent {dim} is negative")
-            values.append(dim)
-        return math.prod(values)
-    if isinstance(type, TupleType):
-        return sum(numel(field) for field in type.fields)
-    return 0
+
+def _leaf_numel(type: TensorType) -> int:
+    values = []
+    for dim in type.shape:
+        if not isinstance(dim, int) or isinstance(dim, bool):
+            from .substitute import dim_vars_by_name  # noqa: PLC0415
+
+            names = dim_vars_by_name(dim)
+            hint = f"; bind it with --dim {next(iter(names))}=EXTENT" if names else ""
+            raise ValueError(f"numel: tensor extent {dim!r} is not concrete{hint}")
+        if dim < 0:
+            raise ValueError(f"numel: tensor extent {dim} is negative")
+        values.append(dim)
+    return math.prod(values)
 
 
 def tensor_bytes(type: Type) -> int:
@@ -52,11 +105,58 @@ def tensor_bytes(type: Type) -> int:
     every backend. A sub-byte dtype rounds up to whole bytes per leaf, because
     a leaf is addressed on its own.
     """
+    return sum(
+        math.ceil(_leaf_numel(leaf) * leaf.dtype.bit_width / 8)
+        for leaf in tensor_types(type)
+    )
+
+
+def tensor_types(type: Type) -> tuple[TensorType, ...]:
+    """The tensor leaves of *type*, flattened out of tuple nesting."""
     if isinstance(type, TensorType):
-        return math.ceil(numel(type) * type.dtype.bit_width / 8)
+        return (type,)
     if isinstance(type, TupleType):
-        return sum(tensor_bytes(field) for field in type.fields)
-    return 0
+        return tuple(leaf for field in type.fields for leaf in tensor_types(field))
+    return ()
+
+
+def bytes_by_storage(
+    type: Type, *, umat_level: str | None = None
+) -> dict[str, int]:
+    """Logical bytes occupied by *type*, grouped by storage level."""
+    result: dict[str, int] = {}
+    for tensor in tensor_types(type):
+        if tensor.storage is StorageKind.UMAT:
+            if umat_level is None:
+                continue
+            level = umat_level
+        else:
+            level = str(tensor.storage)
+        result[level] = result.get(level, 0) + tensor_bytes(tensor)
+    return result
+
+
+def topology_extent(type: Type, name: str) -> int | None:
+    """The one logical extent *type* states for topology *name*, if any."""
+    extents: set[int] = set()
+    for tensor in tensor_types(type):
+        layout = shard_layout_of(tensor.layout)
+        if layout is None:
+            continue
+        names = tuple(topology.name for topology in layout.mesh.topologies)
+        if len(names) != 1 or names[0] != name:
+            continue
+        count = size(layout.mesh.layout)
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            raise ValueError(
+                f"topology_extent: {name!r} needs a positive static layout size"
+            )
+        extents.add(count)
+    if len(extents) > 1:
+        raise ValueError(
+            f"one value references conflicting {name!r} extents {sorted(extents)}"
+        )
+    return next(iter(extents), None)
 
 
 def make_tensor_type(
@@ -91,14 +191,46 @@ def make_shard_tensor_type(
     return TensorType(shape=shape, dtype=dtype, layout=layout, storage=storage)
 
 
-def local_type_of(type: Type, *, level: str, topologies: tuple[Topology, ...]) -> Type:
-    """Project every tensor leaf to what one unit of *level* holds.
+def local_type_of(
+    type: Type, *, level: str | None = None, topologies: tuple[Topology, ...] = ()
+) -> Type:
+    """Project every tensor leaf to what one unit holds.
 
-    A ``Split`` at *level* or a coarser declared level divides. Finer splits do
-    not change what the containing unit holds, while ``Broadcast`` and
-    ``Partial`` never divide. ``topologies`` supplies the ordered hierarchy and
-    concrete extents.
+    With ``level``: a ``Split`` at that level or coarser divides, while finer
+    splits, ``Broadcast``, and ``Partial`` do not; logical axes may factor into
+    layout positions, and ``topologies`` supplies the ordered hierarchy.
+    Without ``level``: every ``Split`` divides, the layout is dropped, and the
+    logical rank is preserved. This form is for relations over logical axes,
+    where factoring an axis into layout positions would lose the modeled flow.
     """
+    if level is None:
+        if not isinstance(type, TensorType):
+            return type
+        layout = shard_layout_of(type.layout)
+        if layout is None:
+            return type
+        local = list(type.shape)
+        for mesh_axis, tensor_axis in enumerate(split_target_axes(layout, type.shape)):
+            if tensor_axis is None:
+                continue
+            extent = layout.mesh.layout.shape[mesh_axis]
+            if extent is None:
+                local[tensor_axis] = 1
+                continue
+            size = local[tensor_axis]
+            if not isinstance(size, int) or isinstance(size, bool):
+                raise ValueError(
+                    f"tensor axis {tensor_axis} is Split-sharded but its extent "
+                    f"{size!r} is not a static int"
+                )
+            if size % extent != 0:
+                raise ValueError(
+                    f"tensor axis {tensor_axis} (extent {size}) is not evenly "
+                    f"divisible by its mesh extent {extent}"
+                )
+            local[tensor_axis] = size // extent
+        return TensorType(shape=tuple(local), dtype=type.dtype, layout=None, storage=type.storage)
+
     levels = {topology.name: index for index, topology in enumerate(topologies)}
     if level not in levels:
         available = ", ".join(levels) or "none"

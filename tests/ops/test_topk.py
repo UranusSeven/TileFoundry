@@ -76,10 +76,10 @@ def test_topk_typeinfer(case):
 def _run_topk(x: torch.Tensor, **attrs):
     param = Var(type=make_tensor_type(tuple(x.shape), DType.f32), name="x")
     call = Call(type=param.type, target=TopK(**attrs), args=(param,))
-    result_type = TypeInferVisitor(TypeInferContext()).visit(call)
+    result_type = TypeInferVisitor().visit(call, TypeInferContext())
     call = replace(call, type=result_type)
     fn = Function.build(name="topk_case", params=(param,), body=call, return_type=result_type)
-    return evaluate(fn, x, device="cpu")
+    return evaluate(fn, x)
 
 
 def test_topk_unsorted_selects_same_set():
@@ -192,7 +192,7 @@ def _build_topk_fn(x_shape, k, *, axis: int = -1) -> tuple[Function, "TupleType"
     """
     x = Var(type=make_tensor_type(x_shape, _F32), name="x")
     call = Call(type=x.type, target=TopK(k=k, axis=axis), args=(x,))
-    result_type = TypeInferVisitor(TypeInferContext()).visit(call)
+    result_type = TypeInferVisitor().visit(call, TypeInferContext())
     call = replace(call, type=result_type)
     fn = Function.build(name="topk_dyn_k", params=(x,), body=call, return_type=result_type)
     return fn, result_type
@@ -240,7 +240,7 @@ def test_topk_dynamic_k_evaluates_at_two_ctx_bindings():
     torch.manual_seed(0)
     for pos, expected_k in ((100, 25), (4096, 512)):
         scores = torch.randn(4, pos)
-        vals, idx = evaluate(fn, scores, device="cpu")
+        vals, idx = evaluate(fn, scores)
         assert vals.shape == (4, expected_k)
         assert idx.shape == (4, expected_k)
         ref_v, ref_i = torch.topk(scores, expected_k, dim=-1, largest=True, sorted=True)
@@ -261,19 +261,19 @@ def test_topk_dynamic_k_downstream_index_select_shape_consistent():
     table = Var(type=make_tensor_type((POS, _D), _F32), name="table")
 
     topk_call = Call(type=scores.type, target=TopK(k=K, axis=-1), args=(scores,))
-    topk_ty = TypeInferVisitor(TypeInferContext()).visit(topk_call)
+    topk_ty = TypeInferVisitor().visit(topk_call, TypeInferContext())
     topk_call = replace(topk_call, type=topk_ty)
 
     idx_call = Call(type=topk_ty.fields[1], target=TupleGetItem(index=1), args=(topk_call,))
-    idx_ty = TypeInferVisitor(TypeInferContext()).visit(idx_call)
+    idx_ty = TypeInferVisitor().visit(idx_call, TypeInferContext())
     idx_call = replace(idx_call, type=idx_ty)
 
     flat_index = Call(type=idx_ty, target=Reshape(new_shape=(K,)), args=(idx_call,))
-    flat_index_ty = TypeInferVisitor(TypeInferContext()).visit(flat_index)
+    flat_index_ty = TypeInferVisitor().visit(flat_index, TypeInferContext())
     flat_index = replace(flat_index, type=flat_index_ty)
 
     selected = Call(type=idx_ty, target=IndexSelect(dim=0), args=(table, flat_index))
-    selected_ty = TypeInferVisitor(TypeInferContext()).visit(selected)
+    selected_ty = TypeInferVisitor().visit(selected, TypeInferContext())
     assert selected_ty.shape == (K, _D)
     selected = replace(selected, type=selected_ty)
 
@@ -282,7 +282,7 @@ def test_topk_dynamic_k_downstream_index_select_shape_consistent():
         target=Reshape(new_shape=(1, K, _D)),
         args=(selected,),
     )
-    output_ty = TypeInferVisitor(TypeInferContext()).visit(output)
+    output_ty = TypeInferVisitor().visit(output, TypeInferContext())
     assert output_ty.shape == (1, K, _D)
     output = replace(output, type=output_ty)
 
@@ -297,7 +297,7 @@ def test_topk_dynamic_k_downstream_index_select_shape_consistent():
     for pos, expected_k in ((100, 25), (4096, 512)):
         scores_data = torch.randn(1, pos)
         table_data = torch.randn(pos, _D)
-        out = evaluate(fn, scores_data, table_data, device="cpu")
+        out = evaluate(fn, scores_data, table_data)
         assert out.shape == (1, expected_k, _D)
         _, ref_idx = torch.topk(scores_data, expected_k, dim=-1, largest=True, sorted=True)
         ref_out = table_data.index_select(0, ref_idx.reshape(-1)).reshape(1, expected_k, _D)
