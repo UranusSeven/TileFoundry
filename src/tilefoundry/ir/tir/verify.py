@@ -11,7 +11,7 @@ from typing import Iterable
 
 from tilefoundry.ir.core import Expr, Var, VerifyError
 from tilefoundry.ir.core.expr import Call, Constant
-from tilefoundry.ir.core.pattern import DimVarRangePat
+from tilefoundry.ir.core.pattern import DimVarRangePat, locate_dim_var
 from tilefoundry.ir.hir.function import (
     Function as HirFunction,
 )
@@ -40,13 +40,11 @@ from tilefoundry.utils.spec_ref import spec_ref_render
 from tilefoundry.visitor_registry import verify_stmt_registry
 from tilefoundry.visitor_registry.contexts import VerifyContext
 
-from .dispatch import DispatchCall
 from .launch import Launch
 from .memory import AllocTensor as AllocTensorOp
 from .prim_function import PrimFunction
 from .shape import ShapeOf, is_hidden_shape_scalar, is_shape_scalar, parse_shape_var_name
 from .stmts import (
-    Abort,
     Evaluate,
     For,
     If,
@@ -64,6 +62,18 @@ _PRIM_FUNCTION = "[tir §1.3](docs/spec/tir.md#13-primfunction)"
 def verify_prim_function(fn: PrimFunction, *, module_fns: Iterable[PrimFunction] = ()) -> None:
     """Per [tir §1.3](docs/spec/tir.md#13-primfunction)'s rule list."""
     _check_param_homogeneity(fn)
+    if fn.variants:
+        for variant in fn.variants:
+            if len(variant.specializations) != 1 or not isinstance(variant.specializations[0], DimVarRangePat):
+                raise VerifyError(
+                    f"PrimFunction {fn.name!r}: each variant must have one DimVarRangePat"
+                )
+            pat = variant.specializations[0]
+            if locate_dim_var(fn.params, pat.dim_var) is None:
+                raise VerifyError(
+                    f"PrimFunction {fn.name!r}: specialization subject {pat.dim_var!r} "
+                    "cannot be derived from parameters"
+                )
     ctx = VerifyContext()
     scope: list[Mesh] = []
 
@@ -150,10 +160,7 @@ def _walk_stmt(stmt, ctx, scope, fn, module_fn_map, bound_var_ids: set[int]):
             _walk_stmt(stmt.body, ctx, scope, fn, module_fn_map, bound_var_ids)
             scope.pop()
             return
-        case Return() | Abort():
-            return
-        case DispatchCall():
-            _verify_dispatch_call(stmt, fn, module_fn_map, ctx)
+        case Return():
             return
         case Evaluate():
             if isinstance(stmt.callable, Launch):
@@ -282,67 +289,6 @@ def _verify_shape_of(expr: ShapeOf) -> None:
     expected = TensorType.scalar(dtype=DType.i32, storage=StorageKind.RMEM)
     if expr.type != expected:
         raise VerifyError(f"ShapeOf.type must be rank-0 i32 scalar TensorType, got {expr.type}")
-
-
-def _verify_dispatch_call(stmt: DispatchCall, fn, module_fn_map, ctx):
-    if len(stmt.subjects) != 1:
-        raise VerifyError(f"DispatchCall: v0 requires len(subjects) == 1, got {len(stmt.subjects)}")
-    subject = stmt.subjects[0]
-    if not isinstance(subject, ShapeOf):
-        raise VerifyError(
-            f"DispatchCall: v0 dispatch subject must be ShapeOf(param, axis), "
-            f"got {type(subject).__name__}"
-        )
-    _verify_shape_of(subject)
-
-    if not any(subject.param is p for p in fn.params):
-        raise VerifyError(
-            f"DispatchCall: subject ShapeOf.param {subject.param.name!r} is not "
-            f"one of the enclosing PrimFunction params"
-        )
-    pty = subject.param.type
-    if not isinstance(pty, TensorType):
-        raise VerifyError(
-            f"DispatchCall: subject ShapeOf.param {subject.param.name!r} must "
-            f"have TensorType, got {type(pty).__name__}"
-        )
-    if subject.axis >= len(pty.shape):
-        raise VerifyError(
-            f"DispatchCall: subject ShapeOf.axis {subject.axis} is out of "
-            f"rank for param {subject.param.name!r} (rank={len(pty.shape)})"
-        )
-    if len(stmt.case_patterns) != len(stmt.case_calls):
-        raise VerifyError(
-            f"DispatchCall: len(case_patterns) {len(stmt.case_patterns)} != "
-            f"len(case_calls) {len(stmt.case_calls)}"
-        )
-    for i, pats in enumerate(stmt.case_patterns):
-        if len(pats) != len(stmt.subjects):
-            raise VerifyError(
-                f"DispatchCall: case_patterns[{i}] length {len(pats)} != "
-                f"len(subjects) {len(stmt.subjects)}"
-            )
-        if not isinstance(pats[0], DimVarRangePat):
-            raise VerifyError(
-                f"DispatchCall: case_patterns[{i}][0] must be DimVarRangePat, "
-                f"got {type(pats[0]).__name__}"
-            )
-    if not (
-        isinstance(stmt.fallback, Sequential)
-        and len(stmt.fallback.body) == 1
-        and isinstance(stmt.fallback.body[0], Abort)
-    ):
-        raise VerifyError("DispatchCall: v0 fallback must be Sequential((Abort(),))")
-    for call in stmt.case_calls:
-        if not (isinstance(call, Evaluate) and isinstance(call.callable, SymbolRef)):
-            inner = (
-                f" (callable={type(call.callable).__name__})" if isinstance(call, Evaluate) else ""
-            )
-            raise VerifyError(
-                "DispatchCall: each case call must be Evaluate(SymbolRef, args), "
-                f"got {type(call).__name__}{inner}"
-            )
-        _verify_symbol_call(call, fn, module_fn_map, ctx)
 
 
 def _resolve_symbol_ref(name, module_fn_map):
@@ -577,9 +523,6 @@ def _iter_all_stmts(body):
         elif isinstance(s, If):
             stack.append(s.then_body)
             stack.append(s.else_body)
-        elif isinstance(s, DispatchCall):
-            stack.extend(s.case_calls)
-            stack.append(s.fallback)
 
 
 def verify_module(fns) -> None:
@@ -593,6 +536,9 @@ def verify_module(fns) -> None:
     it carries variants).
     """
     prim_fns = [f for f in fns if isinstance(f, PrimFunction)]
+    prim_fns_with_variants = [
+        variant for f in prim_fns for variant in (f, *f.variants)
+    ]
     for f in fns:
         if isinstance(f, HirFunction):
             verify_function(f)
@@ -608,7 +554,7 @@ def verify_module(fns) -> None:
                     f"module function must be callable"
                 )
         elif isinstance(f, PrimFunction):
-            verify_prim_function(f, module_fns=prim_fns)
+            verify_prim_function(f, module_fns=prim_fns_with_variants)
         else:
             raise VerifyError(f"verify_module: unknown function type {type(f).__name__}")
 

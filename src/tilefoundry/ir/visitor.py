@@ -16,12 +16,10 @@ from typing import Any, Callable
 from tilefoundry.ir.core import Call, Constant, Expr, Tuple, Var
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.tir.dispatch import DispatchCall
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.tir.stmts import (
-    Abort,
     Evaluate,
     For,
     If,
@@ -133,10 +131,7 @@ def _stmt_children(stmt: Stmt) -> tuple[Stmt, ...]:
             return (body,)
         case If(then_body=then_body, else_body=else_body):
             return (then_body, else_body)
-        case DispatchCall(case_calls=case_calls, fallback=fallback):
-            return (*case_calls, fallback)
-
-        case Return() | Evaluate() | Abort():
+        case Return() | Evaluate():
             return ()
         case _:
             raise AssertionError(f"_stmt_children: unknown Stmt subclass {type(stmt).__name__}")
@@ -156,17 +151,7 @@ def _rebuild_stmt_children(stmt: Stmt, new_children: tuple[Stmt, ...]) -> Stmt:
             assert isinstance(then_body, Sequential)
             assert isinstance(else_body, Sequential)
             return replace(stmt, then_body=then_body, else_body=else_body)
-        case DispatchCall():
-            *new_case_calls, new_fallback = new_children
-            for nc in new_case_calls:
-                assert isinstance(nc, Evaluate)
-            assert isinstance(new_fallback, Sequential)
-            return replace(
-                stmt,
-                case_calls=tuple(new_case_calls),
-                fallback=new_fallback,
-            )
-        case Return() | Evaluate() | Abort():
+        case Return() | Evaluate():
             return stmt
         case _:
             raise AssertionError(

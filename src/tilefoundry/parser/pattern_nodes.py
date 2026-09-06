@@ -28,6 +28,7 @@ from tilefoundry.ir.core import (
     attach_metadata,
     get_metadata,
 )
+from tilefoundry.ir.core.pattern import _mangle_variant_name
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.tir.launch import launch_call
 from tilefoundry.ir.types import TensorType
@@ -3882,7 +3883,9 @@ class LoopHeaderPattern(ElementPattern):
         children.extend(
             AstChild(
                 field_name,
-                StaticValuePattern(),
+                ChoicePattern(ExpressionPattern(), StaticValuePattern())
+                if context.function is not None and context.function.dialect == "tir"
+                else StaticValuePattern(),
                 argument,
                 "loop_bound",
                 field_name,
@@ -3905,8 +3908,17 @@ class LoopHeaderPattern(ElementPattern):
 
     @staticmethod
     def construct(match, children, context):
+        if context.function is not None and context.function.dialect == "tir":
+            iv = runtime.Var(type=runtime.TensorType.scalar(runtime.DType.i64), name=match.captures["target"])
+            values = dict(match.captures["defaults"])
+            values.update({name: value for name, value in children.items() if name != "carry"})
+            bounds = [values[name] for name in ("start", "extent", "step")]
+            bounds = [_constant(v) if isinstance(v, (bool, int, float)) else v for v in bounds]
+            context.lexical_scope.push_frame()
+            context.lexical_scope.define(match.captures["target"], iv)
+            return (iv, *bounds)
         if context.function is None or context.function.dialect != "hir":
-            raise ParseError.from_node(match.node, context, "loops require HIR context")
+            raise ParseError.from_node(match.node, context, "HIR loop header in a non-HIR context")
         values = dict(match.captures["defaults"])
         values.update((name, value) for name, value in children.items() if name != "carry")
         try:
@@ -3999,29 +4011,24 @@ class LoopBodyPattern(ElementPattern):
 class ForPattern(ElementPattern):
     element_name = "for"
     syntax = LazyPattern(
-        lambda: BranchPattern(
-            "loop",
-            AstNodePattern(
-                ast.For,
-                ChildPattern("header", LoopHeaderPattern(), "loop_header"),
-                FieldPattern(
-                    "body",
-                    ChildPattern(
-                        "body",
-                        LoopBodyPattern(),
-                        "loop_body",
-                        transform=_body_as_ast_module,
-                    ),
-                ),
-            ),
-            pattern_id="statement.for",
-        )
+        lambda: BranchPattern("loop", AstNodePattern(
+            ast.For,
+            ChildPattern("header", LoopHeaderPattern(), "loop_header"),
+            FieldPattern("body", ChildPattern("body", ChoicePattern(
+                ConditionPattern("tir loop body", lambda node, context: context.function is not None and context.function.dialect == "tir", BlockPattern()),
+                ConditionPattern("hir loop body", lambda node, context: context.function is None or context.function.dialect == "hir", LoopBodyPattern()),
+            ), "loop_body", transform=_body_as_ast_module)),
+        ), pattern_id="statement.for")
     )
 
     @staticmethod
     def construct(match, children, context):
         frame = children["header"]
         body = children["body"]
+        if context.function is not None and context.function.dialect == "tir":
+            context.lexical_scope.pop_frame()
+            induction_var, start, stop, step = frame
+            return runtime.For(induction_var, start, stop, step, body)
         yield_values = tuple(context.lexical_scope.lookup(name) for name in frame.carry_names)
         context.lexical_scope.pop_frame()
         if frame.carry_names:
@@ -4047,6 +4054,86 @@ class ForPattern(ElementPattern):
         return grid
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
+
+
+@dataclass(frozen=True)
+class TirOnlyStatementRule:
+    STATEMENT: ClassVar[str] = "A TIR-only statement must appear in a prim_func."
+
+    def apply(self, value, *, match, context):
+        if context.function is None or context.function.dialect != "tir":
+            raise ParseError.from_node(
+                match.node, context,
+                f"{match.element_name} is a TIR statement; HIR does not support it",
+            )
+        return value
+
+
+class IfPattern(ElementPattern):
+    element_name = "if"
+    syntax = LazyPattern(
+        lambda: BranchPattern(
+            "if",
+            AstNodePattern(
+                ast.If,
+                CapturePattern("cond_node", lambda node, context: node.test),
+                FieldPattern("body", ChildPattern("then", BlockPattern(), "block", transform=_body_as_ast_module)),
+                FieldPattern(
+                    "orelse",
+                    OptionalPattern(ChildPattern("else", BlockPattern(), "block", transform=_body_as_ast_module)),
+                ),
+            ),
+            pattern_id="statement.if",
+        )
+    )
+
+    @staticmethod
+    def construct(match, children, context):
+        return runtime.If(
+            _tir_scalar_expr(match.captures["cond_node"], context),
+            children["then"],
+            children.get("else", runtime.Sequential(body=())),
+        )
+
+    RULES: ClassVar[tuple[AstRule[Any], ...]] = (TirOnlyStatementRule(),)
+
+class WhilePattern(ElementPattern):
+    element_name = "while"
+    syntax = LazyPattern(lambda: BranchPattern("while", AstNodePattern(
+        ast.While,
+        CapturePattern("cond_node", lambda node, context: node.test),
+        FieldPattern("body", ChildPattern("body", BlockPattern(), "block", transform=_body_as_ast_module)),
+    ), pattern_id="statement.while"))
+
+    @staticmethod
+    def construct(match, children, context):
+        return runtime.While(_tir_scalar_expr(match.captures["cond_node"], context), children["body"])
+
+    RULES: ClassVar[tuple[AstRule[Any], ...]] = (TirOnlyStatementRule(),)
+
+
+def _tir_scalar_expr(node: ast.expr, context):
+    if isinstance(node, ast.Name):
+        value = context.lexical_scope.lookup(node.id)
+        if isinstance(value, runtime.Expr):
+            return value
+    if isinstance(node, ast.Constant) and isinstance(node.value, (bool, int)):
+        return _constant(node.value)
+    if isinstance(node, ast.Compare) and len(node.ops) == 1 and len(node.comparators) == 1:
+        kind = _EXPR_BINARY_KINDS.get(type(node.ops[0]))
+        if kind is not None:
+            lhs = _tir_scalar_expr(node.left, context)
+            rhs = _tir_scalar_expr(node.comparators[0], context)
+            return runtime.Call(
+                type=runtime.TensorType.scalar(runtime.DType.bool),
+                target=runtime.Binary(kind=runtime.BinaryKind[kind]),
+                args=(lhs, rhs),
+            )
+    raise ParseError.from_node(
+        node,
+        context,
+        "TIR if predicate must be an integer/bool constant, scalar variable, or supported comparison",
+    )
 
 
 class TupleAssignmentPattern(ElementPattern):
@@ -4148,6 +4235,8 @@ class StatementPattern(ElementPattern):
     element_name = "statement"
     syntax = LazyPattern(
         lambda: ChoicePattern(
+            IfPattern(),
+            WhilePattern(),
             ForPattern(),
             WithPattern(),
             TupleAssignmentPattern(),
@@ -4438,7 +4527,7 @@ class FunctionDialectRule:
         kind = context.function.function_kind
         if context.function.dialect == "hir" and kind == "prim_func":
             raise ParseError.from_node(match.node, context, "prim_func requires tir dialect")
-        if context.function.dialect == "tir" and kind != "prim_func":
+        if context.function.dialect == "tir" and kind != "prim_func" and context.function.role is not FunctionRole.VARIANT:
             raise ParseError.from_node(match.node, context, f"{kind} requires hir dialect")
         expected = runtime.Function if context.function.dialect == "hir" else runtime.PrimFunction
         if not isinstance(value, expected):
@@ -4520,8 +4609,9 @@ class FunctionRoleValidationRule:
         if function_context.role is FunctionRole.ROOT:
             return
         base = function_context.base
-        if not isinstance(base, runtime.Function):
-            raise ParseError.from_node(node, match_context, "standalone role lacks a HIR base")
+        expected_base = runtime.Function if function_context.dialect == "hir" else runtime.PrimFunction
+        if not isinstance(base, expected_base):
+            raise ParseError.from_node(node, match_context, "standalone role lacks a matching base")
         if getattr(base, "_sealed", False):
             raise ParseError.from_node(node, match_context, f"base {base.name!r} is sealed")
         if getattr(function, "body", None) is None:
@@ -4682,7 +4772,14 @@ class FunctionPattern(ElementPattern):
             setattr(function, _AUTHORED_BODY_TYPE, None if body is None else body.type)
             if context.function.role is FunctionRole.VARIANT:
                 setattr(function, runtime.DISPLAY_NAME, match.captures["name"])
-                function.name = function_name
+                if getattr(context.function, "dialect", None) == "tir" and specializations:
+                    pat = specializations[0]
+                    if isinstance(pat, runtime.DimVarRangePat):
+                        function.name = _mangle_variant_name(function_name, (pat,))
+                    else:
+                        function.name = function_name
+                else:
+                    function.name = function_name
             elif context.function.role is FunctionRole.CONVERTER:
                 function.name = f"{function_name}.converter[{converter}]"
             binding = context.function.binding_name or match.captures["name"]
@@ -4701,7 +4798,11 @@ class FunctionPattern(ElementPattern):
             body=body,
             output_count=context.function.output_count,
             **kwargs,
+            specializations=specializations,
         )
+        if specializations and isinstance(specializations[0], runtime.DimVarRangePat):
+            function.name = _mangle_variant_name(function.name, (specializations[0],))
+        function._display_name = match.captures["name"]
         define = getattr(context.function.module_scope, "define", None)
         if callable(define):
             define(context.function.binding_name or match.captures["name"], function)

@@ -34,6 +34,7 @@ from tilefoundry.ir.core.expr import Tuple as IrTuple
 from tilefoundry.ir.core.kinds import BinaryKind, UnaryKind
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.core.op_schema import OpSchema
+from tilefoundry.ir.core.pattern import DimVarRangePat
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary
@@ -48,8 +49,20 @@ from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.slice import Slice, slice_size
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.stmts import Evaluate, LetStmt, MeshScope, Return, Sequential
+from tilefoundry.ir.tir.shape import ShapeOf
+from tilefoundry.ir.tir.stmts import (
+    Evaluate,
+    For,
+    If,
+    LetStmt,
+    MeshScope,
+    Return,
+    Sequential,
+    While,
+)
+from tilefoundry.ir.tir.symbol_ref import SymbolRef
 from tilefoundry.ir.types import DType, TensorType, TupleType, UnitType
+from tilefoundry.ir.types.callable_type import CallableType
 from tilefoundry.ir.types.dim import (
     DimAdd,
     DimFloorDiv,
@@ -223,6 +236,7 @@ def attach_authored_metadata(value: object, node: ast.AST, context: "MatchContex
 
 runtime = SimpleNamespace(
     Call=Call,
+    CallableType=CallableType,
     BindingSubstitutionCloner=BindingSubstitutionCloner,
     Broadcast=Broadcast,
     Binary=Binary,
@@ -235,7 +249,9 @@ runtime = SimpleNamespace(
     DimMul=DimMul,
     DimSub=DimSub,
     DimVar=DimVar,
+    DimVarRangePat=DimVarRangePat,
     Evaluate=Evaluate,
+    For=For,
     Expr=Expr,
     Function=Function,
     LoopRegion=LoopRegion,
@@ -247,6 +263,8 @@ runtime = SimpleNamespace(
     LetStmt=LetStmt,
     MeshScope=MeshScope,
     MeshRegion=MeshRegion,
+    If=If,
+    While=While,
     MeshCoord=MeshCoord,
     Mesh=Mesh,
     Module=Module,
@@ -256,10 +274,12 @@ runtime = SimpleNamespace(
     Reshape=Reshape,
     Return=Return,
     Sequential=Sequential,
+    ShapeOf=ShapeOf,
     ShardLayout=ShardLayout,
     Slice=Slice,
     Split=Split,
     StorageKind=StorageKind,
+    SymbolRef=SymbolRef,
     TensorType=TensorType,
     TupleType=TupleType,
     TypeInferContext=TypeInferContext,
@@ -998,8 +1018,9 @@ class ModuleBuildContext:
                 )
             return
         base = context.base
-        if base is None or not isinstance(base, runtime.Function):
-            raise ValueError(f"{role.value} {binding!r}: base is not a HIR Function")
+        expected_base = runtime.PrimFunction if context.dialect == "tir" else runtime.Function
+        if base is None or not isinstance(base, expected_base):
+            raise ValueError(f"{role.value} {binding!r}: base is not a matching Function")
         if getattr(base, "_sealed", False):
             raise RuntimeError(f"base {base.name!r}: cannot register {role.value} after seal")
         if binding == "_" and role is FunctionRole.VARIANT:

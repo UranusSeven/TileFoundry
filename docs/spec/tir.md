@@ -225,10 +225,7 @@ Stmt-position form and the only Stmt-position invocation wrapper.
 unconditional invocation — an effect `Op` or a function `SymbolRef` —
 is expressed as `Evaluate(callable, args)`. A construct that carries
 its own control flow stays a first-class `Stmt`, not an `Evaluate`
-callable: `DispatchCall` ([§1.6](#16-dispatchcall)) is a first-match
-`if`/`else` over patterns with a fallback, and `Abort`
-([§1.7](#17-abort)) is a terminator. Their nested function invocations
-are themselves `Evaluate(SymbolRef, args)`.
+callable. `Abort` ([§1.7](#17-abort)) is a terminator.
 
 ### 1.5 `Sync`
 
@@ -331,63 +328,16 @@ the mesh, and any slice of it, is a compile-time descriptor rather than an SSA
 value, and the barrier kind is derived from that set by one shared routine so
 verify and codegen cannot disagree.
 
-### 1.6 `DispatchCall`
-
-`tir.DispatchCall` is a first-class TIR Stmt that implements
-pattern-based first-match dispatch over a tuple of `Expr` subjects.
-It is the lowered form of an HIR dispatch prototype
-([hir.md §1.1](./hir.md#11-function)) and of any sub-call
-to a dispatch-prototype callee.
-
-```python
-class DispatchCall(Stmt):
-    callee_name: str                                  # unmangled dispatcher name (debug / printer)
-    subjects: tuple[Expr, ...]                        # one Expr per dispatch axis
-    case_patterns: tuple[tuple[Pattern, ...], ...]    # parallel case table: patterns
-    case_calls: tuple[Evaluate, ...]                  # parallel case table: Evaluate(SymbolRef, args)
-    fallback: Sequential                              # the Sequential taken when no case matches
-```
-
-- constraints:
-  - a control Stmt (not an `Evaluate` callable) implementing first-match dispatch;
-    source order is part of the IR contract. Verifier rules below.
-
-`DispatchCall` is a control Stmt, not an `Evaluate` callable
-([§1.4](#14-evaluate)); each `case_calls[i]` is an
-`Evaluate(SymbolRef, args)` invoking that case's specialized callee.
-
-Semantics: the i-th `case_patterns` matches against `subjects` by
-position; the first `i` whose every pattern matches runs
-`case_calls[i]` and the op completes. If no case matches, `fallback`
-runs. Source order is part of the IR contract — printers and viewers
-MUST preserve it.
-
-#### Verifier rules
-
-The verifier requires:
-
-- `len(subjects) == 1`.
-- `subjects[0]` is a `tir.ShapeOf(param, axis)`.
-- `len(case_patterns) == len(case_calls)`.
-- Each `case_patterns[i]` has length `== len(subjects) == 1`.
-- Each `case_patterns[i][0]` is a `DimVarRangePat`
-  ([core-ir.md §3.1](./core-ir.md#31-dimvarrangepat)).
-- `fallback` is exactly `Sequential((Abort(),))` — a length-1 body
-  containing one `Abort`.
-
-`subjects` carries a canonical ordering so the IR is deterministic
-across compiles: ordered by axis kind, then by canonical name of the
-matched key. A single dispatch axis makes this ordering trivial.
-
 ### 1.7 `Abort`
 
 ```python
-class Abort(Stmt):
-    message: str = ""    # a debug surface; carries no semantics
+class Abort(Op):
+    message: str = ""
 ```
 
 - constraints:
-  - a terminating Stmt on believed-unreachable paths (notably `DispatchCall.fallback`).
+  - a terminating effect Op on believed-unreachable paths, anchored in Stmt
+    position by `Evaluate`.
 
 - The CUDA emitter renders `Abort` as `__trap();` in device contexts
   and `assert(false);` in host contexts so a runtime hit is loud
@@ -458,9 +408,8 @@ Resolution is module level: a unique lookup over the `Module`
 one `PrimFunction`; zero or more than one match is an error.
 Specialization variants each carry a distinct canonical
 `PrimFunction.name`, so a `SymbolRef` to a variant resolves
-unambiguously; the unmangled dispatcher name lives on
-`DispatchCall.callee_name` ([§1.6](#16-dispatchcall)), not on a
-`SymbolRef`. Local typeinfer does not resolve a `SymbolRef`; it
+unambiguously; the unmangled dispatcher is represented by its prototype and
+`variants`, not by a `SymbolRef`. Local typeinfer does not resolve a `SymbolRef`; it
 carries its `type` directly.
 
 ### 2.2 `ShapeOf`
@@ -510,6 +459,11 @@ handle. Effect Ops appear in Stmt position as `Evaluate(op, args)`
 ([§1.4](#14-evaluate)). Each Op's full contract lives here, in its catalog entry
 below; code carries only a one-line purpose docstring
 ([SPEC-RULES](../SPEC-RULES.md)).
+
+The canonical inspection surface covers every Op in this catalog. Printing and
+re-importing a TIR program MUST reach a fixed point: value Ops remain assignment
+forms, effect Ops remain statement forms, and enum-valued attributes use their
+named enum members with the owning enum imported by the printed program.
 
 - `TensorType.storage` is a `StorageKind` ([types §2](./types.md#2-tensortype)).
   A memory-resident TIR tensor MUST carry a concrete level; the unmaterialized

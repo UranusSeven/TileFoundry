@@ -44,14 +44,14 @@ def test_a_signature_may_not_forge_its_dim_var_envelope() -> None:
 
     A specialization range stays inside the envelope of a parameter DimVar, and
     one name cannot carry two envelopes anywhere in a signature.
-    ``DispatchCall.subject`` lowers to ``ShapeOf(param, axis)``, so a DimVar only
+    Dispatch subjects lower to ``ShapeOf(param, axis)``, so a DimVar only
     in the return type is unreadable at runtime and remains unknown. The scan
     covers params, return type, and nested ``TupleType`` fields.
     """
     s = DimVar(name="S_env", lo=1, hi=8)
     forged = _identity_fn(
         params=(Var(type=_tensor((s,)), name="x"),),
-        specializations=(DimVarRangePat("S_env", 0, 100),),
+        specializations=(DimVarRangePat("S_env", 0, 99),),
     )
     with pytest.raises(VerifyError, match="not contained in DimVar envelope"):
         verify_function(forged)
@@ -59,7 +59,7 @@ def test_a_signature_may_not_forge_its_dim_var_envelope() -> None:
     known = Var(type=_tensor((DimVar(name="S_known", lo=1, hi=8),)), name="x")
     with pytest.raises(VerifyError, match="references unknown DimVar"):
         verify_function(
-            _identity_fn(params=(known,), specializations=(DimVarRangePat("OTHER", 1, 4),))
+            _identity_fn(params=(known,), specializations=(DimVarRangePat("OTHER", 1, 3),))
         )
 
     r = DimVar(name="R_ret_only", lo=1, hi=8)
@@ -68,7 +68,7 @@ def test_a_signature_may_not_forge_its_dim_var_envelope() -> None:
             _identity_fn(
                 params=(Var(type=_tensor((4,)), name="x"),),
                 return_type=_tensor((r,)),
-                specializations=(DimVarRangePat("R_ret_only", 1, 4),),
+                specializations=(DimVarRangePat("R_ret_only", 1, 3),),
             )
         )
 
@@ -89,7 +89,7 @@ def _dispatch_proto(name: str, env, ranges):
     """A dispatch prototype over ``DimVar`` with one variant per ```` in *ranges*.
 
     A dispatch prototype over ``DimVar(name, *env)`` with one variant per
-    ``(lo, hi)`` in *ranges*. Used to exercise the half-open-interval partition
+    ``(lo, hi)`` in *ranges*. Used to exercise the closed-interval partition
     verifier (`_verify_partition`).
     """
     s = DimVar(name=name, lo=env[0], hi=env[1])
@@ -110,14 +110,14 @@ def _dispatch_proto(name: str, env, ranges):
 
 
 def test_variants_must_tile_the_envelope_exactly() -> None:
-    """The variants of a prototype partition its half-open envelope: complete and disjoint.
+    """The variants of a prototype partition its envelope: complete and disjoint.
 
-    The variants of a prototype partition its half-open envelope: complete and
+    The variants of a prototype partition its envelope with closed ranges: complete and
     disjoint. A gap leaves a runtime shape with no arm, and an overlap makes the
     selected arm depend on evaluation order.
     """
-    verify_function(_dispatch_proto("S_par_ok", (1, 8), [(1, 5), (5, 8)]))
-    verify_function(_dispatch_proto("S_par_pt", (1, 8), [(1, 4), (4, 5), (5, 8)]))
+    verify_function(_dispatch_proto("S_par_ok", (1, 8), [(1, 4), (5, 7)]))
+    verify_function(_dispatch_proto("S_par_pt", (1, 8), [(1, 3), (4, 4), (5, 7)]))
 
     with pytest.raises(VerifyError, match="gap or overlap at 4"):
         verify_function(_dispatch_proto("S_par_ov", (1, 8), [(1, 5), (4, 8)]))
@@ -125,5 +125,5 @@ def test_variants_must_tile_the_envelope_exactly() -> None:
     with pytest.raises(VerifyError, match="gap or overlap at 5"):
         verify_function(_dispatch_proto("S_par_gap", (1, 8), [(1, 3), (5, 8)]))
 
-    with pytest.raises(VerifyError, match=r"cover \[1, 7\) but the envelope is \[1, 8\)"):
-        verify_function(_dispatch_proto("S_par_inc", (1, 8), [(1, 5), (5, 7)]))
+    with pytest.raises(VerifyError, match="gap or overlap at 6"):
+        verify_function(_dispatch_proto("S_par_inc", (1, 8), [(1, 4), (6, 7)]))

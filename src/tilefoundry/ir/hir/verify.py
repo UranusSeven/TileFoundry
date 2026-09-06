@@ -100,7 +100,7 @@ def _verify_partition(base: Function) -> None:
     """Verify partition.
 
     Check the variants' ranges partition the base DimVar envelope —
-    pairwise disjoint and jointly complete over the half-open ``[lo, hi)``.
+    pairwise disjoint and jointly complete over closed specialization ranges.
     """
     dim_vars: set[str] = set()
     ranges: list[tuple[int, int]] = []
@@ -124,21 +124,22 @@ def _verify_partition(base: Function) -> None:
             f"hir Function {base.name!r}: dispatch DimVar "
             f"{next(iter(dim_vars))!r} is not reachable from an input parameter"
         )
-    lo, hi = envelope
+    lo, hi_exclusive = envelope
+    hi = hi_exclusive - 1
 
     cursor = lo
     for rlo, rhi in sorted(ranges):
         if rlo != cursor:
             raise VerifyError(
                 f"hir Function {base.name!r}: variant ranges do not partition "
-                f"envelope [{lo}, {hi}) — gap or overlap at {rlo} (expected "
+                f"envelope [{lo}, {hi}] — gap or overlap at {rlo} (expected "
                 f"{cursor})"
             )
-        cursor = rhi
-    if cursor != hi:
+        cursor = rhi + 1
+    if cursor != hi + 1:
         raise VerifyError(
             f"hir Function {base.name!r}: variant ranges cover "
-            f"[{lo}, {cursor}) but the envelope is [{lo}, {hi})"
+            f"[{lo}, {cursor - 1}] but the envelope is [{lo}, {hi}]"
         )
 
 
@@ -192,7 +193,7 @@ def _collect_param_dim_vars(fn: Function) -> dict[str, tuple[int, int]]:
 
     Drives envelope ⊆ and unknown-name checks: specializations must
     anchor to a ``DimVar`` reachable from an *input* param, because
-    ``DispatchCall.subject`` lowers to ``ShapeOf(param, axis)`` and
+    Dispatch subjects lower to ``ShapeOf(param, axis)`` and
     can only reference a value the caller provides.
     """
     bounds: dict[str, tuple[int, int]] = {}

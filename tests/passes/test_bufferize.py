@@ -11,12 +11,12 @@ about.
 from __future__ import annotations
 
 from tests.fixtures.placed.rmsnorm import RmsnormModule
-from tilefoundry.ir.core import Call, Var
+from tilefoundry.ir.core import Call, Constant, Var
 from tilefoundry.ir.core.module import Module
-from tilefoundry.ir.tir.dispatch import DispatchCall
+from tilefoundry.ir.tir.abort import Abort
 from tilefoundry.ir.tir.memory import AllocTensor as AllocTensorOp
 from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.stmts import Abort, LetStmt, Sequential
+from tilefoundry.ir.tir.stmts import Evaluate, If, LetStmt, Sequential
 from tilefoundry.ir.types import DType, TensorType
 from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.passes.transforms import HirToTirPass
@@ -32,27 +32,26 @@ def _lower() -> tuple[PrimFunction, Module]:
     return pf, module
 
 
-def test_lifetime_collector_finds_buffer_inside_dispatch_call_fallback():
-    """A buffer allocated inside a ``DispatchCall``'s ``fallback`` arm must be collected.
+def test_lifetime_collector_finds_buffer_inside_if_else():
+    """A buffer allocated inside an ``If`` else arm must be collected.
 
-    A buffer allocated inside a ``DispatchCall``'s ``fallback`` arm must
-    be collected. A hand-rolled Stmt walk without ``DispatchCall`` coverage
-    silently skips it ([visitor-mutator §1](docs/spec/visitor-mutator.md#1-role)).
+    A hand-rolled Stmt walk without ``If`` coverage silently skips it.
     """
     buf_type = TensorType(shape=(4,), dtype=DType.f32, layout=None, storage=StorageKind.RMEM)
     buf_var = Var(type=buf_type, name="buf")
     alloc_call = Call(type=buf_type, target=AllocTensorOp(tensor_type=buf_type), args=())
     fallback = Sequential(
-        body=(LetStmt(var=buf_var, value=alloc_call, body=Sequential(body=(Abort(),))),)
+        body=(
+            LetStmt(
+                var=buf_var,
+                value=alloc_call,
+                body=Sequential(body=(Evaluate(callable=Abort(message=""), args=()),)),
+            ),
+        )
     )
-    dispatch = DispatchCall(
-        callee_name="f",
-        subjects=(),
-        case_patterns=(),
-        case_calls=(),
-        fallback=fallback,
-    )
-    pf = PrimFunction(name="f", params=(), body=Sequential(body=(dispatch,)))
+    cond = Constant(type=TensorType.scalar(DType.bool), value=True)
+    stmt = If(cond=cond, then_body=Sequential(()), else_body=fallback)
+    pf = PrimFunction(name="f", params=(), body=Sequential(body=(stmt,)))
 
     entries = LifetimeCollector().collect(pf)
 

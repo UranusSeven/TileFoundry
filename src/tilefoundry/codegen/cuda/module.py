@@ -12,7 +12,6 @@ from tilefoundry.codegen.cuda.context import CodegenContext
 from tilefoundry.codegen.cuda.templates import render
 from tilefoundry.codegen.cuda.tir.prim_function import (
     _compute_kernel_fields,
-    _is_dispatch_entry_shape,
 )
 from tilefoundry.codegen.linkable import LinkableFunction, LinkableModule
 from tilefoundry.codegen.registry import CodeGenerator
@@ -79,20 +78,11 @@ def emit_cuda_module(
     ctx = CodegenContext(target)
     kernel_texts = []
     all_fields = []
-    for fn in cuda_fns:
-
-
-        if _is_dispatch_entry_shape(fn):
-            continue
+    expanded_fns = tuple(
+        {v.name: v for fn in cuda_fns for v in (fn.variants or (fn,))}.values()
+    )
+    for fn in expanded_fns:
         fields = _compute_kernel_fields(fn, ctx)
-        if fields.entry_host_only:
-
-
-            raise NotImplementedError(
-                f"emit_cuda_module: cuda function {fn.name!r} has a DispatchCall "
-                f"but is not a recognized dispatch entry; cannot emit a device "
-                f"kernel for it"
-            )
         kernel_texts.append(_emit_kernel_and_shim(fields))
         all_fields.append(fields)
     if not all_fields:

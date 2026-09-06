@@ -12,7 +12,6 @@ from dataclasses import dataclass
 
 from tilefoundry.codegen.cuda.context import CodegenContext
 from tilefoundry.codegen.cuda.tir.memory.tensor_view import render_shard_layout_value
-from tilefoundry.ir.tir.dispatch import DispatchCall
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import (
     is_hidden_shape_scalar as _is_hidden_shape_scalar,
@@ -23,7 +22,7 @@ from tilefoundry.ir.tir.shape import (
 from tilefoundry.ir.tir.shape import (
     shape_var_name,
 )
-from tilefoundry.ir.tir.stmts import Return, Sequential
+from tilefoundry.ir.tir.stmts import Sequential
 from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.dim import DimVar
 from tilefoundry.ir.types.shape_helpers import shape_numel_upper_bound
@@ -95,58 +94,6 @@ def _collect_mesh_dims(body: Sequential) -> tuple[tuple[int, int, int], tuple[in
     return _derive_launch_config(body)
 
 
-def _is_dispatch_entry(node: PrimFunction) -> bool:
-    """Return whether dispatch entry.
-
-    A dispatch entry PrimFunction's body is ``Sequential`` whose
-    statements consist of one ``DispatchCall`` plus an optional trailing
-    ``Return``. The HIR→TIR lowering produces exactly this shape for
-    overload-group entries.
-    """
-    body = node.body
-    if not isinstance(body, Sequential):
-        return False
-    return any(isinstance(s, DispatchCall) for s in body.body)
-
-
-def _is_dispatch_entry_shape(node: PrimFunction) -> bool:
-    """Narrow dispatch-entry recognition: the body is exactly ``Sequential()`` or ``Sequential()``.
-
-    Narrow dispatch-entry recognition: the body is exactly
-    ``Sequential((DispatchCall,))`` or ``Sequential((DispatchCall, Return))``.
-
-    Stricter than :func:`_is_dispatch_entry` (which matches any body that
-    merely contains a ``DispatchCall``); used where a host-only dispatch entry
-    must be recognized precisely rather than guessed.
-    """
-    body = node.body
-    if not isinstance(body, Sequential):
-        return False
-    stmts = body.body
-    if not stmts or not isinstance(stmts[0], DispatchCall):
-        return False
-    if len(stmts) == 1:
-        return True
-    return len(stmts) == 2 and isinstance(stmts[1], Return)
-
-
-def _has_nested_dispatch(node: PrimFunction) -> bool:
-    """Walk *node*'s body and return True if any nested stmt is a ``DispatchCall``.
-
-    Walk *node*'s body and return True if any nested stmt is a
-    ``DispatchCall``. Used to guard non-entry PrimFunctions, where
-    a nested dispatch would require host-side dispatch from inside a
-    ``__global__`` kernel — not supported in v0.
-    """
-    body = node.body
-    if not isinstance(body, Sequential):
-        return False
-    for stmt in body.body:
-        if isinstance(stmt, DispatchCall):
-            return True
-    return False
-
-
 @dataclass(frozen=True)
 class _KernelFields:
     """Represent KernelFields.
@@ -173,6 +120,11 @@ class _KernelFields:
 
 
 def _compute_kernel_fields(node: PrimFunction, ctx: CodegenContext) -> _KernelFields:
+    if node.variants:
+        raise ValueError(
+            f"PrimFunction {node.name!r} is a specialization prototype; "
+            "codegen must dispatch variants instead of emitting an empty kernel"
+        )
     for p in node.params:
         ctx.register_kernel_param(p)
 
@@ -193,16 +145,7 @@ def _compute_kernel_fields(node: PrimFunction, ctx: CodegenContext) -> _KernelFi
 
     ctx.reset_barrier_ids()
 
-    entry_host_only = _is_dispatch_entry(node)
-    if not entry_host_only and _has_nested_dispatch(node):
-
-
-
-
-        raise NotImplementedError(
-            f"PrimFunction emitter: v0 nested dispatch inside a specialized "
-            f"kernel is not yet supported (function {node.name!r})."
-        )
+    entry_host_only = bool(node.variants)
 
 
 
@@ -292,9 +235,10 @@ def _compute_kernel_fields(node: PrimFunction, ctx: CodegenContext) -> _KernelFi
 
     grid, block = _collect_mesh_dims(node.body)
 
+    codegen_name = node.name
     return _KernelFields(
-        kernel_name=node.name,
-        internal_wrapper_name=_internal_wrapper_symbol(node.name),
+        kernel_name=codegen_name,
+        internal_wrapper_name=_internal_wrapper_symbol(codegen_name),
         params=node.params,
         param_cpp_types=param_cpp_types,
         param_kinds=param_kinds,

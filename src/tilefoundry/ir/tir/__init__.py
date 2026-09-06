@@ -3,13 +3,12 @@ from __future__ import annotations
 import importlib
 import pkgutil
 
+from .abort import Abort
 from .async_copy import CopyAsync, CpAsyncCommit, CpAsyncWait
-from .dispatch import DispatchCall
 from .launch import Launch
 from .prim_function import PrimFunction
 from .shape import ShapeOf, shape_var_name
 from .stmts import (
-    Abort,
     For,
     If,
     LetStmt,
@@ -40,7 +39,6 @@ __all__ = [
     "Sequential",
     "LetStmt",
     "Abort",
-    "DispatchCall",
     "Launch",
     "ShapeOf",
     "shape_var_name",

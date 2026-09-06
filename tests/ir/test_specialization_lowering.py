@@ -10,25 +10,18 @@ from __future__ import annotations
 
 import pytest
 
-from tilefoundry.ir.core import Call, Var
+from tilefoundry.ir.core import Call, Var, VerifyError
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.core.pattern import DimVarRangePat
 from tilefoundry.ir.hir.function import Function as HirFunction
-from tilefoundry.ir.tir.dispatch import DispatchCall
 from tilefoundry.ir.tir.prim_function import PrimFunction
-from tilefoundry.ir.tir.shape import ShapeOf
-from tilefoundry.ir.tir.stmts import (
-    For,
-    If,
-    LetStmt,
-    MeshScope,
-    Sequential,
-    While,
-)
-from tilefoundry.ir.tir.verify import verify_module
+from tilefoundry.ir.tir.stmts import Sequential
+from tilefoundry.ir.tir.symbol_ref import SymbolRef
+from tilefoundry.ir.tir.verify import verify_module, verify_prim_function
 from tilefoundry.ir.types import DType, TensorType
 from tilefoundry.ir.types.dim import DimVar
 from tilefoundry.ir.types.storage import StorageKind
+from tilefoundry.ir.visitor import StmtVisitor, walk_prim_function
 from tilefoundry.passes.transforms import HirToTirPass
 
 
@@ -36,17 +29,21 @@ def _tensor(shape) -> TensorType:
     return TensorType(shape=shape, dtype=DType.f32, layout=None, storage="gmem")
 
 
-def _has_dispatch_call(body: Sequential) -> bool:
-    for s in body.body:
-        if isinstance(s, DispatchCall):
-            return True
-    return False
-
 
 def _find_function(mod: Module, name: str) -> PrimFunction:
     matches = [fn for fn in mod.functions if fn.name == name]
     assert len(matches) == 1, f"expected one function named {name!r}"
     return matches[0]
+
+def _callees(pf: PrimFunction) -> set[str]:
+    names: set[str] = set()
+    class _V(StmtVisitor):
+        def visit_Evaluate(self, stmt):
+            if isinstance(stmt.callable, SymbolRef):
+                names.add(stmt.callable.name)
+            return self.generic_visit(stmt)
+    walk_prim_function(_V(), pf)
+    return names
 
 
 def _S(env=(1, 7)) -> DimVar:
@@ -83,7 +80,7 @@ def _prototype(name: str, variants: tuple[HirFunction, ...], env=(1, 7)) -> HirF
     return base
 
 
-def test_static_function_lowers_without_dispatch_call() -> None:
+def test_static_function_lowers_without_variants() -> None:
     ty = _tensor((8,))
     x = Var(type=ty, name="x")
     fn = HirFunction.build(name="static_fn", params=(x,), body=x, return_type=ty)
@@ -94,7 +91,7 @@ def test_static_function_lowers_without_dispatch_call() -> None:
     pf = out.functions[0]
     assert isinstance(pf, PrimFunction)
     assert pf.name == "static_fn"
-    assert not _has_dispatch_call(pf.body)
+    assert not pf.variants
     verify_module(list(out.functions))
 
 
@@ -107,7 +104,7 @@ def test_entry_dispatch_two_arms() -> None:
     out = HirToTirPass().run(mod)
 
     names = sorted(fn.name for fn in out.functions)
-    assert names == ["main", "main$S$1_3", "main$S$4_7"]
+    assert names == ["main"]
 
     entry = _find_function(out, "main")
 
@@ -116,24 +113,14 @@ def test_entry_dispatch_two_arms() -> None:
         dtype=DType.i32, storage=StorageKind.RMEM
     )
 
-    body_stmts = entry.body.body
-    assert isinstance(body_stmts[0], DispatchCall)
-    dc = body_stmts[0]
-    assert dc.callee_name == "main"
-    assert isinstance(dc.subjects[0], ShapeOf)
-    assert dc.subjects[0].param is entry.params[0]
-    assert dc.subjects[0].axis == 0
-    assert dc.case_patterns == (
-        (DimVarRangePat("S", 1, 3),),
-        (DimVarRangePat("S", 4, 7),),
-    )
-    assert dc.case_calls[0].callable.name == "main$S$1_3"
-    assert dc.case_calls[1].callable.name == "main$S$4_7"
+    assert len(entry.variants) == 2
+    assert tuple(v.specializations for v in entry.variants) == ((DimVarRangePat("S", 1, 3),), (DimVarRangePat("S", 4, 7),))
+    assert tuple(v.name for v in entry.variants) == ("main$S$1_3", "main$S$4_7")
 
     verify_module(list(out.functions))
 
 
-def test_sub_call_dispatch_emits_dispatch_call() -> None:
+def test_sub_call_group_lowers_to_variants() -> None:
     inner = _prototype(
         "inner",
         (_variant("inner", 1, 3), _variant("inner", 4, 7)),
@@ -150,48 +137,21 @@ def test_sub_call_dispatch_emits_dispatch_call() -> None:
     out = HirToTirPass().run(mod)
 
     names = sorted(fn.name for fn in out.functions)
-    assert names == [
-        "inner",
-        "inner$S$1_3",
-        "inner$S$4_7",
-        "main",
-    ]
+    assert names == ["inner", "main"]
 
-    caller_pf = _find_function(out, "main")
-    dispatches: list[DispatchCall] = []
-
-    def walk(stmt) -> None:
-        if isinstance(stmt, Sequential):
-            for s in stmt.body:
-                walk(s)
-        elif isinstance(stmt, DispatchCall):
-            dispatches.append(stmt)
-        elif isinstance(stmt, LetStmt):
-            walk(stmt.body)
-        elif isinstance(stmt, (For, While, MeshScope)):
-            walk(stmt.body)
-        elif isinstance(stmt, If):
-            walk(stmt.then_body)
-            walk(stmt.else_body)
-
-    walk(caller_pf.body)
-    assert len(dispatches) == 1
-    dc = dispatches[0]
-    assert dc.callee_name == "inner"
-    assert {c.callable.name for c in dc.case_calls} == {
-        "inner$S$1_3",
-        "inner$S$4_7",
-    }
+    inner_pf = _find_function(out, "inner")
+    assert len(inner_pf.variants) == 2
+    assert {v.name for v in inner_pf.variants} == {"inner$S$1_3", "inner$S$4_7"}
+    caller = _find_function(out, "main")
+    assert _callees(caller) >= {"inner$S$1_3", "inner$S$4_7"}
     verify_module(list(out.functions))
 
 
 def test_nested_dispatch_chain_three_levels() -> None:
     """3-level chain ``main -> inner -> leaf``, each a 2-arm dispatch group.
 
-    Each dispatch-level sub-call must forward the trailing
-    ``<param>_shape_<axis>`` kernel scalars its callee declared, so the
-    full chain verifies and each ``Evaluate(SymbolRef, args)``'s ``args``
-    match the callee ``PrimFunction.params`` at every level.
+    ``verify_module`` checks that every symbol call forwards the correct
+    parameters at each level.
     """
     leaf = _prototype(
         "leaf",
@@ -215,64 +175,37 @@ def test_nested_dispatch_chain_three_levels() -> None:
     )
     out = HirToTirPass().run(mod)
 
-    for inner_name in ("inner$S$1_3", "inner$S$4_7"):
-        inner_pf = _find_function(out, inner_name)
-        dispatches: list[DispatchCall] = []
-
-        def walk(stmt) -> None:
-            if isinstance(stmt, Sequential):
-                for s in stmt.body:
-                    walk(s)
-            elif isinstance(stmt, DispatchCall):
-                dispatches.append(stmt)
-            elif isinstance(stmt, LetStmt):
-                walk(stmt.body)
-            elif isinstance(stmt, (For, While, MeshScope)):
-                walk(stmt.body)
-            elif isinstance(stmt, If):
-                walk(stmt.then_body)
-                walk(stmt.else_body)
-
-        walk(inner_pf.body)
-        assert len(dispatches) == 1
-        dc = dispatches[0]
-        for cc in dc.case_calls:
-            assert cc.callable.name.startswith("leaf$")
-            assert len(cc.args) == len(cc.callable.type.parameters)
+    inner_proto = _find_function(out, "inner")
+    for inner_pf in inner_proto.variants:
+        assert _callees(inner_pf) >= {"leaf$S$1_3", "leaf$S$4_7"}
 
     main_entry = _find_function(out, "main")
-    dc = main_entry.body.body[0]
-    assert isinstance(dc, DispatchCall)
-    for cc in dc.case_calls:
-        assert cc.callable.name.startswith("main$")
-        assert len(cc.args) == len(cc.callable.type.parameters)
-
-    for main_name in ("main$S$1_3", "main$S$4_7"):
-        main_pf = _find_function(out, main_name)
-        dispatches = []
-
-        def walk(stmt) -> None:
-            if isinstance(stmt, Sequential):
-                for s in stmt.body:
-                    walk(s)
-            elif isinstance(stmt, DispatchCall):
-                dispatches.append(stmt)
-            elif isinstance(stmt, LetStmt):
-                walk(stmt.body)
-            elif isinstance(stmt, (For, While, MeshScope)):
-                walk(stmt.body)
-            elif isinstance(stmt, If):
-                walk(stmt.then_body)
-                walk(stmt.else_body)
-
-        walk(main_pf.body)
-        assert len(dispatches) == 1
-        dc = dispatches[0]
-        for cc in dc.case_calls:
-            assert cc.callable.name.startswith("inner$")
-            assert len(cc.args) == len(cc.callable.type.parameters)
+    assert len(main_entry.variants) == 2
+    assert all(_callees(v) >= {"inner$S$1_3", "inner$S$4_7"} for v in main_entry.variants)
 
     verify_module(list(out.functions))
+
+
+def test_variant_requires_single_specialization() -> None:
+    x = Var(type=_tensor((_S(),)), name="x")
+    variant = PrimFunction(
+        name="f$S$1_3", params=(x,), body=Sequential(body=()),
+        specializations=(DimVarRangePat("S", 1, 3), DimVarRangePat("S", 3, 5)),
+    )
+    fn = PrimFunction(name="f", params=(x,), body=Sequential(body=()), variants=(variant,))
+    with pytest.raises(VerifyError, match="one DimVarRangePat"):
+        verify_prim_function(fn)
+
+
+def test_variant_subject_must_be_in_parameters() -> None:
+    x = Var(type=_tensor((8,)), name="x")
+    variant = PrimFunction(
+        name="f$S$1_3", params=(x,), body=Sequential(body=()),
+        specializations=(DimVarRangePat("S", 1, 3),),
+    )
+    fn = PrimFunction(name="f", params=(x,), body=Sequential(body=()), variants=(variant,))
+    with pytest.raises(VerifyError, match="cannot be derived"):
+        verify_prim_function(fn)
 
 
 def test_empty_reachable_set_raises() -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from tilefoundry.ir.core import Var
+from tilefoundry.ir.core.pattern import Pattern
 from tilefoundry.ir.tir.stmt import Stmt
 from tilefoundry.ir.tir.stmts import Sequential
 from tilefoundry.target.base import Target, target_instance
@@ -15,7 +16,7 @@ def _default_target():
     return default_target()
 
 
-@dataclass(frozen=True)
+@dataclass(unsafe_hash=True)
 class PrimFunction(Stmt):
     """Contain an effect-only TIR function as a statement.
 
@@ -30,9 +31,18 @@ class PrimFunction(Stmt):
     body: Sequential
     output_count: int = 1
     target: Target = field(default_factory=_default_target)
+    specializations: tuple[Pattern, ...] = ()
+    variants: tuple["PrimFunction", ...] = ()
+    _sealed: bool = field(default=False, compare=False, hash=False, repr=False)
+    _display_name: str | None = field(default=None, compare=False, hash=False, repr=False)
 
     def __post_init__(self) -> None:
         target_instance(self.target)
+
+    def add_variant(self, variant: "PrimFunction") -> None:
+        if getattr(self, "_sealed", False):
+            raise RuntimeError(f"tir PrimFunction {self.name!r}: cannot add a specialization variant after sealing")
+        self.variants = (*self.variants, variant)
 
 
 __all__ = ["PrimFunction"]

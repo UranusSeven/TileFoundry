@@ -9,6 +9,7 @@ from .mesh import Mesh
 
 class ShardAttr:
     """Base for per-mesh-axis sharding attributes."""
+    pass
 
 
 @dataclass(frozen=True)
@@ -24,7 +25,6 @@ class Partial(ShardAttr):
 @dataclass(frozen=True)
 class Broadcast(ShardAttr):
     pass
-
 
 @dataclass(frozen=True)
 class Dynamic(ShardAttr):
