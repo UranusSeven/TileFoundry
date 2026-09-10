@@ -7,24 +7,22 @@
 
 namespace reduce_impl {
 
-/// Non-sharded reduce over a plain cute tensor. Extents are derived from the
-/// operand via the shared ``cell_decomp``: a scalar ``dst`` folds every
-/// element of ``src`` into ``dst(0)``; an ``M``-cell ``dst`` folds each of the
-/// ``M`` cells over its ``size(src) / M`` elements into ``dst(j)``. Combine +
-/// finalisation come from ``reduce_traits<Op>``, shared with the sharded
-/// tiers.
+/// Fold what this instance holds, and stop.
 template <class Op, class Axes> struct Plain {
     template <class SrcT, class DstT>
     __device__ void operator()(SrcT const &src, DstT &dst) const {
         static_assert(is_supported_reduce_op_v<Op>,
                       "tilefoundry::ops::reduce: unsupported Op");
-        using value_type = cute::remove_cvref_t<decltype(dst(0))>;
-
-        const auto decomp = cell_decomp(src, dst);
-        for (int j = 0; j < decomp.n_cells; ++j) {
-            const float acc = local_fold<Op>(src, j, decomp.step);
-            dst(j) = static_cast<value_type>(
-                reduce_traits<Op>::finalize(acc, float(decomp.step)));
+        auto s = detail::to_local(src);
+        auto &&d = detail::to_local(dst);
+        using value_type = cute::remove_cvref_t<decltype(d(0))>;
+        constexpr int kCells = kept_cells<Axes, decltype(s)>();
+        constexpr int kSpan = reduced_span<Axes, decltype(s)>();
+        CUTE_UNROLL
+        for (int j = 0; j < kCells; ++j) {
+            const float acc = local_fold<Op, Axes>(s, j);
+            d(j) = static_cast<value_type>(
+                reduce_traits<Op>::finalize(acc, float(kSpan)));
         }
     }
 };

@@ -54,13 +54,19 @@ def _(call: "Call", ctx: "TypeInferContext") -> UnitType:
 
 @register_verify_stmt(Mma)
 def _(call: "Call", ctx: "VerifyContext") -> None:
+    """Check the operand shapes ``ops::mma`` will read off these layouts."""
     acc_ty = ctx.type_of(call.args[0])
     lhs_ty = ctx.type_of(call.args[1])
     rhs_ty = ctx.type_of(call.args[2])
 
     if len(lhs_ty.shape) == 2 and len(rhs_ty.shape) == 2 and len(acc_ty.shape) == 2:
         m, k_l = lhs_ty.shape[-2], lhs_ty.shape[-1]
-        k_r, n = rhs_ty.shape[-2], rhs_ty.shape[-1]
+        rhs_sl = getattr(rhs_ty, "layout", None)
+        rhs_is_tile = len(getattr(getattr(rhs_sl, "layout", None), "shape", ())) == 2
+        if rhs_is_tile:
+            n, k_r = rhs_ty.shape[-2], rhs_ty.shape[-1]
+        else:
+            k_r, n = rhs_ty.shape[-2], rhs_ty.shape[-1]
         if k_l != k_r:
             ctx.error(call, f"Mma K-dim mismatch: {k_l} vs {k_r}")
         if acc_ty.shape[-2] != m or acc_ty.shape[-1] != n:

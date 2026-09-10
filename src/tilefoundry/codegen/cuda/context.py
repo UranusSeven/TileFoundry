@@ -34,7 +34,6 @@ def topology_scope_str(name: str) -> str:
     """
     scopes = {
         "cta": "tilefoundry::TopologyScope::cta",
-        "warp": "tilefoundry::TopologyScope::warp",
         "thread": "tilefoundry::TopologyScope::thread",
     }
     try:
@@ -57,16 +56,13 @@ class CodegenContext:
         self._var_names: dict[int, str] = {}
         self._counter = 0
         self._kernel_param_ids: set[int] = set()
-        self._mesh_aliases: dict[int, str] = {}
+        self._mesh_aliases: dict[int, tuple[str, str]] = {}
 
 
 
 
 
         self._dim_var_runtime: dict[str, str] = {}
-
-
-
         self._next_barrier_id = 1
 
     def reset_barrier_ids(self) -> None:
@@ -79,7 +75,10 @@ class CodegenContext:
         Hardware exposes ids 0..15; id 0 is reserved for the whole-CTA barrier,
         so 1..15 are available. Each emitted ``bar.sync`` draws a fresh id; a
         sync op node emits once, so a loop body reuses its id. Raises when a
-        single kernel needs more distinct named barriers than the hardware has.
+        single kernel needs more distinct named barriers than the hardware has:
+        wrapping would hand two live runs one id, and ``bar.sync`` counts
+        arrivals per id, so the first to fill its own count would release the
+        other's threads early.
         """
         bid = self._next_barrier_id
         if bid > 15:

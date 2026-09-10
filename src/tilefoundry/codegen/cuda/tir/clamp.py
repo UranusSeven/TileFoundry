@@ -1,25 +1,9 @@
-"""Codegen for TIR Clamp — emits ``tilefoundry::ops::clamp(src, dst, N, min, max)``."""
+"""Codegen for TIR Clamp — the pointwise entry with ``clamp_op`` as its ``fn``."""
 
 from __future__ import annotations
 
 from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
 from tilefoundry.ir.tir.clamp import Clamp
-from tilefoundry.ir.types.shape_helpers import shape_runtime_total
-from tilefoundry.ir.types.shard.shard_layout import ShardLayout, shard_layout_local_shape
-
-
-def _materialised_shape_dyn(ty) -> tuple:
-    """Materialised shape dyn.
-
-    Per-thread materialised shape, preserving ``DimVar`` entries so a
-    runtime element count can be derived via ``shape_runtime_total``.
-    See [shard §7.1.1](docs/spec/shard.md#711-layoutshape).
-    """
-    layout = getattr(ty, "layout", None)
-    if isinstance(layout, ShardLayout):
-
-        return shard_layout_local_shape(layout)
-    return tuple(ty.shape)
 
 
 @register_codegen_cuda(Clamp)
@@ -28,11 +12,7 @@ def _emit(call, ctx: CodegenContext) -> None:
     op = call.target
     src_n = ctx.name_for(src)
     dst_n = ctx.name_for(dst)
-
-
-
-    N = shape_runtime_total(_materialised_shape_dyn(dst.type), ctx._dim_var_runtime)
     ctx.emit(
-        f"tilefoundry::ops::clamp({src_n}, {dst_n}, {N}, "
-        f"{float(op.min_val)}f, {float(op.max_val)}f);"
+        f"tilefoundry::ops::elementwise({dst_n}, tilefoundry::ops::clamp_op{{"
+        f"{float(op.min_val)}f, {float(op.max_val)}f}}, {src_n});"
     )

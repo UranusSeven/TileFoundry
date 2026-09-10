@@ -541,6 +541,9 @@ class TensorView(Op):
     multiplied by the view extent.
   - The coordinate count MUST match the logical window rank before any
     shard-owned layout axes are removed locally.
+  - `memory` MAY be an allocated `ShardTensor`; in that case the view
+    reprojects the same storage with a new shard layout, using the tensor's
+    engine rather than its existing shard layout.
 
 ##### Copy
 ```python
@@ -659,6 +662,54 @@ class Reduce(Op):
   - All forms lower to the single public runtime entry
     `tilefoundry::ops::reduce<Op, Axes>(src, dst[, workspace])`.
   - Plain and sharded runtime extents/tiers are derived inside the runtime.
+
+##### Dot
+
+`dst = sum(lhs * rhs)` in one statement, and not an `elementwise` followed by a
+`Reduce`: materialising the product first would cost a register per element of
+the row, which is what makes that pair the wrong spelling here ([runtime
+§3](./runtime.md#3-runtime-ops)).
+
+```python
+class Dot(Op):
+    """Effect form; fused multiply-contract over the axes the meshes contract.
+
+    Attributes:
+        lhs: input; left operand.
+        rhs: input; right operand.
+        dst: input; the destination cell.
+        workspace: input; optional shared staging buffer, one slot per warp.
+    """
+
+    lhs: Tensor
+    rhs: Tensor
+    dst: Tensor
+    workspace: Tensor | None = None
+```
+- constraints:
+  - **No axes attribute.** `Reduce` names its axes because
+    `ops::reduce<Op, Axes>` takes them as a template argument; the axes `Dot`
+    contracts are the ones the operands' meshes already contract, so restating
+    them at the call site would be a second source for one fact.
+  - `lhs` and `rhs` contract over the same number of *local* elements: the fold
+    walks one operand's length and indexes the other with it. Their global
+    shapes may differ, and in the canonical matrix-vector call they do — a row
+    of the matrix is split over the mesh while the vector is broadcast.
+  - `dst` is one cell. A contraction leaves a total and every participant leaves
+    holding it, so a wider destination is not a wider result but cells the op
+    never writes.
+  - `workspace` is smem, and is present only in the form that contracts across
+    the block: with none the contraction lives inside a warp, with one each warp
+    posts a partial into a slot. `Dot` carries no dispatch parameter; the runtime
+    selects the tier.
+  - A `workspace` requires `lhs` to carry a `ShardLayout`. Both the count of
+    warps to fold and the barrier to fold behind come off that mesh, so a
+    workspace beside a plain operand asks for a block contraction with nothing
+    saying which block.
+  - The operands need not agree in dtype: accumulation is f32 whatever is
+    loaded.
+  - Both forms lower to the single public runtime entry
+    `tilefoundry::ops::dot(lhs, rhs, dst[, workspace])`.
 
 #### Generic kind-tagged effect Ops (`tir.arith`)
 
@@ -1010,3 +1061,174 @@ class CpAsyncWait(Op):
 - constraints:
   - `n` is a non-negative compile-time count.
   - `n = 0` drains every outstanding committed group.
+
+##### TmaCopy
+
+A staging copy whose completion lands on an mbarrier, and not a tier of
+`CopyAsync`: there every thread issues its own load and a commit closes the
+group, so the thread that issues is the thread that waits; here a consumer can
+wait for a tile it did not fetch.
+
+Which instruction carries it is the runtime's choice from the operand shard
+layouts, not something this op names: a contiguous run takes `cp.async.bulk`,
+anything else takes an element path ([runtime
+§3](./runtime.md#3-runtime-ops)).
+Carrying that on the op would be codegen selecting a tier, which
+[§2.3](#23-tir-ops) forbids.
+
+The tensor forms (`cp.async.bulk.tensor.Nd`) take a host-encoded `TensorMap` in
+place of a size, which is a different operand list rather than a different tier,
+and are outside this op.
+
+```python
+class TmaCopy(Op):
+    """Effect form; gmem→smem staging copy completing on an mbarrier.
+
+    Attributes:
+        src: input; gmem source tile.
+        dst: input; smem destination tile.
+        barrier: input; smem mbarrier the completion lands on.
+    """
+
+    src: Tensor
+    dst: Tensor
+    barrier: Tensor
+```
+- constraints:
+  - `src` is gmem, `dst` is smem, `barrier` is smem.
+  - `src` and `dst` agree in dtype and shape; the copy moves bytes and does not
+    convert them.
+  - Nothing blocks: the copy may still be in flight when the issuing thread
+    reaches the next statement.
+  - Consumers wait with `MBarrierWaitParity`. The arrival that declares the
+    transferred bytes is the implementation's, issued on the same instruction as
+    the copy; a caller pairing this with its own `MBarrierArriveExpectTx` would
+    be declaring a count the op already knows.
+  - Lowers to `tilefoundry::ops::tma_copy(src, dst, bar)`
+    ([runtime §3](./runtime.md#3-runtime-ops)). `barrier` is a tensor here
+    because that is what TIR names a piece of shared memory with, and a word to
+    the runtime, so the emitted call hands over the word's own address.
+
+#### Barrier object Ops (`tir.sync.mbarrier_*`)
+
+A Hopper mbarrier is a 64-bit shared-memory word carrying an arrival count, a
+transaction-byte count and a phase parity. It is not `Sync`
+([§1.5](#15-sync)): `Sync` is a whole-mesh rendezvous every participant reaches,
+while these let a producer signal completion of work the consumer did not
+perform — which is what an asynchronous copy needs, since the thread that issues
+one is not the thread that waits for it.
+
+**Each lowers to its instruction, not to a runtime entry, and the runtime
+publishes no `ops::` entry for any of them:** an mbarrier is a shared-memory
+word, so nothing here reads a `ShardLayout` and none of it is an op
+([runtime §3](./runtime.md#3-runtime-ops)). Each entry below names the
+`mbarrier.*` instruction its emitter writes at the call site, together with the
+generic-to-shared conversion the instruction takes — they name `.shared::cta`
+explicitly rather than leaving the assembler to redo that window conversion on
+every use.
+
+The group is what a `TmaCopy` ring needs and no more: arm the word, arrive on it
+declaring bytes, wait on its phase, release it. A bare `mbarrier.arrive` is
+absent because `ops::tma_copy` issues its own for the strided tier, and a bare
+`mbarrier.expect_tx` because nothing pairs with it.
+
+##### MBarrierInit
+
+```python
+class MBarrierInit(Op):
+    """Effect form; arm a barrier for a fixed number of arrivals.
+
+    Attributes:
+        barrier: input; smem barrier object.
+        arrive_count: attribute; arrivals that complete one phase.
+    """
+
+    barrier: Tensor
+    arrive_count: int
+```
+- constraints:
+  - `barrier` is smem; the instructions take a shared-window address.
+  - `arrive_count` is a positive compile-time count. A phase needing zero
+    arrivals is complete before anything is produced, which makes every
+    consumer's wait a no-op.
+  - One thread initialises, and a `Sync` covering every thread that will use the
+    barrier separates this from the first arrival or wait.
+  - Lowers to `mbarrier.init.shared::cta.b64`, written at the call site with
+    `arrive_count` as an inline operand: the runtime publishes no entry for it
+    ([runtime §3](./runtime.md#3-runtime-ops)).
+
+##### MBarrierArriveExpectTx
+
+```python
+class MBarrierArriveExpectTx(Op):
+    """Effect form; arrive and declare asynchronous bytes in one instruction.
+
+    Attributes:
+        barrier: input; smem barrier object.
+        tx_bytes: attribute; bytes the paired copy delivers to this phase.
+    """
+
+    barrier: Tensor
+    tx_bytes: int
+```
+- constraints:
+  - `barrier` is smem and `tx_bytes` is a positive compile-time count.
+  - The phase completes when both the arrivals and the byte count are satisfied,
+    so one wait covers a copy the waiting thread did not issue.
+  - `tx_bytes` MUST equal the bytes the paired copy delivers. A phase expecting a
+    different count never completes, and that failure presents as a hang rather
+    than as a wrong value.
+  - This is not paired with a `TmaCopy`, which declares its own bytes on the
+    instruction that issues the copy. It belongs to a producer issuing one
+    itself.
+  - Lowers to `mbarrier.arrive.expect_tx.shared::cta.b64`, with the arrival
+    token discarded: consumers wait on the phase parity, not on a token handed
+    between threads. The runtime publishes no entry for it; `ops::tma_copy`
+    writes its own for the bulk tier.
+
+##### MBarrierWaitParity
+
+```python
+class MBarrierWaitParity(Op):
+    """Effect form; block until the barrier's phase parity reaches a value.
+
+    Attributes:
+        barrier: input; smem barrier object.
+        phase: input; the parity waited for.
+    """
+
+    barrier: Tensor
+    phase: Tensor
+```
+- constraints:
+  - `barrier` is smem.
+  - The parity alternates `0, 1, 0, ...` across successive completions, which is
+    what lets a fixed ring of barriers serve a pipeline of any length: stage `t`
+    of a ring of `n` waits on parity `(t // n) & 1`.
+  - Lowers to a single `mbarrier.try_wait.parity.shared::cta.b64` under a **C++**
+    loop, not a PTX one: a label inside inline asm is emitted once per
+    instantiation and collides as soon as two of them land in one translation
+    unit, and `try_wait` already parks the warp in hardware for a bounded
+    interval, so the loop is not a busy spin on the issue pipe. The runtime
+    publishes no entry for it.
+  - `phase` is a value and not an attribute — the parity is a function of the
+    stage index — and lowers through the same scalar-expression renderer as
+    `If.cond`, so a loop induction variable or a constant reaches the
+    instruction and anything else is refused at codegen.
+
+##### MBarrierInvalidate
+
+```python
+class MBarrierInvalidate(Op):
+    """Effect form; release the barrier's shared-memory word.
+
+    Attributes:
+        barrier: input; smem barrier object.
+    """
+
+    barrier: Tensor
+```
+- constraints:
+  - `barrier` is smem.
+  - Lowers to `mbarrier.inval.shared::cta.b64`, written at the call site: the
+    runtime publishes no entry for it.

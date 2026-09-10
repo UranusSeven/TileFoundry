@@ -1,10 +1,11 @@
-"""Codegen for generic Binary and Unary TIR effect-form Ops — tag-dispatched."""
+"""Codegen for the generic Binary and Unary TIR effect-form Ops."""
 
 from __future__ import annotations
 
 from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
 from tilefoundry.ir.tir.arith import Binary, BinaryKind, Unary, UnaryKind
 from tilefoundry.ir.types.shape_helpers import (
+    shape_has_dim_var,
     shape_numel_upper_bound,
     shape_runtime_total,
     shape_upper_bound,
@@ -23,9 +24,8 @@ _UNARY_TAG = {
     UnaryKind.NEG: "tilefoundry::ops::neg_op",
     UnaryKind.RELU: "tilefoundry::ops::relu_op",
     UnaryKind.SQUARE: "tilefoundry::ops::square_op",
+    UnaryKind.CAST: "tilefoundry::ops::identity_op",
 }
-
-
 
 
 def _materialised_shape(ty) -> tuple:
@@ -79,58 +79,130 @@ def _tensor_expr(var, ctx: CodegenContext) -> str:
     return f"{base}_tensor" if ctx.is_kernel_param(var) else base
 
 
+def _extent(e) -> str:
+    """A cute shape entry: static extents stay in the type, dynamic ones do not."""
+    return f"cute::Int<{int(e)}>{{}}" if isinstance(e, int) else str(e)
+
+
+def _broadcast_modes(dst_shape, rhs_shape, n_dst_runtime) -> tuple | None:
+    """The destination-shaped layout *rhs* is read through, or ``None``.
+
+    Every shape relation the retired ``binary_bcast_*`` family named is one
+    ``(shape, stride)`` pair over the destination's domain -- 1 on an axis
+    ``rhs`` supplies, 0 on one it does not. ``None`` means it already spans the
+    domain. The tests keep the old family's order, so the same programs match
+    the same way; ``cell`` and ``col`` land on one layout because they were one
+    relation written twice. *n_dst_runtime* may be a C++ expression: a stride-0
+    mode does not care what its extent is.
+    """
+    n_dst = shape_numel_upper_bound(dst_shape) if dst_shape else 1
+    n_rhs = shape_numel_upper_bound(rhs_shape) if rhs_shape else 1
+    if n_rhs >= n_dst:
+        return None
+    if n_rhs == 1:
+        return (n_dst_runtime,), (0,)
+    if (
+        len(dst_shape) == 2
+        and len(rhs_shape) == 2
+        and rhs_shape[-1] == 1
+        and dst_shape[0] == rhs_shape[0]
+    ):
+        return tuple(int(d) for d in dst_shape), (1, 0)
+    if len(dst_shape) == 2 and len(rhs_shape) == 1 and dst_shape[-1] == rhs_shape[0]:
+        return tuple(int(d) for d in dst_shape), (0, 1)
+    if n_dst % n_rhs == 0:
+        return (n_rhs, n_dst // n_rhs), (1, 0)
+    return None
+
+
+def broadcast_view(rhs_n: str, modes, ctx: CodegenContext) -> str:
+    """Bind *rhs_n* read through a stride-0 layout, and name the binding."""
+    shape, stride = modes
+    ctx._counter += 1
+    name = f"bcast_{ctx._counter}"
+    shape_args = ", ".join(_extent(s) for s in shape)
+    stride_args = ", ".join(f"cute::Int<{int(s)}>{{}}" for s in stride)
+    ctx.emit(
+        f"auto {name} = tilefoundry::ops::detail::to_local({rhs_n}).compose("
+        f"cute::make_layout(cute::make_shape({shape_args}), "
+        f"cute::make_stride({stride_args})));"
+    )
+    return name
+
+
+def _dyn_clip(dst, operands, ctx: CodegenContext) -> str | None:
+    """The run-time count a plain dynamic operand set has to be clipped to."""
+    if any(isinstance(getattr(v.type, "layout", None), ShardLayout)
+           for v in (dst, *operands)):
+        return None
+    if not shape_has_dim_var(dst.type.shape):
+        return None
+    return str(shape_runtime_total(dst.type.shape, ctx._dim_var_runtime))
+
+
+def _binary_fn(tag: str, dst_t: str, in_ts: tuple[str, ...]) -> str:
+    """The ``fn`` a binary kind calls with: the op tag, or a lambda."""
+    if len({dst_t, *in_ts}) <= 1:
+        return f"{tag}{{}}"
+    return (
+        f"[](auto a, auto b) {{ return {tag}{{}}({dst_t}(a), {dst_t}(b)); }}"
+    )
+
+
+def _cpp_dtype(ty, ctx: CodegenContext) -> str:
+    return ctx.dtype_to_cpp(ty.dtype.name)
+
+
 @register_codegen_cuda(Binary)
 def _emit_binary(call, ctx: CodegenContext) -> None:
     lhs, rhs, dst = call.args
-    op = call.target
     lhs_n = _tensor_expr(lhs, ctx)
     rhs_n = _tensor_expr(rhs, ctx)
     dst_n = _tensor_expr(dst, ctx)
-    op_tag = _BINARY_TAG[op.kind]
 
+    modes = _broadcast_modes(
+        _materialised_shape(dst.type),
+        _materialised_shape(rhs.type),
+        _runtime_total(dst.type, ctx),
+    )
+    if modes is not None:
+        rhs_n = broadcast_view(rhs_n, modes, ctx)
 
-
-    l_shape = _materialised_shape(lhs.type)
-    r_shape = _materialised_shape(rhs.type)
-
-    if not r_shape or shape_numel_upper_bound(r_shape) == 1:
-        N = _runtime_total(lhs.type, ctx)
-        ctx.emit(f"tilefoundry::ops::binary_bcast_scalar({lhs_n}, {rhs_n}, {dst_n}, {N}, {op_tag}{{}});")
-    elif len(l_shape) == 2 and len(r_shape) == 2 and r_shape[-1] == 1 and l_shape[0] == r_shape[0]:
-        M, K = int(l_shape[0]), int(l_shape[1])
-        ctx.emit(f"tilefoundry::ops::binary_bcast_col({lhs_n}, {rhs_n}, {dst_n}, {M}, {K}, {op_tag}{{}});")
-    elif len(l_shape) == 2 and len(r_shape) == 1 and l_shape[-1] == r_shape[0]:
-        M, K = int(l_shape[0]), int(l_shape[1])
-        ctx.emit(f"tilefoundry::ops::binary_bcast_row({lhs_n}, {rhs_n}, {dst_n}, {M}, {K}, {op_tag}{{}});")
-    elif (
-        shape_numel_upper_bound(l_shape) % shape_numel_upper_bound(r_shape) == 0
-        and shape_numel_upper_bound(l_shape) > shape_numel_upper_bound(r_shape)
-    ):
-
-
-
-        n_dst = shape_numel_upper_bound(r_shape)
-        step = shape_numel_upper_bound(l_shape) // n_dst
-        ctx.emit(
-            f"tilefoundry::ops::binary_cell_bcast({lhs_n}, {rhs_n}, {dst_n}, "
-            f"{n_dst}, {step}, {op_tag}{{}});"
-        )
-    else:
-        N = _runtime_total(dst.type, ctx)
-        ctx.emit(f"tilefoundry::ops::binary({lhs_n}, {rhs_n}, {dst_n}, {N}, {op_tag}{{}});")
+    fn = _binary_fn(
+        _BINARY_TAG[call.target.kind],
+        _cpp_dtype(dst.type, ctx),
+        (_cpp_dtype(lhs.type, ctx), _cpp_dtype(rhs.type, ctx)),
+    )
+    n = _dyn_clip(dst, (lhs, rhs), ctx)
+    if n is None:
+        ctx.emit(f"tilefoundry::ops::elementwise({dst_n}, {fn}, {lhs_n}, {rhs_n});")
+        return
+    ctx.emit("{")
+    ctx.indent()
+    ctx.emit(f"auto tf_ew_n = cute::make_layout({n});")
+    for view, base in (("tf_ew_dst", dst_n), ("tf_ew_a", lhs_n), ("tf_ew_b", rhs_n)):
+        ctx.emit(f"auto {view} = cute::make_tensor({base}.data(), tf_ew_n);")
+    ctx.emit(f"tilefoundry::ops::elementwise(tf_ew_dst, {fn}, tf_ew_a, tf_ew_b);")
+    ctx.dedent()
+    ctx.emit("}")
 
 
 @register_codegen_cuda(Unary)
 def _emit_unary(call, ctx: CodegenContext) -> None:
+    """One source, always the bare tag -- a unary needs no lambda."""
     src, dst = call.args
-    op = call.target
     src_n = _tensor_expr(src, ctx)
     dst_n = _tensor_expr(dst, ctx)
-
-    N = _runtime_total(dst.type, ctx)
-
-    if op.kind == UnaryKind.CAST:
-        ctx.emit(f"tilefoundry::ops::cast({src_n}, {dst_n}, {N});")
-    else:
-        op_tag = _UNARY_TAG[op.kind]
-        ctx.emit(f"tilefoundry::ops::unary({src_n}, {dst_n}, {N}, {op_tag}{{}});")
+    tag = _UNARY_TAG[call.target.kind]
+    n = _dyn_clip(dst, (src,), ctx)
+    if n is None:
+        ctx.emit(f"tilefoundry::ops::elementwise({dst_n}, {tag}{{}}, {src_n});")
+        return
+    ctx.emit("{")
+    ctx.indent()
+    ctx.emit(f"auto tf_ew_n = cute::make_layout({n});")
+    ctx.emit(f"auto tf_ew_dst = cute::make_tensor({dst_n}.data(), tf_ew_n);")
+    ctx.emit(f"auto tf_ew_src = cute::make_tensor({src_n}.data(), tf_ew_n);")
+    ctx.emit(f"tilefoundry::ops::elementwise(tf_ew_dst, {tag}{{}}, tf_ew_src);")
+    ctx.dedent()
+    ctx.emit("}")

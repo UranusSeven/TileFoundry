@@ -14,12 +14,20 @@ from tilefoundry.codegen.cuda.context import (
     register_codegen_cuda,
     topology_scope_str,
 )
+from tilefoundry.codegen.cuda.tir.reduce import REDUCE_TAG
+from tilefoundry.codegen.cuda.tir.stmts.mesh_scope import (
+    mesh_type,
+    program_topologies,
+)
 from tilefoundry.ir.core import Call, Constant
+from tilefoundry.ir.core.kinds import ReduceKind
 from tilefoundry.ir.tir.memory.tensor_view import TensorView
 from tilefoundry.ir.tir.stmts import LetStmt
+from tilefoundry.ir.tir.sync import participation
 from tilefoundry.ir.types.dim import DimAdd, DimMul, DimSub, DimVar
 from tilefoundry.ir.types.shape_helpers import shape_numel_upper_bound, upper_bound
 from tilefoundry.ir.types.shard import c_order_strides
+from tilefoundry.ir.types.shard.layout import ComposedLayout, Layout
 from tilefoundry.ir.types.shard.shard_layout import (
     Broadcast,
     Dynamic,
@@ -28,6 +36,7 @@ from tilefoundry.ir.types.shard.shard_layout import (
     shard_layout_local_shape,
 )
 from tilefoundry.ir.types.shard.shard_layout import ShardLayout as SL
+from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.ir.visitor import ExprVisitor
 
 
@@ -35,44 +44,52 @@ def _render_layout(shape, strides) -> str:
     """Render a CuTe layout type."""
     shape_args = ", ".join(f"cute::Int<{s}>" for s in shape)
     stride_args = ", ".join(f"cute::Int<{s}>" for s in strides)
-    return (
-        f"cute::Layout<"
-        f"cute::Shape<{shape_args}>, "
-        f"cute::Stride<{stride_args}>>"
-    )
+    return f"cute::Layout<cute::Shape<{shape_args}>, cute::Stride<{stride_args}>>"
+
+
+def _scope_mesh_value(mesh, ctx) -> "str | None":
+    """The name of the enclosing scope's mesh object, when it is this mesh."""
+    if ctx is None or not hasattr(ctx, "_mesh_aliases"):
+        return None
+    entry = ctx._mesh_aliases.get(id(mesh))
+    if entry is None:
+        inline = mesh_type(mesh)
+        entry = next(
+            (e for e in ctx._mesh_aliases.values() if e[1] == inline), None
+        )
+    if entry is None:
+        return None
+    alias = entry[0]
+    return alias[: -len("_mesh_t")] + "_mesh" if alias.endswith("_mesh_t") else None
 
 
 def _render_mesh_type(mesh, ctx=None) -> str:
     """tilefoundry::Mesh<...> — uses scope alias if registered in ctx."""
-    if ctx and hasattr(ctx, '_mesh_aliases'):
-
+    inline = mesh_type(mesh)
+    if ctx and hasattr(ctx, "_mesh_aliases"):
         entry = ctx._mesh_aliases.get(id(mesh))
         if entry:
             return entry[0]
-
-        topo = mesh.topologies[0]
-        scope = topology_scope_str(topo.name)
-        ml = mesh.layout
-        shape_args = ", ".join(f"cute::Int<{s}>" for s in ml.shape)
-        stride_args = ", ".join(f"cute::Int<{s}>" for s in ml.strides)
-        inline = (
-            f"tilefoundry::Mesh<"
-            f"tilefoundry::Topology<{scope}, {topo.size}>, "
-            f"cute::Layout<cute::Shape<{shape_args}>, cute::Stride<{stride_args}>>>"
-        )
         for alias_name, type_str in ctx._mesh_aliases.values():
             if type_str == inline:
                 return alias_name
-    topo = mesh.topologies[0]
-    scope = topology_scope_str(topo.name)
-    ml = mesh.layout
-    shape_args = ", ".join(f"cute::Int<{s}>" for s in ml.shape)
-    stride_args = ", ".join(f"cute::Int<{s}>" for s in ml.strides)
-    return (
-        f"tilefoundry::Mesh<"
-        f"tilefoundry::Topology<{scope}, {topo.size}>, "
-        f"cute::Layout<cute::Shape<{shape_args}>, cute::Stride<{stride_args}>>>"
-    )
+    return inline
+
+
+def _partial_reduction_tag(reduction: str) -> str:
+    """The C++ reduce tag a ``Partial``'s reduction names.
+
+    See [shard §6](docs/spec/shard.md#6-shardattr).
+    """
+    try:
+        kind = ReduceKind(reduction)
+    except ValueError as error:
+        raise NotImplementedError(
+            f"tensor_view: Partial reduction {reduction!r} names no ReduceKind, "
+            f"so there is no C++ reduce tag for it; expected one of "
+            f"{sorted(k.value for k in ReduceKind)}"
+        ) from error
+    return REDUCE_TAG[kind]
 
 
 def _render_attr(a) -> str:
@@ -82,7 +99,7 @@ def _render_attr(a) -> str:
     if isinstance(a, Broadcast):
         return "tilefoundry::shard::B"
     if isinstance(a, Partial):
-        return "tilefoundry::shard::P<void>"
+        return f"tilefoundry::shard::P<{_partial_reduction_tag(a.reduction)}>"
     if isinstance(a, Dynamic):
         return "tilefoundry::shard::Dynamic"
     return f"/* unknown attr {type(a).__name__} */"
@@ -93,31 +110,83 @@ def _render_shard_layout_type(sl: SL, ctx=None) -> str:
     layout_str = _render_layout(sl.layout.shape, sl.layout.strides)
     attrs_str = ", ".join(_render_attr(a) for a in sl.attrs)
     mesh_str = _render_mesh_type(sl.mesh, ctx)
-    return (
-        f"tilefoundry::ShardLayout<"
-        f"{layout_str}, "
-        f"cute::tuple<{attrs_str}>, "
-        f"{mesh_str}>"
-    )
+    return f"tilefoundry::ShardLayout<{layout_str}, cute::tuple<{attrs_str}>, {mesh_str}>"
 
 
+def _composed_mesh_layout(positions: str, base: int) -> str:
+    """A mesh layout value expression, its slice origin folded in.
+
+    See [runtime §2.3.2](docs/spec/runtime.md#232-layoutmeshcuh).
+    """
+    if not base:
+        return positions
+    return f"cute::make_composed_layout(cute::identity{{}}, cute::Int<{base}>{{}}, {positions})"
 
 
-def render_shard_layout_value(var_name: str, sl: SL, dim_var_runtime=None):
+def register_strides(sl: SL) -> tuple[int, ...]:
+    """``sl``'s strides as steps on a *register* engine, not on a shared buffer.
+
+    Registers are the distinct-engine-per-instance case of [shard
+    §7.1.2](docs/spec/shard.md#712-layoutstrides): a ``Split(k)`` axis gets
+    ``0``, so the projection offsets no instance along it, and the rest get
+    the array's own steps -- the compact product in mode order, fastest
+    first, which is how ``_emit_plain_alloc`` lays the backing array out. An
+    extent-1 axis names no step.
+    """
+    local = shard_layout_local_shape(sl, require_static=False)
+    split_axes = {int(a.axis) for a in sl.attrs if isinstance(a, Split)}
+    strides: list[int] = []
+    step = 1
+    for axis, extent in enumerate(local):
+        width = int(upper_bound(extent))
+        if axis in split_axes or width == 1:
+            strides.append(0)
+        else:
+            strides.append(step)
+            step *= width
+    return tuple(strides)
+
+
+def render_shard_layout_value(
+    var_name: str, sl: SL, dim_var_runtime=None, storage=None, ctx=None
+):
     """Render a shard layout as runtime C++ preamble and value expression.
 
     Static values retain the type produced by the type renderer. Runtime
     dimension mappings supply dynamic globals and ``program_dim<cta>()``
     supplies a launch-provided mesh extent. Missing or unmapped dynamic values
-    raise instead of falling back to an envelope bound.
+    raise instead of falling back to an envelope bound. A sliced mesh reaches
+    the value the same way it reaches the type: through the mesh layout directly.
+    *storage* is the engine's storage class: ``rmem`` takes
+    ``register_strides``, anything else the layout's own.
     """
-    sll, ml, topo = sl.layout, sl.mesh.layout, sl.mesh.topologies[0]
+    sll = sl.layout
+    if storage is StorageKind.RMEM:
+        sll = Layout(shape=sll.shape, strides=register_strides(sl))
+    mesh_layout = sl.mesh.layout
+    if isinstance(mesh_layout, ComposedLayout):
+        mesh_outer = mesh_layout.outer
+        if not isinstance(mesh_outer, Layout) or mesh_outer.strides is None:
+            raise NotImplementedError(
+                "render_shard_layout_value: a sliced mesh needs its participating "
+                "box as a strided Layout; this states an identity box, with no sub-box"
+            )
+        participation(sl.mesh)
+        ml_shape, ml_strides, ml_base = (
+            mesh_outer.shape,
+            mesh_outer.strides,
+            int(mesh_layout.offset),
+        )
+    else:
+        if mesh_layout.strides is None:
+            raise NotImplementedError("render_shard_layout_value: mesh layout needs strides")
+        ml_shape, ml_strides, ml_base = mesh_layout.shape, mesh_layout.strides, 0
+    topo = program_topologies(sl.mesh)[0]
 
     def _static_dim(value, what):
         if not isinstance(value, int):
             raise NotImplementedError(
-                f"render_shard_layout_value: dynamic {what} ({value!r}) is not "
-                f"supported"
+                f"render_shard_layout_value: dynamic {what} ({value!r}) is not supported"
             )
         return f"cute::Int<{value}>{{}}"
 
@@ -137,14 +206,9 @@ def render_shard_layout_value(var_name: str, sl: SL, dim_var_runtime=None):
                     f"has no runtime shape scalar"
                 )
             return scalar
-        raise NotImplementedError(
-            f"render_shard_layout_value: unsupported layout dim {d!r}"
-        )
+        raise NotImplementedError(f"render_shard_layout_value: unsupported layout dim {d!r}")
 
-
-
-
-    n_dynamic = sum(1 for d in ml.shape if d is None)
+    n_dynamic = sum(1 for d in ml_shape if d is None)
     if n_dynamic > 1:
         raise NotImplementedError(
             "render_shard_layout_value: at most one dynamic (launch-provided) "
@@ -157,8 +221,7 @@ def render_shard_layout_value(var_name: str, sl: SL, dim_var_runtime=None):
         )
     if n_dynamic == 1 and not dim_var_runtime:
         raise NotImplementedError(
-            "render_shard_layout_value: a dynamic CTA mesh extent requires a "
-            "runtime shape mapping"
+            "render_shard_layout_value: a dynamic CTA mesh extent requires a runtime shape mapping"
         )
 
     def _mesh_dim(d):
@@ -170,24 +233,30 @@ def render_shard_layout_value(var_name: str, sl: SL, dim_var_runtime=None):
     ml_var = f"{var_name}__mesh_layout"
     mesh_var = f"{var_name}__mesh"
 
-    sl_shape = ", ".join(_global_dim(d) for d in sll.shape)
-    sl_stride = ", ".join(_static_dim(s, "shard layout stride") for s in sll.strides)
-    ml_shape = ", ".join(_mesh_dim(d) for d in ml.shape)
-    ml_stride = ", ".join(_static_dim(s, "mesh layout stride") for s in ml.strides)
+    sl_shape_args = ", ".join(_global_dim(d) for d in sll.shape)
+    sl_stride_args = ", ".join(_static_dim(s, "shard layout stride") for s in sll.strides)
+    ml_shape_args = ", ".join(_mesh_dim(d) for d in ml_shape)
+    ml_stride_args = ", ".join(_static_dim(s, "mesh layout stride") for s in ml_strides)
 
     scope = topology_scope_str(topo.name)
+    positions = (
+        f"cute::make_layout(cute::make_shape({ml_shape_args}), cute::make_stride({ml_stride_args}))"
+    )
+    mesh_layout = _composed_mesh_layout(positions, ml_base)
 
-
-    topo_size = topo.size if isinstance(topo.size, int) else 0
     attrs = ", ".join(_render_attr(a) for a in sl.attrs)
     preamble = [
         f"auto {sl_var} = cute::make_layout("
-        f"cute::make_shape({sl_shape}), cute::make_stride({sl_stride}));",
-        f"auto {ml_var} = cute::make_layout("
-        f"cute::make_shape({ml_shape}), cute::make_stride({ml_stride}));",
-        f"tilefoundry::Mesh<tilefoundry::Topology<{scope}, {topo_size}>, "
-        f"decltype({ml_var})> {mesh_var}{{{ml_var}}};",
+        f"cute::make_shape({sl_shape_args}), cute::make_stride({sl_stride_args}));",
     ]
+    scope_mesh = _scope_mesh_value(sl.mesh, ctx)
+    if scope_mesh is not None:
+        mesh_var = scope_mesh
+    else:
+        preamble += [
+            f"auto {ml_var} = {mesh_layout};",
+            f"tilefoundry::Mesh<decltype({ml_var}), {scope}> {mesh_var}{{{ml_var}}};",
+        ]
     value_expr = (
         f"tilefoundry::ShardLayout<decltype({sl_var}), cute::tuple<{attrs}>, "
         f"decltype({mesh_var})>{{{sl_var}, {mesh_var}}}"
@@ -218,8 +287,7 @@ class _CoordinateVisitor(ExprVisitor[str]):
         if dims == (1,):
             return f"{name}_tensor(0)" if ctx.is_kernel_param(expr) else f"{name}(0)"
         raise NotImplementedError(
-            f"local_tile coordinate from a rank-{len(dims)} offset {dims} "
-            "is not supported"
+            f"local_tile coordinate from a rank-{len(dims)} offset {dims} is not supported"
         )
 
     def default_visit(self, expr, ctx: CodegenContext) -> str:
@@ -245,16 +313,8 @@ def _emit(let: LetStmt, ctx: CodegenContext) -> None:
     var_name = ctx.name_for(let.var)
     layout = call.target.layout
 
-
-
-
-
-
-
     if len(call.args) > 1:
         mem_name = ctx.name_for(memory_var)
-
-
 
         if len(call.args) > 2:
             logical_coords = call.args[1:]
@@ -322,12 +382,6 @@ def _emit(let: LetStmt, ctx: CodegenContext) -> None:
             return
         index_var = call.args[1]
         if isinstance(getattr(memory_var.type, "layout", None), SL):
-
-
-
-
-
-
             tensor_ref = f"tilefoundry::local({mem_name})"
             win_layout = getattr(let.var.type, "layout", None)
             if isinstance(win_layout, SL):
@@ -341,11 +395,7 @@ def _emit(let: LetStmt, ctx: CodegenContext) -> None:
             else:
                 tensor_ref = mem_name
 
-
-
-            K = reduce(
-                mul, (int(upper_bound(s)) for s in let.var.type.shape), 1
-            )
+            K = reduce(mul, (int(upper_bound(s)) for s in let.var.type.shape), 1)
         offset_name = f"{var_name}__offset"
         ctx.emit(
             f"auto {offset_name} = cute::domain_offset({_coord_ref(index_var, ctx)}, {tensor_ref});"
@@ -362,14 +412,15 @@ def _emit(let: LetStmt, ctx: CodegenContext) -> None:
         mem_name = ctx.name_for(memory_var)
 
         if ctx.is_kernel_param(memory_var):
-
             tensor_ref = f"{mem_name}_tensor"
             global_total = shape_numel_upper_bound(memory_var.type.shape)
-            global_layout = (
-                f"cute::make_layout(cute::Shape<cute::Int<{global_total}>>{{}})"
-            )
+            global_layout = f"cute::make_layout(cute::Shape<cute::Int<{global_total}>>{{}})"
             preamble, shard_value = render_shard_layout_value(
-                var_name, layout, getattr(ctx, "_dim_var_runtime", None)
+                var_name,
+                layout,
+                getattr(ctx, "_dim_var_runtime", None),
+                getattr(let.var.type, "storage", None),
+                ctx,
             )
             for line in preamble:
                 ctx.emit(line)
@@ -378,25 +429,30 @@ def _emit(let: LetStmt, ctx: CodegenContext) -> None:
                 f"{tensor_ref}, {global_layout}, {shard_value});"
             )
         else:
-
-
-            local_shape = shard_layout_local_shape(layout)
-            local_shape = tuple(s for s in local_shape if s != 1) or (1,)
-            if len(local_shape) > 1:
-                shape_args = ", ".join(f"cute::Int<{int(s)}>" for s in local_shape)
-                tensor_layout = f"cute::make_layout(cute::Shape<{shape_args}>{{}})"
+            source_layout = getattr(memory_var.type, "layout", None)
+            if isinstance(source_layout, SL):
+                ctx.emit(f"auto {var_name}_tensor = {mem_name}.engine;")
             else:
-                tensor_layout = f"cute::make_layout(cute::Shape<cute::Int<{int(local_shape[0])}>>{{}})"
-            ctx.emit(
-                f"auto {var_name}_tensor = cute::make_tensor("
-                f"{mem_name}, {tensor_layout});"
-            )
+                local_shape = shard_layout_local_shape(layout)
+                local_shape = tuple(s for s in local_shape if s != 1) or (1,)
+                if len(local_shape) > 1:
+                    shape_args = ", ".join(f"cute::Int<{int(s)}>" for s in local_shape)
+                    tensor_layout = f"cute::make_layout(cute::Shape<{shape_args}>{{}})"
+                else:
+                    tensor_layout = (
+                        f"cute::make_layout(cute::Shape<cute::Int<{int(local_shape[0])}>>{{}})"
+                    )
+                ctx.emit(
+                    f"auto {var_name}_tensor = cute::make_tensor({mem_name}, {tensor_layout});"
+                )
             target_total = shape_numel_upper_bound(let.var.type.shape)
-            target_global = (
-                f"cute::make_layout(cute::Shape<cute::Int<{target_total}>>{{}})"
-            )
+            target_global = f"cute::make_layout(cute::Shape<cute::Int<{target_total}>>{{}})"
             preamble, shard_value = render_shard_layout_value(
-                var_name, layout, getattr(ctx, "_dim_var_runtime", None)
+                var_name,
+                layout,
+                getattr(ctx, "_dim_var_runtime", None),
+                getattr(let.var.type, "storage", None),
+                ctx,
             )
             for line in preamble:
                 ctx.emit(line)

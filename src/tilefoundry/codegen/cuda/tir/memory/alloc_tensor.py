@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
 from tilefoundry.codegen.cuda.tir.memory.tensor_view import render_shard_layout_value
+from tilefoundry.codegen.cuda.tir.stmts.mesh_scope import program_topologies
 from tilefoundry.ir.tir.memory import AllocTensor
 from tilefoundry.ir.tir.stmts import LetStmt
 from tilefoundry.ir.types.shape_helpers import (
@@ -31,12 +32,16 @@ def _emit_plain_alloc(
     storage: StorageKind,
     local_shape: tuple,
 ) -> str:
-    """Emit plain alloc.
+    """Emit the backing cute tensor and return the identifier for it.
 
-    Emit the per-thread / per-CTA backing cute tensor and return
-    the C++ identifier the caller can use as the engine for a
-    ``make_shard_tensor`` wrap (or directly as the visible name when
-    no shard wrap is needed).
+    The caller uses it as the engine of a ``make_shard_tensor`` wrap, or
+    directly as the visible name when no wrap is needed.
+
+    Registers get a named array and a pointer engine, never
+    ``make_tensor<T>(layout)``: that builds an ``ArrayEngine`` holding its
+    storage inside the tensor object, and ``ShardTensor`` keeps its engine by
+    value, so wrapping one copies the registers and writes through ``local()``
+    land in the copy.
     """
     if storage is StorageKind.UMAT:
         raise ValueError(
@@ -60,6 +65,12 @@ def _emit_plain_alloc(
             f"auto {name} = cute::make_tensor("
             f"cute::make_smem_ptr({name}_buf), {layout});"
         )
+    elif storage == StorageKind.RMEM:
+        ctx.emit(f"__align__(16) {cpp_type} {name}_buf[{total}];")
+        ctx.emit(
+            f"auto {name} = cute::make_tensor("
+            f"cute::make_rmem_ptr({name}_buf), {layout});"
+        )
     else:
         ctx.emit(f"auto {name} = cute::make_tensor<{cpp_type}>({layout});")
     return name
@@ -70,7 +81,12 @@ def _emit(let: LetStmt, ctx: CodegenContext) -> None:
     """Materialize plain or sharded storage for one allocation.
 
     Shard layout shapes are global and backing storage uses their derived local
-    shape. See [shard §7.1.1](docs/spec/shard.md#711-layoutshape).
+    shape, except for shared memory split across the block's *threads*: shared
+    memory belongs to the CTA, ``local()`` offsets into it by the instance's
+    own base, and a buffer sized to one instance's share is read past by every
+    instance but the first. The local shape stays right for rmem -- a thread's
+    registers are its own -- and for a cta-scoped mesh, where each CTA owns its
+    slice. See [shard §7.1.1](docs/spec/shard.md#711-layoutshape).
     """
     var = let.var
     name = ctx.name_for(var)
@@ -84,8 +100,14 @@ def _emit(let: LetStmt, ctx: CodegenContext) -> None:
 
 
 
-        local_shape = shard_layout_local_shape(layout_obj)
-        local_shape = tuple(s for s in local_shape if s != 1) or (1,)
+        if (
+            storage is StorageKind.SMEM
+            and program_topologies(layout_obj.mesh)[0].name == "thread"
+        ):
+            backing_shape = shape_upper_bound(layout_obj.layout.shape)
+        else:
+            backing_shape = shard_layout_local_shape(layout_obj)
+        local_shape = tuple(s for s in backing_shape if s != 1) or (1,)
 
 
         buf_name = f"{name}_buf_t"
@@ -100,7 +122,7 @@ def _emit(let: LetStmt, ctx: CodegenContext) -> None:
             f"cute::make_layout(cute::Shape<cute::Int<{global_total}>>{{}})"
         )
         preamble, shard_value = render_shard_layout_value(
-            name, layout_obj, getattr(ctx, "_dim_var_runtime", None)
+            name, layout_obj, getattr(ctx, "_dim_var_runtime", None), storage, ctx
         )
         for line in preamble:
             ctx.emit(line)

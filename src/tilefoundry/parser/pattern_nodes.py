@@ -2246,6 +2246,11 @@ class CallPattern(ElementPattern):
         A ``Tuple[T]`` input consumes exactly one explicit sequence and flattens
         its elements into ``Call.args``. Attributes remain keyword-only, so the
         sequence boundary cannot be confused with an attribute position.
+
+        An input declared ``optional`` may be left off the end of the call. A
+        resource operand such as ``reduce``'s or ``dot``'s workspace is present
+        only in the form that needs one, so counting it as required would make
+        the other form unauthorable.
         """
         params = tuple(schema.signature)
         inputs = [param for param in params if param.kind == "input"]
@@ -2333,11 +2338,12 @@ class CallPattern(ElementPattern):
                     "allocation" if param.annotation is runtime.TensorType else param.name,
                 )
             )
-        if not variadic and len(positional) < len(inputs):
+        required = [param for param in inputs if not param.optional]
+        if not variadic and len(positional) < len(required):
             return PatternFailure(
                 "op_call",
                 node,
-                f"{schema.name} takes {len(inputs)} inputs, got {len(positional)}",
+                f"{schema.name} takes {len(required)} inputs, got {len(positional)}",
             )
         return tuple(children)
 

@@ -5,10 +5,12 @@ from __future__ import annotations
 from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
 from tilefoundry.ir.tir.reduce import Reduce, ReduceKind
 
-_REDUCE_TAG = {
+REDUCE_TAG = {
     ReduceKind.MEAN: "tilefoundry::ops::mean_op",
-    ReduceKind.SUM: "tilefoundry::ops::sum_op",
+    ReduceKind.SUM: "tilefoundry::ops::add_op",
     ReduceKind.ABS_MAX: "tilefoundry::ops::absmax_op",
+    ReduceKind.MAX: "tilefoundry::ops::max_op",
+    ReduceKind.MIN: "tilefoundry::ops::min_op",
 }
 
 
@@ -29,7 +31,7 @@ def _emit(call, ctx: CodegenContext) -> None:
     src, dst = call.args[0], call.args[1]
     src_n = ctx.name_for(src)
     dst_n = ctx.name_for(dst)
-    op_tag = _REDUCE_TAG[call.target.kind]
+    op_tag = REDUCE_TAG[call.target.kind]
     axes_t = _axes_pack_typename(call.target.axes)
 
 

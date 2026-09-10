@@ -4,13 +4,10 @@
 
 #include "copy/copy_impl.h"
 
-/// ``copy_n`` is a plain per-element copy (with dtype conversion) — routed
-/// through the shared ``unary_impl::Unary`` skeleton via the ``identity_op``
-/// tag (unary.cuh), identically to ``cast`` (cast.cuh): the two public
-/// entries name the same operation for different call sites.
+/// Copy one projected slice to another.
 template <class TSrc, class TDst>
-__device__ void copy_n(TSrc const &src, TDst &dst, int N) {
-    unary_impl::Unary<identity_op>{}(src, dst, N);
+__device__ void copy(TSrc const &src, TDst &dst) {
+    copy_impl::Copy{}(src, dst);
 }
 
 template <class TSrc, class TDst>

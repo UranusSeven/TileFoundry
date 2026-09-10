@@ -63,6 +63,7 @@ class ReduceKind(enum.Enum):
     SUM = "sum"
     ABS_MAX = "abs_max"
     MAX = "max"
+    MIN = "min"
 
 
 __all__ = ["BinaryKind", "UnaryKind", "ReduceKind"]

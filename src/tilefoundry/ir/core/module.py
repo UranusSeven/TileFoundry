@@ -37,6 +37,11 @@ def subtree(root: "Module"):
         yield from subtree(child)
 
 
+def module_functions(root: "Module") -> tuple[ModuleFunction, ...]:
+    """Return every function owned by *root* or one of its descendants."""
+    return tuple(function for node in subtree(root) for function in node.functions)
+
+
 def owning_module(root: "Module", function: object) -> "Module | None":
     """The one node of *root*'s subtree that owns *function*, else ``None``.
 
@@ -326,7 +331,7 @@ class Module:
         The functions whose name matches, in source order (0 or 1 of them in
         a verified module).
         """
-        return tuple(fn for fn in self.functions if fn.name == name)
+        return tuple(fn for fn in module_functions(self) if fn.name == name)
 
     def lookup(self, name: str) -> ModuleFunction:
         """The function named *name*; raises unless exactly one matches."""
@@ -641,6 +646,7 @@ __all__ = [
     "ModuleFunction",
     "called_functions",
     "function_selectors",
+    "module_functions",
     "owning_module",
     "reachable_functions",
     "select",

@@ -14,7 +14,6 @@
 /// ``reduce_impl::reduce_traits<Op>`` (reduce/reduce_common_impl.h), consumed
 /// uniformly by all four reduce tiers below.
 struct mean_op {};
-struct sum_op {};
 struct absmax_op {};
 
 /// ── Sharded reduce ───────────────────────────────
@@ -29,29 +28,38 @@ struct absmax_op {};
 
 /// Single public reduce entry: ``dst = reduce_kind(src)`` over ``Axes``.
 ///
-/// Sharded operands (a nested ``shard_layout_type``) select an intra-warp,
-/// intra-CTA, or cross-warp tier: with no workspace the reduce mesh lives
-/// inside a single warp (intra-warp); otherwise the (src, dst) shard layouts
-/// pick the intra-CTA (lane-reduced) vs. cross-warp tier and its
-/// ``warps_per_group``. Non-sharded operands take the plain rank-aware fold.
+/// Dispatch the reduction tier from operand shard layouts.
 template <class Op, class Axes, class Src, class Dst,
           class Ws = reduce_impl::no_workspace_t>
 __device__ inline void reduce(Src const &src, Dst &dst, Ws &&ws = {}) {
-    if constexpr (reduce_impl::has_shard_layout_v<cute::remove_cvref_t<Src>>) {
+    reduce_impl::check_reduce_domain<Src, Dst>();
+    if constexpr (tilefoundry::detail::ShardTensorLike<Src>) {
         using SLs = typename cute::remove_cvref_t<Src>::shard_layout_type;
         using SLd = typename cute::remove_cvref_t<Dst>::shard_layout_type;
-        if constexpr (std::is_same_v<cute::remove_cvref_t<Ws>,
-                                     reduce_impl::no_workspace_t>) {
+        constexpr reduce_impl::reduce_dispatch_info plan =
+            reduce_impl::reduce_dispatch<SLs, SLd>();
+        constexpr bool has_ws = !std::is_same_v<cute::remove_cvref_t<Ws>,
+                                                reduce_impl::no_workspace_t>;
+        static_assert(plan.warp_aligned,
+                      "ops::reduce: a reduced mesh axis must divide into whole "
+                      "lanes and whole warps");
+        if constexpr (!plan.mesh_reduced) {
+            /// Reduce without crossing mesh instances.
+            reduce_impl::Plain<Op, Axes>{}(src, dst);
+        } else if constexpr (plan.warps_per_group == 1) {
+            /// Reduce within one warp.
             reduce_impl::IntraWarp<Op, Axes>{}(src, dst);
+        } else if constexpr (!has_ws) {
+            static_assert(
+                dependent_false_v<Src>,
+                "ops::reduce: these shard layouts spread one value over "
+                "more than one warp");
+        } else if constexpr (plan.lane_reduced) {
+            reduce_impl::IntraCta<Op, Axes>{}(src, dst, ws,
+                                              plan.warps_per_group);
         } else {
-            constexpr reduce_impl::reduce_dispatch_info info =
-                reduce_impl::reduce_dispatch<SLs, SLd>();
-            if constexpr (info.lane_reduced)
-                reduce_impl::IntraCta<Op, Axes>{}(src, dst, ws,
-                                                  info.warps_per_group);
-            else
-                reduce_impl::CrossWarp<Op, Axes>{}(src, dst, ws,
-                                                   info.warps_per_group);
+            reduce_impl::CrossWarp<Op, Axes>{}(src, dst, ws,
+                                               plan.warps_per_group);
         }
     } else {
         reduce_impl::Plain<Op, Axes>{}(src, dst);

@@ -1,7 +1,11 @@
-"""Emitter for `tir.memory.Copy` — dispatches ``tilefoundry::copy`` or ``cute::copy``.
+"""Emitter for `tir.memory.Copy` — emits ``tilefoundry::ops::copy``.
 
-Emitter for `tir.memory.Copy` — dispatches ``tilefoundry::copy`` (when either
-operand carries ``ShardLayout``) or ``cute::copy`` (plain↔plain).
+One entry whatever the operands are: ``ops::copy`` reads width, alignment and
+*count* off the two layouts, so a run-time extent is the op's business and not a
+form it lacks. What is missing is on this side -- a plain operand is wrapped at
+its envelope bound -- so a dynamic pair is handed a view over the same data
+whose layout is the run-time length. That is what the retired
+``ops::copy_n(src, dst, N)`` said with a third argument.
 """
 
 from __future__ import annotations
@@ -29,22 +33,22 @@ def _has_dyn_shape(var) -> bool:
 @register_codegen_cuda(Copy)
 def _emit(call, ctx: CodegenContext) -> None:
     source, destination = call.args[0], call.args[1]
-    src = _tensor_expr(source, ctx)
-    dst = _tensor_expr(destination, ctx)
     src_shard = _is_shard(source)
     dst_shard = _is_shard(destination)
+    dyn = _has_dyn_shape(source) or _has_dyn_shape(destination)
+    src = _tensor_expr(source, ctx)
+    dst = _tensor_expr(destination, ctx)
+    if dyn and not src_shard and not dst_shard:
+        n = shape_runtime_total(destination.type.shape, ctx._dim_var_runtime)
 
 
-
-    if not src_shard and not dst_shard and (
-        _has_dyn_shape(source) or _has_dyn_shape(destination)
-    ):
-        N = shape_runtime_total(
-            destination.type.shape, ctx._dim_var_runtime,
-        )
-        ctx.emit(f"tilefoundry::ops::copy_n({src}, {dst}, {N});")
+        ctx.emit("{")
+        ctx.indent()
+        ctx.emit(f"auto tf_copy_n = cute::make_layout({n});")
+        ctx.emit(f"auto tf_copy_src = cute::make_tensor({src}.data(), tf_copy_n);")
+        ctx.emit(f"auto tf_copy_dst = cute::make_tensor({dst}.data(), tf_copy_n);")
+        ctx.emit("tilefoundry::ops::copy(tf_copy_src, tf_copy_dst);")
+        ctx.dedent()
+        ctx.emit("}")
         return
-    if src_shard or dst_shard:
-        ctx.emit(f"tilefoundry::copy({src}, {dst});")
-    else:
-        ctx.emit(f"cute::copy({src}, {dst});")
+    ctx.emit(f"tilefoundry::ops::copy({src}, {dst});")
