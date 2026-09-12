@@ -123,14 +123,14 @@ class VerifyContext(TypeInferContext):
 class CostContext(TypeInferContext):
     """Cost Evaluator context for one topology window.
 
-    ``level=None`` exposes the types as written. A named level projects them to
-    what one unit of that level holds, letting the same registered evaluator
-    answer both global and per-unit questions.
+    ``topology_level=None`` exposes the types as written. A named level projects
+    them to what one unit of that level holds, letting the same registered
+    evaluator answer both global and per-unit questions.
     """
 
     selected_types: Mapping[int, Type] = field(default_factory=dict)
     selected_output_type: Type | None = None
-    level: str | None = None
+    topology_level: str | None = None
     topologies: tuple[Topology, ...] = ()
 
     def type_of(self, expr: Expr) -> Type:
@@ -141,18 +141,18 @@ class CostContext(TypeInferContext):
         """Return ``expr``'s Type in this context's topology window."""
         selected = self.selected_types.get(id(expr))
         type_ = selected if selected is not None else expr.type
-        if self.level is None:
+        if self.topology_level is None:
             return type_
-        return local_type_of(type_, level=self.level, topologies=self.topologies)
+        return local_type_of(type_, topology_level=self.topology_level, topologies=self.topologies)
 
     def local_output_type(self, call: Call) -> Type:
         """Return the selected candidate output in recursive-local form."""
         output = self.selected_output_type
         if output is None:
             output = call.type
-        if self.level is None:
+        if self.topology_level is None:
             return output
-        return local_type_of(output, level=self.level, topologies=self.topologies)
+        return local_type_of(output, topology_level=self.topology_level, topologies=self.topologies)
 
 
 @dataclass(frozen=True)
@@ -184,6 +184,14 @@ class Cost:
     flops: Mapping[DType, int]
     traffic: tuple[TrafficBytes, ...]
     service: Mapping[str, int] = field(default_factory=dict)
+    sent: tuple[tuple[str, TrafficBytes], ...] = ()
+    """Bytes that left the unit they were on, by the boundary they crossed.
+
+    ``traffic`` says which storage level each operand touched. Data handed
+    between two units of one topology level touches the same storage at both
+    ends and has still gone somewhere, so it is stated against that level's
+    name instead, from the sending unit's own view.
+    """
 
     @property
     def bytes(self) -> int:

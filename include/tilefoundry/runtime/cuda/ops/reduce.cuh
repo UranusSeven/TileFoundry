@@ -2,11 +2,11 @@
 ///
 /// This file is included IN-CONTEXT from runtime.cuh, at the point inside
 /// ``namespace tilefoundry::ops`` where the reduce surface used to live. It
-/// therefore does NOT open ``namespace tilefoundry`` / ``ops`` and pulls in no
-/// system headers — cute/std and the surrounding names (``detail::to_local``,
-/// ``shard::S``/``shard::B``, ``TopologyScope``) are already in scope. The op
-/// tags below must precede the impl-header includes because
-/// ``reduce_impl::reduce_traits<Op>`` specializes on them.
+/// therefore does NOT open ``namespace tilefoundry`` / ``ops`` and pulls in
+/// no system headers — cute/std and the surrounding names
+/// (``local_tensor``, ``shard::S``/``shard::B``, ``TopologyScope``) are
+/// already in scope. The op tags below must precede the impl-header includes
+/// because ``reduce_impl::reduce_traits<Op>`` specializes on them.
 #pragma once
 
 /// Reduce combine-kind tags — pure compile-time markers. Semantics (init
@@ -33,7 +33,7 @@ template <class Op, class Axes, class Src, class Dst,
           class Ws = reduce_impl::no_workspace_t>
 __device__ inline void reduce(Src const &src, Dst &dst, Ws &&ws = {}) {
     reduce_impl::check_reduce_domain<Src, Dst>();
-    if constexpr (tilefoundry::detail::ShardTensorLike<Src>) {
+    if constexpr (tilefoundry::ShardTensorLike<Src>) {
         using SLs = typename cute::remove_cvref_t<Src>::shard_layout_type;
         using SLd = typename cute::remove_cvref_t<Dst>::shard_layout_type;
         constexpr reduce_impl::reduce_dispatch_info plan =

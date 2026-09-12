@@ -8,13 +8,15 @@ destination tensor must already have been materialised by a preceding
 """
 from __future__ import annotations
 
-from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
+from tilefoundry.codegen.cuda.context import CudaCodegenContext
 from tilefoundry.ir.core import Var
 from tilefoundry.ir.tir.nn import ReLU
+from tilefoundry.target import CudaTarget
+from tilefoundry.visitor_registry.registries import Role, register_codegen
 
 
-@register_codegen_cuda(ReLU)
-def _emit(call, ctx: CodegenContext) -> None:
+@register_codegen(CudaTarget, Role.EMIT, ReLU)
+def _emit(call, ctx: CudaCodegenContext) -> None:
     src, dst = call.args[0], call.args[1]
     if not isinstance(src, Var) or not isinstance(dst, Var):
         raise RuntimeError("tir.nn.ReLU: demo path expects Var operands on both sides")
@@ -22,5 +24,5 @@ def _emit(call, ctx: CodegenContext) -> None:
     dst_name = ctx.name_for(dst)
     ctx.emit(
         f"tilefoundry::ops::elementwise({dst_name}, "
-        f"tilefoundry::ops::relu_op{{}}, {src_name});"
+        f"tilefoundry::primitive::relu_op{{}}, {src_name});"
     )

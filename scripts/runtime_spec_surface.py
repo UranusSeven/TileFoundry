@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Write the C++ runtime surface into the spec, so it is stated once.
+"""Write the runtime surface into the spec, so it is stated once.
 
 A signature in prose is a copy of a declaration, and a copy drifts: the spec
 named `local_index` and `mesh_offset` for as long as it took someone to look.
-The declarations are read out of the headers with libclang and written into
-the ``<!-- generated: id -->`` regions of the spec; everything outside those
-regions is written by hand and left alone.
-
-``--check`` regenerates and reports a difference instead of writing, which is
-what a hook runs. Usage: ``spec_surface.py [--check]``.
+The declarations are read out of the C++ headers with libclang and out of the
+Python files with ``ast``, then written into the ``<!-- generated: id -->``
+regions; everything outside them is written by hand and left alone. ``--check``
+reports a difference instead of writing, which is what the hook runs.
 """
 
 from __future__ import annotations
 
+import ast
+import copy
+import difflib
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,10 +23,21 @@ import clang.cindex as CI
 
 ROOT = Path(__file__).resolve().parent.parent
 HEADERS = ROOT / "include/tilefoundry/runtime"
+PACKAGE = ROOT / "src/tilefoundry"
 SPEC = ROOT / "docs/spec/runtime.md"
 LIBCLANG = ("/usr/lib/x86_64-linux-gnu/libclang-18.so.1", "/usr/lib/llvm-18/lib/libclang.so.1")
+"""Where a system install puts it; the ``libclang`` wheel is asked first."""
 
 REGIONS: dict[str, str] = {
+    "py-module-RuntimeModule": "runtime/module.py::RuntimeModule",
+    "py-module-CompiledModule": "runtime/module.py::CompiledModule",
+    "py-function": "runtime/function.py",
+    "py-decorator": "runtime/decorator.py",
+    "py-loader": "runtime/loader.py",
+    "py-resource": "runtime/resource.py",
+    "py-measure": "runtime/measure.py",
+    "py-tensor": "runtime/tensor.py",
+    "py-compile": "compile.py",
     "cpu-runtime": "cpu/runtime.h",
     "cuda-runtime": "cuda/runtime.cuh",
     "layout-cute-ext": "cuda/layout/cute_ext.cuh",
@@ -45,6 +58,31 @@ REGIONS: dict[str, str] = {
     "utility-warp": "cuda/utility/warp.cuh",
 }
 
+PARSE_ARGS = ["-std=c++20", "-x", "c++", "-ferror-limit=0", "-nostdinc", "-nostdinc++"]
+"""No system header is reachable: what the prelude states is the whole world.
+
+A header that half-resolves is worse than one that does not resolve at all --
+clang drops the declaration it could not finish and the block silently loses
+it, which is how ``local_view_t`` went missing on a machine whose libstdc++
+sat somewhere else. :func:`_check_prelude` holds the prelude to its job.
+"""
+
+PROBE = """template <class T> struct P {
+    using a = std::remove_const<T>;
+    using b = std::remove_reference<T>;
+    using c = cute::remove_cvref_t<T>;
+    using d = decltype(std::declval<T const &>());
+    static constexpr bool e = std::is_same_v<T, T> || std::is_pointer_v<T>;
+    static constexpr bool f = std::is_integral_v<T> || std::is_floating_point_v<T>;
+    static constexpr bool g = std::is_convertible_v<T, T>;
+    using h = std::void_t<T>;
+    using i = std::make_index_sequence<1>;
+    using j = std::false_type;
+    using k = std::true_type;
+    static auto l(T &&t) -> decltype(std::forward<T>(t));
+};
+"""
+
 KINDS = {
     CI.CursorKind.STRUCT_DECL,
     CI.CursorKind.CLASS_TEMPLATE,
@@ -53,10 +91,31 @@ KINDS = {
     CI.CursorKind.ENUM_DECL,
     CI.CursorKind.VAR_DECL,
     CI.CursorKind.TYPE_ALIAS_DECL,
+    CI.CursorKind.TYPE_ALIAS_TEMPLATE_DECL,
+    CI.CursorKind.CONCEPT_DECL,
     CI.CursorKind.UNEXPOSED_DECL,
 }
 
-PRELUDE = """#include <cstddef>
+PRELUDE = """using size_t = decltype(sizeof(0));
+namespace std {
+template <class T> struct remove_const { using type = T; };
+template <class T> struct remove_const<T const> { using type = T; };
+template <class T> struct remove_reference { using type = T; };
+template <class T> struct remove_reference<T &> { using type = T; };
+template <class T> struct remove_reference<T &&> { using type = T; };
+struct false_type { static constexpr bool value = false; };
+struct true_type { static constexpr bool value = true; };
+template <class...> using void_t = void;
+template <class T> T &&declval() noexcept;
+template <class T> T &&forward(typename remove_reference<T>::type &) noexcept;
+template <class, class> inline constexpr bool is_same_v = false;
+template <class> inline constexpr bool is_pointer_v = false;
+template <class> inline constexpr bool is_integral_v = false;
+template <class> inline constexpr bool is_floating_point_v = false;
+template <class, class> inline constexpr bool is_convertible_v = false;
+template <unsigned long...> struct index_sequence {};
+template <unsigned long N> using make_index_sequence = index_sequence<N>;
+}
 namespace cute {
 template <class...> struct Layout; template <class...> struct ComposedLayout;
 template <class...> struct tuple; template <int> struct Int; struct identity;
@@ -99,11 +158,41 @@ template <class> inline constexpr bool dependent_false_v = false;
 
 
 def _configure() -> None:
-    for path in LIBCLANG:
-        if Path(path).exists():
-            CI.Config.set_library_file(path)
+    """Point the bindings at a libclang, wherever this machine keeps one.
+
+    The ``libclang`` wheel ships one beside the bindings and a distribution
+    ships one in ``/usr/lib``; a machine may have either, so both are asked.
+    """
+    bundled = Path(CI.__file__).parent / "native" / "libclang.so"
+    for path in (bundled, *map(Path, LIBCLANG)):
+        if path.exists():
+            CI.Config.set_library_file(str(path))
             return
-    raise SystemExit("runtime_spec_surface: no libclang found")
+    raise SystemExit(
+        "runtime_spec_surface: no libclang found; install the project's dev "
+        "extra, which asks for the libclang wheel"
+    )
+
+
+def _check_prelude(index) -> None:
+    """Refuse to read a header until every name the prelude promises resolves.
+
+    A name the prelude misses does not raise: clang drops the declaration that
+    used it and the block comes out short. So the promise is tested first, on
+    a probe that uses all of them and must parse clean.
+    """
+    source = ROOT / "build" / "spec_surface_probe.cpp"
+    source.parent.mkdir(exist_ok=True)
+    source.write_text(f"{PRELUDE}{PROBE}}}\n")
+    unit = index.parse(str(source), args=PARSE_ARGS)
+    errors = [d.spelling for d in unit.diagnostics if d.severity >= CI.Diagnostic.Error]
+    source.unlink(missing_ok=True)
+    if errors:
+        raise SystemExit(
+            "runtime_spec_surface: the prelude no longer declares everything the "
+            "headers use, so a declaration would be dropped without a word:\n  "
+            + "\n  ".join(errors)
+        )
 
 
 def _declarations(header: str) -> list[str]:
@@ -117,10 +206,11 @@ def _declarations(header: str) -> list[str]:
     source = ROOT / "build" / "spec_surface_tu.cpp"
     source.parent.mkdir(exist_ok=True)
     source.write_text(f'{PRELUDE}#include "{(HEADERS / header).resolve()}"\n}}\n')
-    unit = CI.Index.create().parse(
+    index = CI.Index.create()
+    _check_prelude(index)
+    unit = index.parse(
         str(source),
-        args=["-std=c++20", "-x", "c++", "-ferror-limit=0",
-              "-I/usr/lib/gcc/x86_64-linux-gnu/13/include"],
+        args=PARSE_ARGS,
         options=CI.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES,
     )
     text = (HEADERS / header).read_bytes()
@@ -169,8 +259,24 @@ def _signature(source: str) -> str:
         _signature(m) for m in _members(body)
         if not m.lstrip().startswith("static_assert(")
     ]
-    inner = "\n".join("    " + line for m in members for line in m.splitlines())
+    inner = "\n".join(_indented(m, "    ") for m in members)
     return f"{header.rstrip()} {{\n{inner}\n}};" if members else header.rstrip() + " {};"
+
+
+def _indented(member: str, prefix: str) -> str:
+    """*member* under *prefix*, keeping only the indentation it makes itself.
+
+    A member is read out of the header at whatever column it sat in, and its
+    first line arrives stripped while the rest keep that column. Taking the
+    shallowest of the rest as the margin puts them back under the first.
+    """
+    lines = member.splitlines()
+    rest = [line for line in lines[1:] if line.strip()]
+    margin = min((len(line) - len(line.lstrip()) for line in rest), default=0)
+    return "\n".join(
+        prefix + (line if index == 0 else line[margin:]).rstrip()
+        for index, line in enumerate(lines)
+    )
 
 
 def _without_value(source: str) -> str:
@@ -179,7 +285,7 @@ def _without_value(source: str) -> str:
     Only a top-level ``=`` counts: a default argument's sits inside the
     parameter list, and a defaulted template parameter's inside the angles.
     """
-    if re.match(r"^\s*(template\s*<.*?>\s*)?using\b", source, re.S):
+    if re.match(r"^\s*(template\s*<.*?>\s*)?(using|concept)\b", source, re.S):
         return source
     paren = angle = 0
     for index, char in enumerate(source):
@@ -246,9 +352,103 @@ def _members(body: str) -> list[str]:
     return out
 
 
+DUNDERS = frozenset({"__init__", "__call__", "__getitem__", "__iter__", "__len__"})
+
+
+def _python_block(target: str) -> str:
+    """One Python file's public surface, or one class out of it.
+
+    Signatures only, and no docstrings: a C++ ``///`` sits above a declaration
+    and is one line of it, while a Python docstring is the body, and the body
+    is the half the spec does not state.
+    """
+    file, _, name = target.partition("::")
+    path = PACKAGE / file
+    tree = ast.parse(path.read_text())
+    if name:
+        nodes = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == name]
+        if not nodes:
+            raise SystemExit(f"runtime_spec_surface: {file} declares no {name!r}")
+    else:
+        exported = _exported(tree)
+        nodes = [n for n in tree.body if _named(n) in exported]
+    decls = [_python_decl(node) for node in nodes]
+    rel = path.resolve().relative_to(ROOT)
+    if not decls:
+        return f"```text\n# {rel}\n# This file declares no surface of its own.\n```"
+    return f"```python\n# {rel}\n" + _formatted("\n\n".join(decls)) + "\n```"
+
+
+def _formatted(source: str) -> str:
+    """*source* as the repository formats Python, so a block reads like the code."""
+    done = subprocess.run(
+        ["ruff", "format", "--stdin-filename", str(SPEC.with_suffix(".py")), "-"],
+        input=source, capture_output=True, text=True, check=False,
+    )
+    if done.returncode:
+        raise SystemExit(f"runtime_spec_surface: ruff format failed\n{done.stderr}")
+    return done.stdout.rstrip()
+
+
+def _exported(tree: ast.Module) -> frozenset[str]:
+    """The names a module's ``__all__`` declares, which is its stated surface."""
+    for node in tree.body:
+        targets = getattr(node, "targets", ())
+        if any(isinstance(t, ast.Name) and t.id == "__all__" for t in targets):
+            return frozenset(
+                item.value for item in node.value.elts if isinstance(item, ast.Constant)
+            )
+    raise SystemExit("runtime_spec_surface: a generated module must declare __all__")
+
+
+def _named(node) -> str | None:
+    """The one name *node* binds, or ``None`` when it binds none or several."""
+    if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+        return node.name
+    target = getattr(node, "target", None)
+    if target is None and len(getattr(node, "targets", ())) == 1:
+        target = node.targets[0]
+    return target.id if isinstance(target, ast.Name) else None
+
+
+def _is_member(node) -> bool:
+    """Whether a class member is one a caller writes, rather than a detail."""
+    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return False
+    return not node.name.startswith("_") or node.name in DUNDERS
+
+
+def _python_decl(node) -> str:
+    """*node* as the spec states it: what a caller writes, and no body."""
+    if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        return ast.unparse(node)
+    if not isinstance(node, ast.ClassDef):
+        return ast.unparse(_no_body(node))
+    members: list[ast.stmt] = []
+    for item in node.body:
+        if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+            if not item.target.id.startswith("_"):
+                members.append(item)
+        elif _is_member(item):
+            members.append(_no_body(item))
+    clone = copy.copy(node)
+    clone.body = members or [ast.Expr(value=ast.Constant(value=Ellipsis))]
+    return ast.unparse(clone)
+
+
+def _no_body(node):
+    """*node* with ``...`` where its body was."""
+    clone = copy.copy(node)
+    clone.body = [ast.Expr(value=ast.Constant(value=Ellipsis))]
+    return clone
+
+
 def _block(region: str) -> str:
-    """The generated body of one region: one header's public declarations."""
-    header = REGIONS[region]
+    """The generated body of one region: one file's public declarations."""
+    target = REGIONS[region]
+    if target.endswith(".py") or ".py::" in target:
+        return _python_block(target)
+    header = target
     path = (HEADERS / header).resolve().relative_to(ROOT)
     decls = _declarations(header)
     if not decls:
@@ -278,6 +478,13 @@ def main(argv: list[str]) -> int:
     if "--check" in argv:
         if current != updated:
             print(f"{SPEC.relative_to(ROOT)}: stale; run scripts/runtime_spec_surface.py")
+            sys.stdout.writelines(
+                difflib.unified_diff(
+                    current.splitlines(keepends=True),
+                    updated.splitlines(keepends=True),
+                    "spec", "generated",
+                )
+            )
             return 1
         return 0
     if current != updated:

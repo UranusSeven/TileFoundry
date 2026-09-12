@@ -19,6 +19,7 @@ from tilefoundry.analysis.facts import (
     ThroughputFacts,
 )
 
+from ..base import UnsupportedCapabilityError
 from .target import CudaTarget
 
 
@@ -84,8 +85,33 @@ def memory_hierarchy(target: CudaTarget, query: object = None) -> MemoryHierarch
     )
 
 
+def _cards(target: CudaTarget) -> int:
+    """How many cards the deployment runs on; one when nobody said."""
+    return 1 if target.device_count is None else target.device_count
+
+
+def parallel_units(target: CudaTarget, unit: str) -> int:
+    """How many of *unit* the deployment runs at once.
+
+    Both the divisor a per-unit rate is the deployment peak over, and the
+    answer to how many instances of a level run together -- the same number,
+    asked once. A target that never said how many cards is one card.
+    """
+    cards = _cards(target)
+    if unit == "gpu":
+        return cards
+    if unit == "cta":
+        return cards * target.device.sm_count
+    if unit == "thread":
+        return cards * target.device.sm_count * target.architecture.max_threads_per_cta
+    raise UnsupportedCapabilityError(
+        f"cuda: no per-unit rate for topology level {unit!r}; the levels this "
+        f"target divides its peaks among are ('gpu', 'cta', 'thread')"
+    )
+
+
 def throughput(target: CudaTarget, query: object = None) -> ThroughputFacts:
-    """The device rates a roofline divides work by.
+    """The deployment rates a roofline divides work by.
 
     The bandwidth is HBM's, so the memory side of the bound is computed from
     global traffic alone. Shared memory and the register file publish no static
@@ -93,52 +119,57 @@ def throughput(target: CudaTarget, query: object = None) -> ThroughputFacts:
     document supports.
     """
     device = target.device
+    cards = _cards(target)
     peaks = tuple(
-        sorted(device.dense_flops_per_second.items(), key=lambda item: item[0].name)
+        (dtype, peak * cards)
+        for dtype, peak in sorted(
+            device.dense_flops_per_second.items(), key=lambda item: item[0].name
+        )
     )
     return ThroughputFacts(
         peak_flops_per_second=peaks,
-        memory_bandwidth_bytes_per_second=device.hbm_bandwidth_bytes_per_second,
+        memory_bandwidth_bytes_per_second=device.hbm_bandwidth_bytes_per_second * cards,
         bandwidth_level="gmem",
     )
 
 
-def performance_service(
-    target: CudaTarget, query: object = None
-) -> PerformanceServiceFacts:
-    """What one CTA gets through, for every kind of work a program asks for.
+def performance_service(target: CudaTarget, query: object = None) -> PerformanceServiceFacts:
+    """What one unit of the level asked about gets through, by kind of work.
 
-    The float rates are the device peaks divided among its SMs, the same
-    division the roofline's one-unit rates use. The services are what the
-    device's own document states, and a device that states none prices no work
-    of that kind rather than pricing it at nothing.
+    The float rates are the deployment's peaks divided among however many of
+    that unit run at once, the same division the roofline's bound starts from.
+    The services are what the device's own document states, and a device that
+    states none prices no work of that kind rather than pricing it at nothing.
     """
     device = target.device
+    cards = _cards(target)
+    unit = "cta" if query is None else str(query)
+    share = parallel_units(target, unit)
     return PerformanceServiceFacts(
         unit_flops=tuple(
-            (dtype, peak // device.sm_count)
+            (dtype, peak * cards // share)
             for dtype, peak in sorted(
                 device.dense_flops_per_second.items(), key=lambda item: item[0].name
             )
         ),
-        unit_ops=tuple(sorted(device.service_ops_per_second.items())),
-        unit_bandwidth=(
-            ("gmem", device.hbm_bandwidth_bytes_per_second // device.sm_count),
+        unit_ops=tuple(
+            (kind, rate * device.sm_count * cards // share)
+            for kind, rate in sorted(device.service_ops_per_second.items())
         ),
-        unit="cta",
+        unit_bandwidth=(("gmem", device.hbm_bandwidth_bytes_per_second * cards // share),),
+        unit=unit,
     )
 
 
-def parallel_capacity(
-    target: CudaTarget, query: object = None
-) -> ParallelCapacityFacts:
-    """How many CTAs the plan assumes run at once.
+def parallel_capacity(target: CudaTarget, query: object = None) -> ParallelCapacityFacts:
+    """How many of the level asked about the plan assumes run at once.
 
     This is a compiler policy, not CUDA's grid limit and not the hardware
-    resident-CTA maximum: one active CTA per SM. A tighter policy changes what
-    analysis concludes rather than the program.
+    resident-CTA maximum: one active CTA per SM, over however many cards the
+    deployment runs.
     """
-    return ParallelCapacityFacts(topology="cta", parallel_units=target.device.sm_count)
+    unit = "cta" if query is None else str(query)
+    return ParallelCapacityFacts(topology=unit, parallel_units=parallel_units(target, unit))
 
 
 __all__ = [

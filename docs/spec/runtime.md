@@ -12,27 +12,47 @@ snapshot.
 
 ## 1. Python Runtime Surface
 
-### 1.1 `RuntimeModule`
+The sections are one per file, and a file with more than one class states each
+under its own heading. Each signature block is read out of that file by
+`scripts/runtime_spec_surface.py` and written into its `<!-- generated -->`
+region; a file's `__all__` is what it states, and a docstring is the half the
+spec says in its own words instead. A number nothing carries -- `1.5` and `1.7`
+-- is a section that became a heading under the file that owns it.
+
+### 1.1 `runtime/module.py`
 
 An ir `Module` (the semantic definition — @func bodies the evaluator runs) and
 a `RuntimeModule` (the runtime instance — kernel bodies) are twins: same
 `name`, same child tree, same `entry`. `@runtime_module` / `@runtime_func`
 (`tilefoundry.runtime.decorator`, below) build one twin mechanically from the
 other, validated one-to-one at decoration time; the correspondence is
-additionally held by comparing the two numerically ([§1.6](#16-check)), against bounds the
+additionally held by comparing the two numerically ([§1.9](#19-runtimemeasurepy)), against bounds the
 comparison's caller states — a `RuntimeModule` never runs the HIR evaluator.
 
+#### `RuntimeModule`
+
+<!-- generated: py-module-RuntimeModule -->
 ```python
+# src/tilefoundry/runtime/module.py
 class RuntimeModule:
-    name: str                                    # mirrors the ir Module node name
-    entry: str | None                            # mirrors the ir Module entry (metadata)
-    modules: tuple["RuntimeModule", ...]         # children, registered explicitly in __init__
-    module: Module | None                        # the authored Module this stands for
-    def __init__(self, name, entry=None, modules=()): ...
-    def forward(self, *args): ...                # subclass-written orchestration — forward IS the step
-    def __call__(self, *args): ...               # delegates to forward
-    def load(self, resource): ...                # remember the source, recursive over children
+    name: str
+    entry: str | None
+    modules: tuple["RuntimeModule", ...]
+
+    def __init__(
+        self, name: str, entry: str | None = None, modules: tuple["RuntimeModule", ...] = ()
+    ) -> None: ...
+
+    @property
+    def module(self): ...
+
+    def forward(self, *args): ...
+
+    def __call__(self, *args): ...
+
+    def load(self, resource: RuntimeResource, *, placement: "Placement | None" = None) -> None: ...
 ```
+<!-- /generated -->
 
 - constraints:
   - the base class is authored like a `torch.nn.Module`: subclass it, build
@@ -41,16 +61,23 @@ class RuntimeModule:
     attributes called from `forward`. `@runtime_module` (below) generates
     this subclass mechanically from a semantic `Module` and is the normal
     authoring path; a direct subclass remains available for special cases
-    (e.g. `CompiledModule`, [§1.1.3](#113-internal-pipeline-compiled-origin)).
-  - `load(resource)` (base class): recurses into each child with
-    `resource.subtree(child.name)`; the base class itself resolves nothing.
+    (e.g. `CompiledModule`, below).
+  - `load(resource, *, placement=None)` (base class): recurses into each child
+    with `resource.subtree(child.name)`, handing every one the same
+    *placement*; the base class itself resolves nothing. One process is one
+    program throughout the tree it loaded, so a child MUST NOT be given a
+    placement of its own.
+  - a twin with a sharded weight and no *placement* MUST refuse to read it.
+    Nothing else in the system says which of the mesh's positions this process
+    holds, and returning the whole tensor would silently give every program
+    every other program's data ([§1.10](#110-runtimetensorpy)).
     Weight prefixes follow module paths, matching ir attribute addressing.
     Lifecycle: construct (structure) → `load` (remember source) → call. A
     `RuntimeModule` does **not** run `prepare`; it loads straight from the
-    directory the semantic side prepared ([§1.1.2](#112-weight-converter-and-prepare--forward)).
+    directory the semantic side prepared ([§1.3](#13-runtimedecoratorpy)).
   - correspondence contract: the runtime twin's `forward` and the semantic
     evaluator's `evaluate(LoadedModule, ...)` must agree on the same inputs —
-    `measure.check` comparing them against stated bounds ([§1.6](#16-check)) is that
+    `measure.check` comparing them against stated bounds ([§1.9](#19-runtimemeasurepy)) is that
     contract.
   - `module` names the authored `Module` a twin was generated from, so a
     caller holding an implementation can reach what it is judged against. A
@@ -66,98 +93,76 @@ class RuntimeModule:
     HIR evaluator.
   - two origins: compiled — `tilefoundry.build` / `compile` / `jit` →
     `LinkedModule` → the loader binds a `CompiledModule` (a `RuntimeModule`,
-    not a `RuntimeFunction`) ([§1.1.3](#113-internal-pipeline-compiled-origin)); handwritten — a `@runtime_module`
+    not a `RuntimeFunction`) ([§1.4](#14-runtimeloaderpy)); handwritten — a `@runtime_module`
     class (below), loading from a prepared checkpoint directory via a
-    `RuntimeResource` ([§1.5](#15-runtimeresource)).
+    `RuntimeResource` ([§1.8](#18-runtimeresourcepy)).
 
-#### `@runtime_module` / `@runtime_func`
+#### `CompiledModule`
 
-`@runtime_module(sem)` is a class decorator taking the semantic `Module`
-instance; it returns a `RuntimeModule` subclass whose instances are *sem*'s
-runtime twin — same function names, same child tree, same entry.
-`@runtime_func` tags a plain method as a kernel body: same call signature as
-the semantic `@func` of the same name, weight params included.
-
+<!-- generated: py-module-CompiledModule -->
 ```python
-# example
-@runtime_module(attention_sem)
-class Attention:
-    @runtime_func                                    # weight params included, in the
-    def mla_kv_update(self, hidden, gamma_kv, w_kv,  # semantic @func's own order
-                      cos_pos, sin_pos, kv_cache0, cur_pos, s):
-        ...  # a real kernel body, e.g. a torch / triton / CUDA implementation
+# src/tilefoundry/runtime/module.py
+class CompiledModule(RuntimeModule):
+    def __init__(self, type: CallableSignature, fn: Callable) -> None: ...
 
-    moe = SomeMoeRuntimeClass  # a @runtime_module class, not an instance
+    def load(self, resource: RuntimeResource, *, placement: "Placement | None" = None) -> None: ...
+
+    def forward(self, *args): ...
 ```
+<!-- /generated -->
 
-- constraints:
-  - decoration-time validation is **strictly one-to-one**: the
-    `@runtime_func` name set (a tagged method, or a `RuntimeFunction`
-    instance class attribute — a heavy kernel that owns its own compilation
-    state, standing in for a `@runtime_func`) MUST equal `sem`'s function
-    name set, and the child-attribute name set MUST equal `sem`'s child
-    module name set; missing *or* extra either MUST be rejected.
-  - a child attribute is a `RuntimeModule` **subclass**, not an instance
-    (typically another `@runtime_module` result); the generated `__init__`
-    builds one instance per `sem.modules` entry via `child_cls(ir=<that
-    child's ir Module>)`, so a child class MUST accept the `ir=` constructor
-    keyword (every `@runtime_module` result already does).
-  - weights are filled by name at call time from what `load` bound, so a
-    kernel method's caller passes only activations.
-  - orchestration methods (`forward` / `init_caches` / …) are reused from the
-    semantic `Module.methods` verbatim and are never rewritten on the
-    runtime side: inside them, `self.<fn>` / `self.<child>` resolve to the
-    runtime twin's own kernels / children. Absent an own `forward`, the generated
-    class runs `sem.methods["forward"]` if present, else calls the entry function
-    by name. A loaded semantic Module resolves the same named functions,
-    children, and methods ([§1.1.2](#112-weight-converter-and-prepare--forward)).
+`CompiledModule.forward(*args)` uses the out-param ABI (`type.output_count`
+trailing params are outputs):
 
-### 1.1.1 `RuntimeFunction`
+- **Auto-alloc**: `len(args) == type.input_count` — allocates output tensors
+  from the first input's device/dtype, calls the entry, returns result(s).
+- **Pre-alloc**: `len(args) == len(type.params)` — uses provided output tensors,
+  returns same output(s). All outputs must be provided; partial → `TypeError`.
+- **Return**: single output → bare tensor; multiple outputs → `tuple`.
+
+Auto-alloc is torch-only; non-torch inputs raise `TypeError`. Output metadata
+(dtype, shape) comes from `CallableSignature.output_params` — each
+`TensorSignature.type` carries them (set by codegen from lowered IR, NOT
+guessed at runtime). This convention is specific to `CompiledModule`; other
+`RuntimeModule.forward` implementations are not bound by it.
+
+### 1.2 `runtime/function.py`
 
 `RuntimeFunction` is the **base class** for a node's function body; a body
 subclasses it and overrides `__call__`. A handwritten torch / triton / CUDA
 implementation takes whatever it needs (converted weights, caches) at
 construction and returns its value(s) directly. `RuntimeFunction.type` is the
-ABI contract below: an `EntryABI` built of `ParamABI` records.
+`CallableSignature` codegen produced for that function
+([codegen §4.4](./codegen.md#44-signatures)).
 
+<!-- generated: py-function -->
 ```python
-class ParamABI:
-    name: str                       # parameter name
-    type: TensorType                # dtype / shape / storage / layout all come from here
-
-class EntryABI:
-    name: str                       # entry / function name
-    params: tuple[ParamABI, ...]    # ALL parameters (inputs + outputs), declaration order
-    output_count: int = 0           # trailing count of output parameters
-
+# src/tilefoundry/runtime/function.py
 class RuntimeFunction:
-    type: EntryABI                  # the ABI (entry_abi_of(ir_func))
-    def __init__(self, type): ...
-    def __call__(self, *acts): ...  # subclass overrides — launch, positional activations
+    def __init__(self, type: CallableSignature) -> None: ...
+
+    def __call__(self, *args): ...
 ```
+<!-- /generated -->
 
 - constraints:
   - the base `__call__` raises; every usable body is a subclass. Agents may
     write any subclass whose `__call__` runs (torch / triton / CUDA / …).
-  - `ParamABI` reuses the IR type system instead of restating it: dtype /
-    shape / storage / layout all come from `type` (a `TensorType`); a dynamic
-    dim is whatever `type.shape` carries (e.g. a `DimVar`) — there is no
-    separate dynamic-dim sentinel.
-  - `EntryABI.params` lists ALL parameters (inputs + outputs) in declaration
-    order; `output_count` is the trailing count of output parameters.
-    `input_count` is `len(params) - output_count`; `input_params` /
-    `output_params` are the corresponding leading / trailing slices of
-    `params`.
-  - `param_abi_of(var)` is the single `ParamABI`-derivation site, shared by
-    codegen's host-entry ABI derivation (`codegen/cuda/emit.py`) and
-    `entry_abi_of` below.
-  - `entry_abi_of(fn)` derives an `EntryABI` for a HIR `Function`: one
-    `ParamABI` per declared parameter, `output_count=0` (a value-returning
-    implementation, not an out-param entry). The compiled-entry `EntryABI`
-    (`output_count` possibly nonzero) is set by codegen from lowered IR
-    instead ([codegen §4.3](./codegen.md#43-linkedmodule)).
+  - the signature is codegen's product and the runtime's input: it is defined
+    by [codegen §4.4](./codegen.md#44-signatures) and MUST NOT be redefined
+    here.
 
-### 1.1.2 Weight converter and `prepare` / `forward`
+### 1.3 `runtime/decorator.py`
+
+<!-- generated: py-decorator -->
+```python
+# src/tilefoundry/runtime/decorator.py
+def runtime_func(fn: Callable) -> Callable: ...
+
+
+def runtime_module(sem: Module) -> Callable[[type], type]: ...
+```
+<!-- /generated -->
 
 A weight's converter is registered **per weight**, not per module:
 `@<compute_fn>.converter("<weight_name>")` decorates a throwaway `def` and
@@ -219,7 +224,7 @@ passes only activations; constants come from its resource at first use.
     checkpoints, two devices — and each reading is independent of the others.
     A child reached from two owners therefore yields one `LoadedModule` per
     owner rather than one binding the last owner wins. This is the semantic-side
-    counterpart of the `RuntimeModule` twin's own `load` ([§1.1](#11-runtimemodule)).
+    counterpart of the `RuntimeModule` twin's own `load` ([§1.1](#11-runtimemodulepy)).
   - The caller supplies `evaluate(..., device=...)`. Every activation and every
     weight used by the reading MUST already be on that device; a mismatch is
     rejected at the activation binding or weight's first-use point, naming the
@@ -257,7 +262,57 @@ passes only activations; constants come from its resource at first use.
     across steps. These methods bind on the runtime twin in the same way as
     `forward`.
 
-### 1.1.3 Internal Pipeline (compiled origin)
+#### `@runtime_module` / `@runtime_func`
+
+
+`@runtime_module(sem)` is a class decorator taking the semantic `Module`
+instance; it returns a `RuntimeModule` subclass whose instances are *sem*'s
+runtime twin — same function names, same child tree, same entry.
+`@runtime_func` tags a plain method as a kernel body: same call signature as
+the semantic `@func` of the same name, weight params included.
+
+```python
+# example
+@runtime_module(attention_sem)
+class Attention:
+    @runtime_func                                    # weight params included, in the
+    def mla_kv_update(self, hidden, gamma_kv, w_kv,  # semantic @func's own order
+                      cos_pos, sin_pos, kv_cache0, cur_pos, s):
+        ...  # a real kernel body, e.g. a torch / triton / CUDA implementation
+
+    moe = SomeMoeRuntimeClass  # a @runtime_module class, not an instance
+```
+
+- constraints:
+  - decoration-time validation is **strictly one-to-one**: the
+    `@runtime_func` name set (a tagged method, or a `RuntimeFunction`
+    instance class attribute — a heavy kernel that owns its own compilation
+    state, standing in for a `@runtime_func`) MUST equal `sem`'s function
+    name set, and the child-attribute name set MUST equal `sem`'s child
+    module name set; missing *or* extra either MUST be rejected.
+  - a child attribute is a `RuntimeModule` **subclass**, not an instance
+    (typically another `@runtime_module` result); the generated `__init__`
+    builds one instance per `sem.modules` entry via `child_cls(ir=<that
+    child's ir Module>)`, so a child class MUST accept the `ir=` constructor
+    keyword (every `@runtime_module` result already does).
+  - weights are filled by name at call time from what `load` bound, so a
+    kernel method's caller passes only activations.
+  - orchestration methods (`forward` / `init_caches` / …) are reused from the
+    semantic `Module.methods` verbatim and are never rewritten on the
+    runtime side: inside them, `self.<fn>` / `self.<child>` resolve to the
+    runtime twin's own kernels / children. Absent an own `forward`, the generated
+    class runs `sem.methods["forward"]` if present, else calls the entry function
+    by name. A loaded semantic Module resolves the same named functions,
+    children, and methods ([§1.3](#13-runtimedecoratorpy)).
+
+### 1.4 `runtime/loader.py`
+
+<!-- generated: py-loader -->
+```python
+# src/tilefoundry/runtime/loader.py
+def load_linked_module(linked: "LinkedModule") -> CompiledModule: ...
+```
+<!-- /generated -->
 
 ```
 Module (IR) → codegen: per-target LinkableModule… → LinkedModule (.so + metadata)
@@ -270,87 +325,11 @@ LinkedModule → load → CompiledModule (fully-loaded, public, callable Runtime
 API; only `CompiledModule` (a `RuntimeModule`) is. `load_linked_module` returns
 `CompiledModule(type=linked.entry, fn=entry_callable)`; `name` / `entry` are
 both `linked.entry.name`. Its `forward` implements the out-param calling
-convention directly ([§1.2](#12-calling-convention-compiledmodule)) — there is no separate function-body object it
+convention directly ([§1.1](#11-runtimemodulepy)) — there is no separate function-body object it
 delegates to. The compiled path has no `resource` / `weights` / `states`
 (weights are ordinary entry arguments), so its `load` is the inherited no-op.
 
-### 1.2 Calling Convention (`CompiledModule`)
-
-`CompiledModule.forward(*args)` uses the out-param ABI (`type.output_count`
-trailing params are outputs):
-
-- **Auto-alloc**: `len(args) == type.input_count` — allocates output tensors
-  from the first input's device/dtype, calls the entry, returns result(s).
-- **Pre-alloc**: `len(args) == len(type.params)` — uses provided output tensors,
-  returns same output(s). All outputs must be provided; partial → `TypeError`.
-- **Return**: single output → bare tensor; multiple outputs → `tuple`.
-
-Auto-alloc is torch-only; non-torch inputs raise `TypeError`. Output metadata
-(dtype, shape) comes from `EntryABI.output_params` — each `ParamABI.type`
-carries them (set by codegen from lowered IR, NOT guessed at runtime). This
-convention is specific to `CompiledModule`; other `RuntimeModule.forward`
-implementations are not bound by it.
-
-### 1.3 `jit()` API
-
-```python
-def jit(
-    fn_or_mod: Function | Module,
-    /,
-    *,
-    target: Target | None = None,
-    options: CompilerOptions | None = None,
-    **kwargs,
-) -> RuntimeModule:
-    """Compile *fn_or_mod* and return the callable runtime module.
-
-    Args:
-        fn_or_mod: a hir.Function or Module (normalized to a Module).
-        target: an explicit constructed Target, or the omitted-target policy.
-        options: optional CompilerOptions.
-        kwargs: rejected compatibility catch-all for unexpected keywords.
-
-    Returns:
-        The callable RuntimeModule.
-    """
-```
-
-- constraints:
-  - accepts only TileFoundry IR (`Function` / `Module`); raw Python functions
-    raise `TypeError`; the full input contract is stated below.
-
-`tilefoundry.jit(fn_or_mod, *, target=None, options=None)` is the JIT
-entry point.  It accepts a `hir.Function` or `Module`, normalizes to a
-`Module`, compiles with cache, and returns a callable `RuntimeModule`.
-
-**Input contract**:
-- Only TileFoundry IR objects (`Function` / `Module`) accepted.
-- Raw Python functions raise `TypeError` — use `@func` first.
-- A stated `target` MUST be a constructed Target instance. Strings
-  MUST be refused and MUST NOT select a backend or construct a Target.
-- A Module-owned Target takes precedence and is retained as the exact instance;
-  a conflicting explicit Target or `CompilerOptions.target` MUST fail.
-- Topology is declared by the `Module`; a single-function
-  `@func(topologies=...)` declares it through the implicit `Module` that
-  decorator yields ([parser §2.1](./parser.md#21-syntax)).
-- Mesh layout is expressed in the DSL with lexical `with Mesh(...) as mesh` scopes.
-- `jit()` has no `cta_mesh` / `thread_mesh` parameters.
-
-**Pipeline**: `jit()` reuses [passes §6](./passes.md#6-top-level-api)'s
-`lower()` → `build()` pipeline (`compile()`). It auto-wraps a bare `Function` input into a single-function
-`Module` that declares no execution context.
-
-**Cache**: in-process dict cache keyed by
-`sha256(canonical_module_text + target_text + canonical_options_text)`.
-`canonical_module_text` includes functions, the Module's *effective* topology
-hierarchy, and `with Mesh` scopes. It uses the effective hierarchy rather than
-the declared one so that a Module inheriting its hierarchy from an owner does
-not collide with an identically-authored Module under a different owner. No
-Python object identity and no
-dedicated `cta_mesh` / `thread_mesh` key fields participate in the key.
-`jit.cache_clear()` evicts; `jit.cache_info()` returns `{"size": N}`.
-
-### 1.4 Launcher ABI
+#### Launcher ABI
 
 `tilefoundry.build(mod)` internally runs codegen and links the artifact (see
 [codegen](./codegen.md)), then loads it and binds the entry; these are
@@ -380,34 +359,140 @@ Launch geometry (grid / block extents) is embedded into the generated host entry
 or supplied by an authored `launch(...)`; it is never carried as metadata past
 codegen.
 
-### 1.5 `RuntimeResource`
+### 1.6 `compile.py`
+
+<!-- generated: py-compile -->
+```python
+# src/tilefoundry/compile.py
+@dataclass(frozen=True)
+class CompilerOptions:
+    target: Target
+
+    def canonical_text(self) -> str: ...
+
+
+def normalize_to_module(fn_or_mod: HirFunction | Module) -> Module: ...
+
+
+def build(mod: Module, /, *, target: Target | None = None) -> "RuntimeModule": ...
+
+
+def compile(mod: Module, /, *, target: Target | None = None) -> "RuntimeModule": ...
+
+
+def jit(
+    fn_or_mod, /, *, target: Target | None = None, options: CompilerOptions | None = None, **kwargs
+) -> "RuntimeModule": ...
+```
+<!-- /generated -->
+
+- constraints:
+  - accepts only TileFoundry IR (`Function` / `Module`); raw Python functions
+    raise `TypeError`; the full input contract is stated below.
+
+`tilefoundry.jit(fn_or_mod, *, target=None, options=None)` is the JIT
+entry point.  It accepts a `hir.Function` or `Module`, normalizes to a
+`Module`, compiles with cache, and returns a callable `RuntimeModule`.
+
+**Input contract**:
+- Only TileFoundry IR objects (`Function` / `Module`) accepted.
+- Raw Python functions raise `TypeError` — use `@func` first.
+- A stated `target` MUST be a constructed Target instance. Strings
+  MUST be refused and MUST NOT select a backend or construct a Target.
+- A Module-owned Target takes precedence and is retained as the exact instance;
+  a conflicting explicit Target or `CompilerOptions.target` MUST fail.
+- Topology is declared by the `Module`; a single-function
+  `@func(topologies=...)` declares it through the implicit `Module` that
+  decorator yields ([parser §2.1](./parser.md#21-syntax)).
+- Mesh layout is expressed in the DSL with lexical `with Mesh(...) as mesh` scopes.
+- `jit()` has no `cta_mesh` / `thread_mesh` parameters.
+
+**Pipeline**: `jit()` reuses [passes §6](./passes.md#6-top-level-api)'s `build()`
+pipeline (`compile()`). It auto-wraps a bare `Function` input into a
+single-function `Module` that declares no execution context.
+
+**Cache**: in-process dict cache keyed by
+`sha256(canonical_module_text + target_text + canonical_options_text)`.
+`canonical_module_text` includes functions, the Module's *effective* topology
+hierarchy, and `with Mesh` scopes. It uses the effective hierarchy rather than
+the declared one so that a Module inheriting its hierarchy from an owner does
+not collide with an identically-authored Module under a different owner. No
+Python object identity and no
+dedicated `cta_mesh` / `thread_mesh` key fields participate in the key.
+`jit.cache_clear()` evicts; `jit.cache_info()` returns `{"size": N}`.
+
+### 1.8 `runtime/resource.py`
 
 Checkpoint aliasing is a base capability of every resource, not a wrapper
 class: both implementations below take an `alias={canonical: raw}` table,
 resolved by the same lookup order.
 
+<!-- generated: py-resource -->
 ```python
-AliasValue = str | tuple[str, ...] | Absolute | Preprocessed
-
+# src/tilefoundry/runtime/resource.py
+@dataclasses.dataclass(frozen=True)
 class Absolute:
-    """Name a raw checkpoint key from the resource root.
-
-    Attributes:
-        name: attribute; Absolute raw key.
-    """
-
     name: str
 
 
+@dataclasses.dataclass(frozen=True)
 class Preprocessed:
-    name: str | Absolute
-    read: Callable[[torch.Tensor], torch.Tensor]
+    name: "str | Absolute"
+    read: Convert
+
 
 class RuntimeResource(Protocol):
     def load(self, name: str) -> torch.Tensor: ...
+
     def load_group(self, name: str) -> "tuple[torch.Tensor, ...] | None": ...
+
     def subtree(self, seg: str) -> "RuntimeResource": ...
+
+
+class DictResource:
+    def __init__(
+        self, data: Mapping[str, torch.Tensor], prefix: str = "", alias: AliasMap | None = None
+    ) -> None: ...
+
+    def load(self, name: str) -> torch.Tensor: ...
+
+    def load_group(self, name: str) -> "tuple[torch.Tensor, ...] | None": ...
+
+    def subtree(self, seg: str) -> "DictResource": ...
+
+
+class SafetensorsResource:
+    def __init__(
+        self, ckpt_dir: str, prefix: str = "", device: str = "cuda", alias: AliasMap | None = None
+    ) -> None: ...
+
+    def load(self, name: str) -> torch.Tensor: ...
+
+    def load_group(self, name: str) -> "tuple[torch.Tensor, ...] | None": ...
+
+    def subtree(self, seg: str) -> "SafetensorsResource": ...
+
+
+class DrawnResource:
+    def __init__(
+        self,
+        module: Module,
+        generator: torch.Generator,
+        device: str,
+        drawn: dict[str, torch.Tensor] | None = None,
+        prefix: str = "",
+    ) -> None: ...
+
+    def load(self, name: str) -> torch.Tensor: ...
+
+    def load_group(self, name: str) -> None: ...
+
+    def subtree(self, seg: str) -> "DrawnResource": ...
+
+
+def draw_tensor(declared: TensorType, generator: torch.Generator, device: str) -> torch.Tensor: ...
 ```
+<!-- /generated -->
 
 - constraints:
   - `Preprocessed` is a frozen dataclass carrying one raw name and its one-tensor
@@ -427,12 +512,12 @@ class RuntimeResource(Protocol):
     reshapes only where a `Preprocessed` alias entry states that the checkpoint
     stores that one tensor differently from how the Module declares it — a
     transpose, a slice of a fused tensor, or a dropped axis. Assembling a
-    one-to-many group into one tensor stays `prepare`'s job ([§1.1.2](#112-weight-converter-and-prepare--forward)), via
+    one-to-many group into one tensor stays `prepare`'s job ([§1.3](#13-runtimedecoratorpy)), via
     `torch.stack`, and so does any value that is a function of more than one raw
     tensor. `Preprocessed` MUST resolve to one name: a tuple-valued name is
     rejected at construction, naming the weight converter as the way to express
     it. Precision is not preprocessing: a read MUST return the checkpoint's own
-    stored element type and be validated against the declaration ([§1.1.2](#112-weight-converter-and-prepare--forward)).
+    stored element type and be validated against the declaration ([§1.3](#13-runtimedecoratorpy)).
 
 An `alias` entry renames one path *segment* or *leaf* **within the current
 scope**, joined onto the caller's already-accumulated prefix: lookup order is
@@ -498,6 +583,13 @@ def draw_tensor(declared: TensorType, generator, device: str) -> torch.Tensor: .
     A raw key is cached weakly: repeated reads return the same tensor while a
     caller holds it, and the entry may disappear after the last reference is
     collected; scoped views share the index, shard handles, and tensor cache.
+  - *device* is resolved on every read, and both the shard handles and the
+    tensor cache are keyed by that resolved device alongside the name. A bare
+    `"cuda"` means whichever card the process has selected, which a
+    single-process multi-card host changes between reads; a handle keyed by
+    file alone would stay pinned to the card that first opened it, and a tensor
+    keyed by name alone would hand a reader on one card what another card
+    holds.
   - `DrawnResource` draws a declared weight lazily with `draw_tensor`, keeps
     the result strongly, and shares its generator and drawing ledger across
     `subtree` views without reseeding. The strong ledger is a contract: drawing
@@ -506,81 +598,126 @@ def draw_tensor(declared: TensorType, generator, device: str) -> torch.Tensor: .
     groups, so `load_group` always returns `None`.
   - every read tensor keeps the element type the checkpoint stores. A
     declaration requiring a different precision uses a weight converter
-    ([§1.1.2](#112-weight-converter-and-prepare--forward)), and `load` validates the converted or raw result against that
+    ([§1.3](#13-runtimedecoratorpy)), and `load` validates the converted or raw result against that
     declaration.
 
-### 1.6 `check`
+### 1.9 `runtime/measure.py`
 
+<!-- generated: py-measure -->
 ```python
+# src/tilefoundry/runtime/measure.py
+@dataclass(frozen=True)
 class Predicate:
-    """Carry one comparison and its bounds.
-
-    Attributes:
-        name: attribute; Registry and report name.
-        bounds: attribute; Bound fields in surface order.
-        needs_reference: attribute; Whether the comparison consumes a reference.
-        discrete: attribute; Whether it is meaningful on integer outputs.
-        guidance: attribute; One-line CLI guidance.
-    """
-
     name: ClassVar[str] = ""
     bounds: ClassVar[tuple[str, ...]] = ()
     needs_reference: ClassVar[bool] = True
     discrete: ClassVar[bool] = True
     guidance: ClassVar[str] = ""
 
-PREDICATES: Mapping[str, type[Predicate]]
+    def measure(
+        self, candidate: torch.Tensor, reference: torch.Tensor | None
+    ) -> "PredicateResult": ...
 
+
+@dataclass(frozen=True)
 class PredicateResult:
-    """Record one predicate measurement.
-
-    Attributes:
-        predicate: attribute; Predicate that ran.
-        values: attribute; Named measurements.
-        passed: attribute; Whether its bound held.
-        note: attribute; Optional interpretation note.
-    """
-
     predicate: Predicate
     values: Mapping[str, float]
     passed: bool
     note: str | None = None
 
+
+@dataclass(frozen=True)
+class AllClose(Predicate):
+    atol: float
+    rtol: float
+
+    def measure(self, candidate, reference): ...
+
+
+@dataclass(frozen=True)
+class RelL2(Predicate):
+    max: float
+
+    def measure(self, candidate, reference): ...
+
+
+@dataclass(frozen=True)
+class Cosine(Predicate):
+    min: float
+
+    def measure(self, candidate, reference): ...
+
+
+@dataclass(frozen=True)
+class Equal(Predicate):
+    def measure(self, candidate, reference): ...
+
+
+@dataclass(frozen=True)
+class Ulp(Predicate):
+    max: float
+
+    def measure(self, candidate, reference): ...
+
+
+@dataclass(frozen=True)
+class MaxAbs(Predicate):
+    max: float
+
+    def measure(self, candidate, reference): ...
+
+
+@dataclass(frozen=True)
+class MaxRel(Predicate):
+    max: float
+
+    def measure(self, candidate, reference): ...
+
+
+@dataclass(frozen=True)
+class NanInf(Predicate):
+    def measure(self, candidate, reference=None): ...
+
+
+PREDICATES: Mapping[str, type[Predicate]] = {
+    predicate.name: predicate
+    for predicate in (AllClose, RelL2, Cosine, Equal, Ulp, MaxAbs, MaxRel, NanInf)
+}
+
+
+@dataclass(frozen=True)
 class OutputCheck:
-    """Record predicate results for one output.
-
-    Attributes:
-        path: attribute; Structural output path.
-        shape: attribute; Runtime output shape.
-        dtype: attribute; Runtime output dtype.
-        ref_norm: attribute; Reference norm when a reference exists.
-        results: attribute; Predicate results.
-        passed: attribute; Derived read-only verdict over the results.
-    """
-
     path: str
     shape: tuple[int, ...]
     dtype: str
     ref_norm: float | None
     results: tuple[PredicateResult, ...]
 
+    @property
     def passed(self) -> bool: ...
 
+
+@dataclass(frozen=True)
 class Report:
-    """Record all checked outputs.
-
-    Attributes:
-        outputs: attribute; Output checks in structural order.
-        passed: attribute; Derived read-only verdict over the outputs.
-    """
-
     outputs: tuple[OutputCheck, ...]
 
+    @property
     def passed(self) -> bool: ...
 
-def check(candidate: Callable, reference: Callable | None, inputs: tuple, *,
-          expect: Mapping[str, Sequence[Predicate]]) -> Report: ...
+
+def flatten_outputs(x, path: str = "output") -> list[tuple[str, torch.Tensor]]: ...
+
+
+def check(
+    candidate: Callable,
+    reference: Callable | None,
+    inputs: tuple,
+    *,
+    expect: Mapping[str, Sequence[Predicate]],
+) -> Report: ...
 ```
+<!-- /generated -->
 
 - constraints:
   - `PREDICATES` MUST contain the built-in `allclose`, `rel_l2`, `cosine`,
@@ -611,6 +748,55 @@ def check(candidate: Callable, reference: Callable | None, inputs: tuple, *,
   - it is not specific to `RuntimeModule`: *candidate* / *reference* may be a
     `RuntimeModule` bound method, a raw torch callable, or an evaluator
     closure — anything callable on *inputs*.
+
+### 1.10 `runtime/tensor.py`
+
+`Module.prepare` writes one canonical tensor per weight and the HIR keeps the
+global `TensorType`, so a checkpoint read hands back every program's data at
+once. `ShardTensor` pairs that owning tensor with the type that shards it, and
+`to_local` is the single place the pair is narrowed to one program.
+
+<!-- generated: py-tensor -->
+```python
+# src/tilefoundry/runtime/tensor.py
+@dataclass(frozen=True)
+class ShardTensor:
+    tensor: torch.Tensor
+    type: TensorType
+
+    def to_local(
+        self, topologies: tuple[Topology, ...], placement: "Placement | None"
+    ) -> torch.Tensor: ...
+```
+<!-- /generated -->
+
+- constraints:
+  - `ShardTensor` carries no `Placement`, coordinate, rank or device map. The
+    program is an argument to `to_local`, so one owning tensor serves every
+    program a host dispatches, and `to_local` is the only way to a slice. Named
+    as `DTensor.to_local`, which answers the same question.
+  - a `type` with no `ShardLayout` is every program's whole tensor, and so is
+    an axis the mesh only broadcasts over or reduces across.
+  - which part is one program's MUST come from `local_layout_and_offset`
+    ([shard §7](shard.md#7-shardlayout)), the same algebra the device side runs
+    under that name, rather than from a second walk over the attrs. Host and
+    device read the one layout and the one offset, so a slice is not derived
+    twice and cannot disagree with itself.
+  - a level whose id is unfixed MUST be left undivided
+    ([shard §5.1](shard.md#51-placement)).
+  - a `RuntimeModule`'s public boundary takes and returns `ShardTensor`, while
+    a body -- a Python reference or a launched kernel alike -- only ever
+    receives the local `torch.Tensor`. A returned tensor is already one
+    program's, so the type it is paired with states that shape and carries no
+    layout: narrowing it again would take a shard of a shard.
+  - a weight narrowed on first use is copied out of the read it came from, so
+    the whole canonical tensor is released once every shard it contributes is
+    held. A weight the mesh does not divide is kept as the read itself.
+  - what remembers a read weight is keyed by name, program ids and the current
+    device together. One weight read on two cards is two tensors, and a key of
+    the name alone hands a reader on one card what another card holds.
+
+---
 
 ## 2. C++ Runtime Surface
 
@@ -649,6 +835,7 @@ inline constexpr int kWarpSize;
 template <class...> inline constexpr bool dependent_false_v;
 
 enum class TopologyScope {
+    gpu,
     cta,
     thread,
     scope_count,
@@ -660,13 +847,56 @@ CUTE_HOST_DEVICE constexpr auto program_dim() noexcept;
 template <TopologyScope T>
 CUTE_HOST_DEVICE constexpr auto program_shape() noexcept;
 
+CUTE_HOST_DEVICE constexpr TopologyScope program_topology() noexcept;
+
+CUTE_HOST_DEVICE constexpr auto program_topologies() noexcept;
+
+struct ProgramMetaData {
+    int program_id[int(TopologyScope::scope_count)];
+};
+
+CUTE_HOST_DEVICE ProgramMetaData &program_meta();
+
+CUTE_HOST_DEVICE void program_meta(ProgramMetaData const &meta);
+
 template <TopologyScope T> CUTE_HOST_DEVICE size_t program_id() noexcept;
 
 CUTE_HOST_DEVICE auto program_ids() noexcept;
 ```
 <!-- /generated -->
 
-**Terms.** A *level* is one parallel-resource level of the launch: `cta` or `thread`. An *instance* is one id of a level. A *coordinate* is one id per level, which is what `program_ids()` hands back.
+**Terms.** A *level* is one parallel-resource level of the launch: `gpu`, `cta` or `thread`. An *instance* is one id of a level. A *coordinate* is one id per level, which is what `program_ids()` hands back.
+
+- constraints:
+  - `gpu` is the level the host places. A card carries no register naming
+    which of the mesh's cards it is, so `program_id<TopologyScope::gpu>()`
+    reads what the launch was told instead, and that value MUST equal the id
+    the host's `Placement` gave the `gpu` level for the same invocation
+    ([§1.10](#110-runtimetensorpy)).
+  - the value reaches the device as a by-value `ProgramMetaData` kernel
+    parameter, and the generated kernel MUST hand it to `program_meta` before
+    any divergence. One thread writes and the barrier orders that write
+    against every read.
+  - `program_meta`'s slot is `__shared__`, so one name is one copy per block
+    rather than one per device: two kernels running at once on one card each
+    read what their own launch was told.
+  - `scope_count` states how many levels there are, and everything indexed by
+    a level MUST derive its length from it: `ProgramMetaData.program_id`, the
+    tuple `program_ids()` returns, and the coord a mesh is asked about. A
+    coord shorter than that is missing a level rather than naming a smaller
+    mesh, and MUST be refused where it is used rather than left to read the
+    neighbouring level's id.
+  - `program_topology()` is the coarsest level this program names and
+    `program_topologies()` is the whole run from there to `scope_count`,
+    coarsest first. Both derived answers are CuTe's own questions about that
+    tuple -- how many levels is `cute::rank` of it, where level `S` sits is
+    `cute::find(program_topologies(), cute::C<S>{})` -- so neither has a name
+    of its own, and a level this program does not name is refused the way CuTe
+    refuses it: `cute::find` hands back the rank and the `get` that follows
+    reports `"Index out of range"`.
+  - that parameter MUST NOT appear in the wrapper's user-visible signature. A
+    `Placement` itself never reaches a kernel ([§1.10](#110-runtimetensorpy)); the
+    id derived from it is an internal parameter the caller supplies.
 
 - constraints:
   - The enumeration is fixed to the `cta` and `thread` program levels plus the `scope_count` sentinel. A warp-sized grouping is an axis of a `thread` mesh's layout, not a level of its own.
@@ -713,7 +943,7 @@ CUTE_HOST_DEVICE constexpr bool contains(Mesh<L, Topos...> const &mesh,
                                          Coord const &coord);
 
 template <class L, TopologyScope... Topos, class Coord>
-CUTE_HOST_DEVICE constexpr int get_1d_coord(Mesh<L, Topos...> const &mesh,
+CUTE_HOST_DEVICE constexpr auto mesh_coords(Mesh<L, Topos...> const &mesh,
                                             Coord const &coord);
 
 template <class L, TopologyScope... Topos>
@@ -732,7 +962,8 @@ CUTE_HOST_DEVICE constexpr auto make_mesh(Extents const &extents);
 - constraints:
   - A mesh is the levels it names and the layout whose values are their ids -- the same two facts the IR `Mesh` carries beside its axis names ([shard §5](./shard.md#5-mesh)). Its instance count and shape are `cute::size` and `cute::shape` of that layout, which read through a slice on their own.
   - A mesh naming several levels states its axes grouped one nest per level, each already in that level's own numbering, and `get<level>` picks the nest. A mesh that names several without that grouping is refused: no rule says which axes are whose. It cannot also be sliced -- the slice and the level boundary would both be deciding which positions these are.
-  - `contains` and `get_1d_coord` are not the same question, and on a mesh narrower than its level not the same answer. `idx2crd` is `(id / stride) % extent`, so thread 64 of a 128-thread block is not in a 32-instance mesh and does act as its instance 0: the upper warps repeat what the lowest warp does. A slice does not repeat, so a coordinate from outside one reaching `get_1d_coord` is a codegen fault.
+  - `mesh_coords` answers where this program sits in the mesh's own coordinates: one `idx2crd` per level, of that level's id against that level's nest, grouped the way the mesh is. The answer is congruent with `cute::shape` of the mesh's layout whether it names one level or several, so a layout over that shape indexes with it as it stands. The ids it reads are `program_ids()`, one per level this program names, so a coord of another length is refused by name.
+  - `contains` and `mesh_coords` are not the same question, and on a mesh narrower than its level not the same answer. `idx2crd` is `(id / stride) % extent`, so thread 64 of a 128-thread block is not in a 32-instance mesh and does act as its instance 0: the upper warps repeat what the lowest warp does. A slice does not repeat, so a coordinate from outside one reaching `mesh_coords` is a codegen fault. `contains` asks every level the mesh names, because a mesh grouped one nest per level is one instance per level together.
   - A thread mesh has warps only when its ids run a whole number of them. `(32,..)` stepping by one is one warp and the axis beyond it carries the warps; `(128,..)` holds four that `as_warped` splits out. Lanes shorter than a warp, repeated across warps, MUST be refused by name -- they reach neither `bar.sync`, which counts whole warps, nor one `__syncwarp`.
   - `as_warped` is idempotent: a mesh whose fastest axis is already one warp comes back unchanged.
   - Only one shape of `cute::ComposedLayout` is a mesh: `cute::identity` over a static offset. A swizzle in the first slot, or a dynamic offset, is a mesh whose first instance is not a compile-time number, and every reader wants it as one.
@@ -762,6 +993,9 @@ template <class Reduction> struct P {
 };
 
 struct Dynamic {};
+
+template <size_t Ax, class L, class A, class M>
+CUTE_HOST_DEVICE constexpr auto stride(ShardLayout<L, A, M> const &sl);
 
 template <class SL> CUTE_HOST_DEVICE constexpr void check_shard_layout();
 
@@ -797,6 +1031,8 @@ struct ShardTensor {
     using shard_layout_type = TShardLayout;
     TEngine engine;
     TShardLayout shard_layout;
+    /// As ``cute::Tensor`` has it: the engine's own pointer, before any
+    /// instance's slice is projected out of it.
     CUTE_HOST_DEVICE auto data();
     CUTE_HOST_DEVICE auto data() const;
 };
@@ -804,15 +1040,29 @@ struct ShardTensor {
 template <class T, class GL, class SL>
 CUTE_HOST_DEVICE auto make_shard_tensor(T const &tensor, GL, SL shard_layout);
 
+template <class T>
+concept ShardTensorLike =
+    detail::is_shard_tensor<cute::remove_cvref_t<T>>::value;
+
+template <class T> CUTE_HOST_DEVICE decltype(auto) local_tensor(T &&t);
+
+template <class T>
+using local_view_t =
+    cute::remove_cvref_t<decltype(local_tensor(std::declval<T const &>()))>;
+
 template <class T> CUTE_HOST_DEVICE constexpr int shard_mesh_instances();
 ```
 <!-- /generated -->
 
-**Terms.** A *shard tensor* is an engine, the global layout it came from, and a shard layout. *Projecting* it is resolving it to the slice this instance owns.
+**Terms.** A *shard tensor* is an engine, the global layout it came from, and a shard layout. *Projecting* it is resolving it to the slice this instance owns: `local_tensor`, whose type-level half is `local_view_t`, while `ShardTensorLike` is the one test for "is this operand sharded". All three are `tilefoundry::` names, not `detail` ones.
 
 - constraints:
   - `engine` is a CuTe tensor or view, never a raw pointer: residency lives on the engine type, and `data()` drops it.
+  - `local_tensor`, `local_view_t` and `ShardTensorLike` are public: a step every op must take, and the word an op writes its own constraints in, are not implementation details. `is_shard_tensor` -- how `ShardTensorLike` is decided, which nothing outside needs -- stays in `detail`.
   - A tensor whose layout is a `ShardLayout` has distributed semantics -- it is the whole tensor, and each instance owns the slice its shard layout gives it.
+  - One attr per mesh axis, against the mesh's axes flattened: a mesh naming several levels states them grouped one nest per level, and its rank is then how many levels it names rather than how many axes the attrs answer for.
+  - Several mesh axes MAY cut one tensor axis -- two axes of one level as a grid, or two levels one taking a block of what the other left. Each cut divides what the previous one left, so the axis's local extent is the whole divided by all of them, and one step of a mesh axis clears everything the axes inside it hold.
+  - Where an instance's slice begins is that mesh's own shape carrying, on each axis, how far along the tensor one step of it moves the origin: the attrs say which tensor axis and how much of it a step clears, the tensor layout says what that costs in elements. It is congruent with the mesh's shape, grouping and all, so `mesh_coords` indexes it as it stands and reading it is `crd2idx`. It is not `offset(mesh)`, which is the first id a sliced mesh covers.
 
 ### 2.5 `cuda/primitive/`
 
@@ -910,177 +1160,6 @@ struct div_op {
 
 ### 2.6 `cuda/ops/`
 
-#### 2.6.1 `ops/detail.cuh`
-
-<!-- generated: ops-detail -->
-```text
-// include/tilefoundry/runtime/cuda/ops/detail.cuh
-// This header declares no surface of its own.
-```
-<!-- /generated -->
-
-**Terms.** `ops::detail` is the set of tensor-view names an op may reach for. They are defined in `tilefoundry::detail`; this header states which of them cross into `ops`.
-
-- constraints:
-  - An op reaches for a tensor-view name through `ops::detail` and nowhere else, so what crosses the boundary is stated in one header.
-
-#### 2.6.2 `ops/copy.cuh`
-
-<!-- generated: ops-copy -->
-```cpp
-// include/tilefoundry/runtime/cuda/ops/copy.cuh
-template <class TSrc, class TDst>
-__device__ void copy(TSrc const &src, TDst &dst);
-
-template <class TSrc, class TDst>
-__device__ void copy_async(TSrc const &src, TDst &dst);
-```
-<!-- /generated -->
-
-- constraints: none beyond the signature.
-
-#### 2.6.3 `ops/dot.cuh`
-
-<!-- generated: ops-dot -->
-```cpp
-// include/tilefoundry/runtime/cuda/ops/dot.cuh
-template <class Lhs, class Rhs, class Dst,
-          class Ws = reduce_impl::no_workspace_t>
-__device__ inline void dot(Lhs const &lhs, Rhs const &rhs, Dst &dst,
-                           Ws &&ws = {});
-```
-<!-- /generated -->
-
-- constraints: none beyond the signature.
-
-#### 2.6.4 `ops/elementwise.cuh`
-
-<!-- generated: ops-elementwise -->
-```cpp
-// include/tilefoundry/runtime/cuda/ops/elementwise.cuh
-template <class Fn, class TOut, class... TIn>
-__device__ void elementwise(TOut &dst, Fn fn, TIn const &...src);
-```
-<!-- /generated -->
-
-- constraints: none beyond the signature.
-
-#### 2.6.5 `ops/mma.cuh`
-
-<!-- generated: ops-mma -->
-```cpp
-// include/tilefoundry/runtime/cuda/ops/mma.cuh
-template <class TA, class TB, class TC>
-__device__ void mma(TA const &a, TB const &b, TC &c);
-```
-<!-- /generated -->
-
-- constraints: none beyond the signature.
-
-#### 2.6.6 `ops/reduce.cuh`
-
-<!-- generated: ops-reduce -->
-```cpp
-// include/tilefoundry/runtime/cuda/ops/reduce.cuh
-struct mean_op {};
-
-struct absmax_op {};
-
-template <class Op, class Axes, class Src, class Dst,
-          class Ws = reduce_impl::no_workspace_t>
-__device__ inline void reduce(Src const &src, Dst &dst, Ws &&ws = {});
-```
-<!-- /generated -->
-
-- constraints: none beyond the signature.
-
-#### 2.6.7 `ops/rmsnorm.cuh`
-
-<!-- generated: ops-rmsnorm -->
-```cpp
-// include/tilefoundry/runtime/cuda/ops/rmsnorm.cuh
-template <class TIn, class TOut, class TW>
-__device__ void rmsnorm(TIn const &src, TOut &dst, TW const &weight,
-                        float eps);
-```
-<!-- /generated -->
-
-- constraints: none beyond the signature.
-
-#### 2.6.8 `ops/sync.cuh`
-
-<!-- generated: ops-sync -->
-```cpp
-// include/tilefoundry/runtime/cuda/ops/sync.cuh
-template <int Id> struct BarrierId {
-    static constexpr int value;
-};
-
-template <int Id> inline constexpr BarrierId<Id> bar_id;
-
-struct no_resource_t {};
-
-template <class T> struct barrier_id_traits {
-    static constexpr bool value;
-};
-
-template <class TMesh, TopologyScope... Topos, class TRes = no_resource_t>
-__device__ inline void sync(Mesh<TMesh, Topos...> const &mesh,
-                            TRes resource = {});
-```
-<!-- /generated -->
-
-**Terms.** A *tier* is the barrier a mesh reaches: `grid`, `block`, `warp`, or a *named* barrier. A mesh that reaches none is refused by the name of what it lacks.
-
-- constraints:
-  - A mesh that reaches no barrier is refused by the name of what it lacks, not approximated. Silence would read as "not implemented yet"; the refusal says which of the two it is.
-
-#### 2.6.9 `ops/tma.cuh`
-
-<!-- generated: ops-tma -->
-```cpp
-// include/tilefoundry/runtime/cuda/ops/tma.cuh
-template <class Src, class Dst>
-__device__ inline void tma_copy(Src const &src, Dst &dst, uint64_t *bar);
-```
-<!-- /generated -->
-
-- constraints: none beyond the signature.
-
-### 2.7 `cuda/utility/`
-
-#### 2.7.1 `utility/warp.cuh`
-
-<!-- generated: utility-warp -->
-```cpp
-// include/tilefoundry/runtime/cuda/utility/warp.cuh
-template <class T>
-inline constexpr bool is_shuffle_native_v;
-
-template <class T> struct ShuffleXor {
-    __device__ T operator()(T value, int lane_mask,
-                                unsigned member_mask) const;
-};
-
-struct Elect {
-    __device__ bool operator()() const;
-};
-
-template <class T>
-__device__ inline T shuffle_xor(T value, int lane_mask,
-                                unsigned member_mask = 0xFFFFFFFFu);
-
-inline bool shuffle_elect();
-
-template <class Combine, int Width = 32, class T>
-__device__ inline T warp_reduce(T value);
-```
-<!-- /generated -->
-
-- constraints: none beyond the signature.
-
-## 3. Runtime Ops
-
 Codegen targets one public namespace function per runtime op/family:
 
 ```cpp
@@ -1117,7 +1196,7 @@ the one time it was written down as the rule it argued a dependency chain into
 
 Anything that takes a raw pointer, an `int` or a type and answers a question
 about it is not an op but a utility, and belongs outside `ops::` — the
-warp-scoped primitives of [§4](#4-warp-primitives) and the `mbarrier`
+warp-scoped primitives of [§2.7](#27-cudautility) and the `mbarrier`
 instructions a caller writes around `tma_copy` are both that. In particular the
 runtime publishes **no predicate and no constant reporting which tier an op
 selected or how wide a move it chose**: a caller cannot use one to decide how to
@@ -1151,26 +1230,284 @@ a symbol what an argument already states.
 **Annotation convention.** `ops::*` public entries, their internal impl
 functors, and op tags MUST be annotated `__device__` (their bodies are
 device-only). `CUTE_HOST_DEVICE` MUST be reserved for tensor-view / layout
-helpers genuinely capable of host compilation (e.g. `local()`,
+helpers genuinely capable of host compilation (e.g. `local_tensor`,
 `make_shard_tensor`).
 
-#### `runtime/cuda/ops/`
 
-Ops are organised by the header they live in; the file is organisation, not a
-separate layer. Each entry below states what its tier is read off, and nothing
-a sibling spec already owns.
+#### 2.6.1 `ops/detail.cuh`
 
-##### `sync`
-
-```cpp
-/**
- * @brief Barrier over every instance of a mesh.
- * @param mesh the participants; its scope and layout pick the barrier
- */
-/** @param resource the counter or named barrier required by the selected tier */
-template <class TMesh, TopologyScope... Topos, class TRes = no_resource_t>
-__device__ void sync(Mesh<TMesh, Topos...> const& mesh, TRes resource = {});
+<!-- generated: ops-detail -->
+```text
+// include/tilefoundry/runtime/cuda/ops/detail.cuh
+// This header declares no surface of its own.
 ```
+<!-- /generated -->
+
+**Terms.** `ops::detail` is the set of tensor-view *implementation* names an op may reach for: `id_axes`, `is_partial_attr_v`, `is_shard_tensor`, `is_split_attr_v`, `positions_of`, `shard_attrs_match_mesh`, `shard_layout_is_full_broadcast`. They are defined in `tilefoundry::detail`; this header states which of them cross into `ops`. *Projecting* an operand is `local_tensor`: a ShardTensor resolved to this instance's slice, and an operand the mesh never spread returned whole. It is not one of them -- it, `local_view_t` and `ShardTensorLike` are `tilefoundry::` names an op calls unqualified by `detail` ([§2.4.1](#241-tensor_viewshard_tensorcuh)).
+
+- constraints:
+  - An op reaches for a tensor-view *implementation* name through `ops::detail` and nowhere else, so what crosses that boundary is stated in one header. The gate holds only names an op may want and none must have; a step no op may skip is public instead, because a thing every op goes through is not an implementation detail.
+  - An op projects every operand through `tilefoundry::local_tensor`, sharded or not. An operand with no shard layout is not a case to refuse: it is one every instance holds entire, and the op's arithmetic over it is the same. So the choice is made once, where the operand is projected, rather than at each op.
+
+#### 2.6.2 `ops/copy.cuh`
+
+<!-- generated: ops-copy -->
+```cpp
+// include/tilefoundry/runtime/cuda/ops/copy.cuh
+template <class TSrc, class TDst>
+__device__ void copy(TSrc const &src, TDst &dst);
+
+template <class TSrc, class TDst>
+__device__ void copy_async(TSrc const &src, TDst &dst);
+```
+<!-- /generated -->
+
+**`copy`.**
+
+One entry, taking tensors, with the transfer shape, the strides, the element
+types, the share this instance owns and the move width all read off the operand
+`ShardLayout`s.
+
+- constraints:
+  - **The move width is a property of the layouts, not of the call.** It is the
+    largest power of two both operands run contiguously over —
+    `max_common_vector` of the two *projected* layouts, which
+    [§2.4.1](#241-tensor_viewshard_tensorcuh) derives statically from the shard layout and
+    the mesh — capped so neither side's move exceeds 16 bytes.
+  - A dtype change does not force the width to one element: the wide load still
+    holds and the conversion happens on the way out. The cap follows the wider
+    of the two element types.
+  - Register fragments take the element path. Addressing `&frag(i)` under a
+    loop the compiler cannot unroll spills the fragment to local memory, which
+    costs more than the wider move saves.
+  - Where the shard's offset lands is the one thing a layout cannot state, so
+    the implementation tests the two base pointers against the width's
+    alignment and falls back to the element path when it does not hold. That
+    is one comparison, not a scan.
+  - The call site names no vector width and no thread index. A copy split across
+    a block's threads is a thread-scoped mesh in the operands' shard layouts;
+    the entry then copies exactly the slice `local_tensor` hands each thread.
+
+**`copy_async`.**
+
+- constraints:
+  - The call is non-blocking; generated code orders later reads through
+    `cp_async_commit` and `cp_async_wait`.
+  - The name is the contract: a pair of projected views `cp.async` cannot move
+    a 4-byte-or-wider word of does not compile, and takes `ops::copy` instead.
+    There is no synchronous tier hiding under this entry for the caller to wait
+    on.
+  - The two projected slices hold the same number of elements. Where an
+    instance owns part of a wider destination, that is the destination's shard
+    layout to state; the source's offset is not borrowed for it.
+  - Runtime implementation details such as vector width and tail handling live
+    in code comments, not this spec entry.
+
+#### 2.6.3 `ops/dot.cuh`
+
+<!-- generated: ops-dot -->
+```cpp
+// include/tilefoundry/runtime/cuda/ops/dot.cuh
+template <class Lhs, class Rhs, class Dst,
+          class Ws = reduce_impl::no_workspace_t>
+__device__ inline void dot(Lhs const &lhs, Rhs const &rhs, Dst &dst,
+                           Ws &&ws = {});
+```
+<!-- /generated -->
+
+**`dot`.**
+
+`dst = sum(lhs * rhs)`. A matrix-vector product's inner loop is one statement,
+not an `elementwise` followed by a `reduce`: materialising the product first
+would cost a register per element of the row, which is what makes that
+pair the wrong spelling here.
+
+- constraints:
+  - **Two tiers, one entry.** With no workspace the contraction lives inside a
+    warp and one butterfly finishes it; with a workspace it spans the block,
+    each warp posting a partial into a slot. Either way every participant leaves
+    holding the total, so a caller never broadcasts it back.
+  - The load width is the operands' shard layouts', the same question
+    the `copy` entry answers: the run both sides share, capped by what both are
+    aligned for and by 16 bytes.
+    A row split so that a lane owns four contiguous elements loads eight bytes
+    at a time; one that leaves it eight loads sixteen. The width appears neither
+    at the call site nor on the op surface — the runtime derives it inside the
+    entry and publishes nothing that reports it, for the reason
+    [§2.6](#26-cudaops) gives for publishing no tier predicate.
+  - The fold uses a fixed number of independent partial accumulators, and the
+    tree that combines them is this op's summation order. One running sum would
+    make a row a chain of dependent multiply-adds, and the loads could not run
+    ahead of it: what a warp then waits on is the row's latency, not its bytes.
+  - Accumulation is f32 regardless of the operand type.
+
+#### 2.6.4 `ops/elementwise.cuh`
+
+<!-- generated: ops-elementwise -->
+```cpp
+// include/tilefoundry/runtime/cuda/ops/elementwise.cuh
+template <class Fn, class TOut, class... TIn>
+__device__ void elementwise(TOut &dst, Fn fn, TIn const &...src);
+```
+<!-- /generated -->
+
+**`elementwise`.**
+
+`dst(i) = fn(src(i)...)` over the destination's local domain. The one pointwise
+op: arity is the pack's length, the operation is `fn`, and a broadcast operand
+is a stride-0 mode on that operand's layout.
+
+- constraints:
+  - **`dst` and `fn` lead**, because the sources are a variadic pack. Zero
+    sources is a fill, one is a map, two a combine; the same instantiation
+    serves all three.
+  - `fn` is anything callable. The primitives the runtime ships
+    (`ops/primitive/`) are values, not ops, and are not in this section's list;
+    `reduce` and `dot` take the arity-2 ones too. There is no separate tag path
+    and lambda path.
+  - **The extent is `size()` of the projected destination.** No count
+    parameter: a hand-passed one is a second statement of a fact the layout
+    already holds, free to disagree with it.
+  - **No shape or domain check.** A mismatched operand is a codegen bug, and
+    shapes are computed on the compile side.
+  - **The only conversion is the one `dst(i) = ...` implies.** The runtime
+    performs no `static_cast` of its own — it does not choose a compute
+    precision. A caller that wants one states it in `fn` (`float(x) * scale`),
+    which mirrors TIR, where a cast is a `Cast` node.
+  - **Broadcast is a layout fact.** A per-row scale is the operand read through
+    `(M, K):(1, 0)`, a per-column weight through `(M, K):(0, 1)`, a scalar
+    through `(N):(0)`. `compose` states this against the operand's own layout,
+    so a strided or sharded operand is read where it actually lies.
+
+#### 2.6.5 `ops/mma.cuh`
+
+<!-- generated: ops-mma -->
+```cpp
+// include/tilefoundry/runtime/cuda/ops/mma.cuh
+template <class TA, class TB, class TC>
+__device__ void mma(TA const &a, TB const &b, TC &c);
+```
+<!-- /generated -->
+
+**`mma`.**
+
+`c += a @ b`, one entry, with the tier read off the operand layouts: rank-2
+static shard layouts on `a` and `b` are a tile and the entry loops the atom over
+it; anything else is a lane's already-gathered fragment and takes the single
+instruction. Codegen emits this one call either way.
+
+- constraints:
+  - The tile tier reads `a` as `(M, K)` and `b` as `(N, K)`. **There is no
+    transpose flag.** Whether the buffer behind `b` is k-major or n-major is a
+    stride in its layout, and the indexing picks that up, so the same call reads
+    both.
+  - `M` and `K` must be whole multiples of the atom's `16` and `16`, and every
+    warp must receive a whole number of `N` atoms of `8`. Violations are
+    `static_assert`s, not run-time checks.
+  - Warps split `N`. The warp count comes from the accumulator's mesh — that is
+    what `c` being a `ShardTensor` is for — not from `blockDim`.
+  - The accumulator's engine is the lane's own registers, which is what
+    `local_tensor` ([§2.4.1](#241-tensor_viewshard_tensorcuh)) hands back for register storage, while its
+    `ShardLayout` states which entries of the tile those registers are: the
+    fragment map is warp-split over `N` and lane-split within each atom, and
+    saying so is the layout's job, not an accessor's. **The runtime publishes no
+    fragment-coordinate function and no accumulator constructor.** A caller that
+    needs the map writes it as modes and attrs, the way it writes any other
+    layout, and the tile it moves the fragment to or from is then the same map
+    over a buffer — so rescaling a row of the accumulator or storing it out is
+    one `ops::elementwise` between two shards of one layout, with no fragment
+    index at the call site.
+  - Today's atom is `SM80_16x8x16_F32BF16BF16F32_TN`: bf16 operands, f32
+    accumulate. Another instruction is another atom under the same entry, not
+    another entry.
+
+#### 2.6.6 `ops/reduce.cuh`
+
+<!-- generated: ops-reduce -->
+```cpp
+// include/tilefoundry/runtime/cuda/ops/reduce.cuh
+struct mean_op {};
+
+struct absmax_op {};
+
+template <class Op, class Axes, class Src, class Dst,
+          class Ws = reduce_impl::no_workspace_t>
+__device__ inline void reduce(Src const &src, Dst &dst, Ws &&ws = {});
+```
+<!-- /generated -->
+
+**`reduce`.**
+
+- constraints:
+  - `reduce` is the only public runtime reduce entry; tier names and helper
+    functions are internal.
+  - Sharded operands derive the active tier and warp grouping from `(src, dst)`
+    shard layouts inside the runtime. `ws` is a *resource the layouts demand*
+    and never the tier selector: a reduce mesh that stays inside one warp takes
+    the intra-warp tier and needs no workspace, and one that crosses warps does
+    not compile without one.
+  - Both operands name one mesh and give one attr per mesh axis; the reduced
+    set is `src[i]` split or partial against `dst[i]` broadcast.
+  - The combine domain is `float` — `init`, `elem`, `combine` and `finalize`
+    all are — so an element type `float` cannot hold exactly (a 4- or 8-byte
+    integer, a packed key) is refused at the entry rather than rounded.
+  - Plain operands derive extents from the operand rank and size inside the
+    runtime.
+  - A reduction whose reduced axis crosses CTA boundaries is not supported.
+
+#### 2.6.7 `ops/rmsnorm.cuh`
+
+<!-- generated: ops-rmsnorm -->
+```cpp
+// include/tilefoundry/runtime/cuda/ops/rmsnorm.cuh
+template <class TIn, class TOut, class TW>
+__device__ void rmsnorm(TIn const &src, TOut &dst, TW const &weight,
+                        float eps);
+```
+<!-- /generated -->
+
+**`rmsnorm`.**
+
+- constraints:
+  - An op, not a composition of `reduce` and `elementwise`. The row's sum of
+    squares feeds that same row's rescale, so the fused form carries the row's
+    whole state in one scalar; the decomposed form has to materialise it as an
+    `M * K` per-instance scratch.
+  - `M` and `K` come from the destination's shard layout. Neither is a
+    parameter, and neither is computed by codegen.
+  - Each instance must hold the whole source and destination tile; a mesh that
+    splits either operand needs per-instance `M` and `K`, which this entry does
+    not derive. The weight is a rank-1 vector of length `K`.
+
+#### 2.6.8 `ops/sync.cuh`
+
+<!-- generated: ops-sync -->
+```cpp
+// include/tilefoundry/runtime/cuda/ops/sync.cuh
+template <int Id> struct BarrierId {
+    static constexpr int value;
+};
+
+template <int Id> inline constexpr BarrierId<Id> bar_id;
+
+struct no_resource_t {};
+
+template <class T> struct barrier_id_traits {
+    static constexpr bool value;
+};
+
+template <class TMesh, TopologyScope... Topos, class TRes = no_resource_t>
+__device__ inline void sync(Mesh<TMesh, Topos...> const &mesh,
+                            TRes resource = {});
+```
+<!-- /generated -->
+
+**Terms.** A *tier* is the barrier a mesh reaches: `grid`, `block`, `warp`, or a *named* barrier. A mesh that reaches none is refused by the name of what it lacks.
+
+- constraints:
+  - A mesh that reaches no barrier is refused by the name of what it lacks, not approximated. Silence would read as "not implemented yet"; the refusal says which of the two it is.
+
+**`sync`.**
 
 - constraints:
   - Which barrier runs is the mesh's own answer and never a call-site template
@@ -1206,100 +1543,17 @@ __device__ void sync(Mesh<TMesh, Topos...> const& mesh, TRes resource = {});
     launch, so the caller passes it; with none, a cooperative launch's grid
     group is used instead.
 
-##### `reduce`
+#### 2.6.9 `ops/tma.cuh`
 
+<!-- generated: ops-tma -->
 ```cpp
-/**
- * @brief Reduce src into dst along Axes.
- * @tparam Op compile-time combine tag (add_op, mean_op, max_op, min_op, absmax_op)
- * @tparam Axes compile-time reduced logical axes
- * @param src source operand; sharded operands carry ShardLayout
- * @param dst destination operand; sharded operands carry ShardLayout
- * @param ws shared-memory workspace, one slot per warp; required exactly when the layouts cross warps
- */
-template <class Op, class Axes, class Src, class Dst, class Ws = reduce_impl::no_workspace_t>
-__device__ void reduce(Src const& src, Dst& dst, Ws&& ws = {});
+// include/tilefoundry/runtime/cuda/ops/tma.cuh
+template <class Src, class Dst>
+__device__ inline void tma_copy(Src const &src, Dst &dst, uint64_t *bar);
 ```
+<!-- /generated -->
 
-- constraints:
-  - `reduce` is the only public runtime reduce entry; tier names and helper
-    functions are internal.
-  - Sharded operands derive the active tier and warp grouping from `(src, dst)`
-    shard layouts inside the runtime. `ws` is a *resource the layouts demand*
-    and never the tier selector: a reduce mesh that stays inside one warp takes
-    the intra-warp tier and needs no workspace, and one that crosses warps does
-    not compile without one.
-  - Both operands name one mesh and give one attr per mesh axis; the reduced
-    set is `src[i]` split or partial against `dst[i]` broadcast.
-  - The combine domain is `float` — `init`, `elem`, `combine` and `finalize`
-    all are — so an element type `float` cannot hold exactly (a 4- or 8-byte
-    integer, a packed key) is refused at the entry rather than rounded.
-  - Plain operands derive extents from the operand rank and size inside the
-    runtime.
-  - A reduction whose reduced axis crosses CTA boundaries is not supported.
-
-##### `copy`
-
-One entry, taking tensors, with the transfer shape, the strides, the element
-types, the share this instance owns and the move width all read off the operand
-`ShardLayout`s.
-
-```cpp
-/**
- * @brief Copy src into dst, at the width their shard layouts admit.
- * @param src the source tile
- * @param dst the destination tile
- */
-template <class TSrc, class TDst>
-__device__ void copy(TSrc const& src, TDst& dst);
-```
-
-- constraints:
-  - **The move width is a property of the layouts, not of the call.** It is the
-    largest power of two both operands run contiguously over —
-    `max_common_vector` of the two *projected* layouts, which
-    [§2.4.1](#241-tensor_viewshard_tensorcuh) derives statically from the shard layout and
-    the mesh — capped so neither side's move exceeds 16 bytes.
-  - A dtype change does not force the width to one element: the wide load still
-    holds and the conversion happens on the way out. The cap follows the wider
-    of the two element types.
-  - Register fragments take the element path. Addressing `&frag(i)` under a
-    loop the compiler cannot unroll spills the fragment to local memory, which
-    costs more than the wider move saves.
-  - Where the shard's offset lands is the one thing a layout cannot state, so
-    the implementation tests the two base pointers against the width's
-    alignment and falls back to the element path when it does not hold. That
-    is one comparison, not a scan.
-  - The call site names no vector width and no thread index. A copy split across
-    a block's threads is a thread-scoped mesh in the operands' shard layouts;
-    the entry then copies exactly the slice `local()` hands each thread.
-
-##### `copy_async`
-
-```cpp
-/**
- * @brief Async staging copy; fast path stages a gmem source into an smem destination.
- * @param src per-thread projected source operand
- * @param dst per-thread projected destination operand
- */
-template <class TSrc, class TDst>
-__device__ void copy_async(TSrc const& src, TDst& dst);
-```
-
-- constraints:
-  - The call is non-blocking; generated code orders later reads through
-    `cp_async_commit` and `cp_async_wait`.
-  - The name is the contract: a pair of projected views `cp.async` cannot move
-    a 4-byte-or-wider word of does not compile, and takes `ops::copy` instead.
-    There is no synchronous tier hiding under this entry for the caller to wait
-    on.
-  - The two projected slices hold the same number of elements. Where an
-    instance owns part of a wider destination, that is the destination's shard
-    layout to state; the source's offset is not borrowed for it.
-  - Runtime implementation details such as vector width and tail handling live
-    in code comments, not this spec entry.
-
-##### `tma_copy`
+**`tma_copy`.**
 
 Stage a tile into shared memory and signal an mbarrier when it is readable. It
 is not a tier of `ops::copy_async`: there every thread issues its own load and
@@ -1307,22 +1561,11 @@ a commit closes the group, so the thread that issues is the thread that waits;
 here completion lands on a barrier, which is what lets a consumer wait for a
 tile it did not fetch.
 
-```cpp
-/**
- * @brief Stage src into dst, completing on bar.
- * @param src the source tile
- * @param dst the shared destination tile
- * @param bar the mbarrier the completion lands on
- */
-template <class Src, class Dst>
-__device__ void tma_copy(Src const& src, Dst& dst, uint64_t* bar);
-```
-
 - constraints:
   - The operands are tensors, not addresses: the entry takes the transfer shape,
     the strides and the element type from the operand `ShardLayout`s. A caller
     passing a pointer and a byte count would be choosing the tier itself, which
-    is what [§3](#3-runtime-ops) puts behind one entry.
+    is what [§2.6](#26-cudaops) puts behind one entry.
   - **One instruction, and a run-time hand-off.** `cp.async.bulk` moves the run:
     one elected thread issues it, nothing blocks, and it is still in flight at
     the next statement. A byte count off the 16-byte grain hands off to the
@@ -1360,153 +1603,7 @@ __device__ void tma_copy(Src const& src, Dst& dst, uint64_t* bar);
     property of the layout type, so an off-grain extent is a run-time hand-off
     to the element path inside the same entry — same barrier, same result.
 
-##### `mma`
-
-`c += a @ b`, one entry, with the tier read off the operand layouts: rank-2
-static shard layouts on `a` and `b` are a tile and the entry loops the atom over
-it; anything else is a lane's already-gathered fragment and takes the single
-instruction. Codegen emits this one call either way.
-
-```cpp
-/**
- * @brief c += a @ b, over a tile or over one lane's fragments.
- * @param a the left operand, (M, K) for a tile
- * @param b the right operand, (N, K) for a tile
- * @param c the accumulator
- */
-template <class TA, class TB, class TC>
-__device__ void mma(TA const& a, TB const& b, TC& c);
-```
-
-- constraints:
-  - The tile tier reads `a` as `(M, K)` and `b` as `(N, K)`. **There is no
-    transpose flag.** Whether the buffer behind `b` is k-major or n-major is a
-    stride in its layout, and the indexing picks that up, so the same call reads
-    both.
-  - `M` and `K` must be whole multiples of the atom's `16` and `16`, and every
-    warp must receive a whole number of `N` atoms of `8`. Violations are
-    `static_assert`s, not run-time checks.
-  - Warps split `N`. The warp count comes from the accumulator's mesh — that is
-    what `c` being a `ShardTensor` is for — not from `blockDim`.
-  - The accumulator's engine is the lane's own registers, which is what
-    `local()` ([§2.4.1](#241-tensor_viewshard_tensorcuh)) hands back for register storage, while its
-    `ShardLayout` states which entries of the tile those registers are: the
-    fragment map is warp-split over `N` and lane-split within each atom, and
-    saying so is the layout's job, not an accessor's. **The runtime publishes no
-    fragment-coordinate function and no accumulator constructor.** A caller that
-    needs the map writes it as modes and attrs, the way it writes any other
-    layout, and the tile it moves the fragment to or from is then the same map
-    over a buffer — so rescaling a row of the accumulator or storing it out is
-    one `ops::elementwise` between two shards of one layout, with no fragment
-    index at the call site.
-  - Today's atom is `SM80_16x8x16_F32BF16BF16F32_TN`: bf16 operands, f32
-    accumulate. Another instruction is another atom under the same entry, not
-    another entry.
-
-##### `dot`
-
-`dst = sum(lhs * rhs)`. A matrix-vector product's inner loop is one statement,
-not an `elementwise` followed by a `reduce`: materialising the product first
-would cost a register per element of the row, which is what makes that
-pair the wrong spelling here.
-
-```cpp
-/**
- * @brief dst = sum(lhs * rhs) over the axes the operands' meshes contract.
- * @param lhs the left operand
- * @param rhs the right operand
- * @param dst the destination cell
- * @param ws optional shared workspace, one slot per warp
- */
-template <class Lhs, class Rhs, class Dst, class Ws = reduce_impl::no_workspace_t>
-__device__ void dot(Lhs const& lhs, Rhs const& rhs, Dst& dst, Ws&& ws = {});
-```
-
-- constraints:
-  - **Two tiers, one entry.** With no workspace the contraction lives inside a
-    warp and one butterfly finishes it; with a workspace it spans the block,
-    each warp posting a partial into a slot. Either way every participant leaves
-    holding the total, so a caller never broadcasts it back.
-  - The load width is the operands' shard layouts', the same question
-    the `copy` entry answers: the run both sides share, capped by what both are
-    aligned for and by 16 bytes.
-    A row split so that a lane owns four contiguous elements loads eight bytes
-    at a time; one that leaves it eight loads sixteen. The width appears neither
-    at the call site nor on the op surface — the runtime derives it inside the
-    entry and publishes nothing that reports it, for the reason
-    [§3](#3-runtime-ops) gives for publishing no tier predicate.
-  - The fold uses a fixed number of independent partial accumulators, and the
-    tree that combines them is this op's summation order. One running sum would
-    make a row a chain of dependent multiply-adds, and the loads could not run
-    ahead of it: what a warp then waits on is the row's latency, not its bytes.
-  - Accumulation is f32 regardless of the operand type.
-
-##### `elementwise`
-
-`dst(i) = fn(src(i)...)` over the destination's local domain. The one pointwise
-op: arity is the pack's length, the operation is `fn`, and a broadcast operand
-is a stride-0 mode on that operand's layout.
-
-```cpp
-/**
- * @brief dst(i) = fn(src(i)...) over the destination's local domain.
- * @param dst the destination tensor
- * @param fn any callable of as many arguments as there are sources
- * @param src zero or more source tensors, read at the same index
- */
-template <class Fn, class TOut, class... TIn>
-__device__ void elementwise(TOut& dst, Fn fn, TIn const&... src);
-```
-
-- constraints:
-  - **`dst` and `fn` lead**, because the sources are a variadic pack. Zero
-    sources is a fill, one is a map, two a combine; the same instantiation
-    serves all three.
-  - `fn` is anything callable. The primitives the runtime ships
-    (`ops/primitive/`) are values, not ops, and are not in this section's list;
-    `reduce` and `dot` take the arity-2 ones too. There is no separate tag path
-    and lambda path.
-  - **The extent is `size()` of the projected destination.** No count
-    parameter: a hand-passed one is a second statement of a fact the layout
-    already holds, free to disagree with it.
-  - **No shape or domain check.** A mismatched operand is a codegen bug, and
-    shapes are computed on the compile side.
-  - **The only conversion is the one `dst(i) = ...` implies.** The runtime
-    performs no `static_cast` of its own — it does not choose a compute
-    precision. A caller that wants one states it in `fn` (`float(x) * scale`),
-    which mirrors TIR, where a cast is a `Cast` node.
-  - **Broadcast is a layout fact.** A per-row scale is the operand read through
-    `(M, K):(1, 0)`, a per-column weight through `(M, K):(0, 1)`, a scalar
-    through `(N):(0)`. `compose` states this against the operand's own layout,
-    so a strided or sharded operand is read where it actually lies.
-
-##### `rmsnorm`
-
-```cpp
-/**
- * @brief Normalise each row of src by its RMS, then scale by weight.
- * @param src the source tile
- * @param dst the destination tile
- * @param weight the per-column scale
- * @param eps added to the mean square before the inverse square root
- */
-template <class TIn, class TOut, class TW>
-__device__ void rmsnorm(TIn const& src, TOut& dst, TW const& weight,
-                        float eps);
-```
-
-- constraints:
-  - An op, not a composition of `reduce` and `elementwise`. The row's sum of
-    squares feeds that same row's rescale, so the fused form carries the row's
-    whole state in one scalar; the decomposed form has to materialise it as an
-    `M * K` per-instance scratch.
-  - `M` and `K` come from the destination's shard layout. Neither is a
-    parameter, and neither is computed by codegen.
-  - Each instance must hold the whole source and destination tile; a mesh that
-    splits either operand needs per-instance `M` and `K`, which this entry does
-    not derive. The weight is a rank-1 vector of length `K`.
-
-## 4. Warp Primitives
+### 2.7 `cuda/utility/`
 
 `tilefoundry::shuffle_xor`, `tilefoundry::shuffle_elect` and
 `tilefoundry::warp_reduce` (`runtime/cuda/utility/warp.cuh`) are the runtime's
@@ -1514,7 +1611,7 @@ warp-scoped primitives: part of its callable surface, and no part of its op
 surface.
 
 **What is a warp primitive.** An op takes tensors and reads its geometry off
-their shard layouts ([§3](#3-runtime-ops)). A warp primitive takes a value and a
+their shard layouts ([§2.6](#26-cudaops)). A warp primitive takes a value and a
 lane count — in one case not even that, only the calling thread's own id — so
 there is no layout for a tier selection to read and nothing an operand would
 have stated; each is one instruction or a short run of them, with one
@@ -1528,7 +1625,7 @@ these and nothing else:
 | `warp_reduce` | one lane's value, a combine functor, and the lanes per fold |
 
 Being outside `ops::` is not licence to grow. A candidate taking a
-`ShardTensor` or a `Mesh` is an op, and belongs in [§3](#3-runtime-ops)'s closed
+`ShardTensor` or a `Mesh` is an op, and belongs in [§2.6](#26-cudaops)'s closed
 list or nowhere; a candidate offering a template parameter the hardware then
 clamps to one value is not an entry at all, because a parameter every value but
 one is clamped away from states nothing.
@@ -1541,23 +1638,39 @@ spelling the butterfly a second time. A caller folding something it just
 computed, rather than something it stored, has no tensor to hand an op and
 reaches for the primitive.
 
-#### `runtime/cuda/utility/`
 
 **Not ops.** These take lanes and a width, not tensors and a mesh, so no
 layout describes them and no tier is read off anything.
 
-##### `shuffle_xor`
+#### 2.7.1 `utility/warp.cuh`
 
+<!-- generated: utility-warp -->
 ```cpp
-/**
- * @brief Exchange a value with the lane whose id differs by lane_mask.
- * @param value this lane's contribution
- * @param lane_mask the lane-id bits exchanged across
- * @param member_mask the participating lanes
- */
+// include/tilefoundry/runtime/cuda/utility/warp.cuh
 template <class T>
-__device__ T shuffle_xor(T value, int lane_mask, unsigned member_mask = 0xFFFFFFFFu);
+inline constexpr bool is_shuffle_native_v;
+
+template <class T> struct ShuffleXor {
+    __device__ T operator()(T value, int lane_mask,
+    unsigned member_mask) const;
+};
+
+struct Elect {
+    __device__ bool operator()() const;
+};
+
+template <class T>
+__device__ inline T shuffle_xor(T value, int lane_mask,
+                                unsigned member_mask = 0xFFFFFFFFu);
+
+inline bool shuffle_elect();
+
+template <class Combine, int Width = 32, class T>
+__device__ inline T warp_reduce(T value);
 ```
+<!-- /generated -->
+
+**`shuffle_xor`.**
 
 - constraints:
   - The exchange is warp-scoped: a lane's result is defined only where the lane
@@ -1567,14 +1680,7 @@ __device__ T shuffle_xor(T value, int lane_mask, unsigned member_mask = 0xFFFFFF
     compile. Which types the intrinsic takes is a code-level fact and lives in
     code comments, not this entry.
 
-##### `shuffle_elect`
-
-```cpp
-/**
- * @brief Select exactly one thread of the CTA.
- */
-__device__ bool shuffle_elect();
-```
+**`shuffle_elect`.**
 
 - constraints:
   - It elects one thread of the **CTA**, not one lane of each warp. An mbarrier
@@ -1589,18 +1695,7 @@ __device__ bool shuffle_elect();
     answers `false` without reaching the warp-scoped election, whose result is
     defined only for the lanes in its member mask.
 
-##### `warp_reduce`
-
-```cpp
-/**
- * @brief Fold value across each aligned run of Width lanes.
- * @tparam Combine a binary functor, called as Combine{}(a, b)
- * @tparam Width lanes per fold, a power of two in 2..32
- * @param value this lane's contribution
- */
-template <class Combine, int Width = 32, class T>
-__device__ T warp_reduce(T value);
-```
+**`warp_reduce`.**
 
 - constraints:
   - A butterfly over `Width` lanes — `log2(Width)` shuffles — which leaves the
@@ -1612,6 +1707,6 @@ __device__ T warp_reduce(T value);
     alternatives are a shared round trip or leaving every lane but one row's
     idle.
   - `Combine` is invoked as `Combine{}(a, b)` — the spelling
-    `ops::elementwise` and `ops::reduce` ([§3](#3-runtime-ops)) use, so a merge
+    `ops::elementwise` and `ops::reduce` ([§2.6](#26-cudaops)) use, so a merge
     is defined once for all three and the op tags are valid `Combine` values as
     they stand.

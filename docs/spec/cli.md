@@ -119,7 +119,7 @@ of them are finished.
 
 `check` reads the same `SOURCE` shape and one thing more: its selector MAY name a
 runtime twin instead of an authored Module. A twin generated from an authored
-Module states which Module that is ([runtime §1.1](./runtime.md#11-runtimemodule)),
+Module states which Module that is ([runtime §1.1](./runtime.md#11-runtimemodulepy)),
 so naming the implementation is enough to reach what it is judged against. A
 runtime module that states none MUST be refused rather than compared against
 something chosen for it.
@@ -386,7 +386,7 @@ explicit analysis; there is no ordinary `--target` option.
     so a reader who did not ask is not made to read it.
     With no analysis flag it MUST be accepted and inert.
   - `--topology LEVEL` MUST be optional, passed through as the public analysis
-    operation's `level`, and name the unit for per-unit figures. Its help MUST
+    operation's `topology_level`, and name the unit for per-unit figures. Its help MUST
     state the default and, for every family, which figure changes with the level
     and when to pass it, together with the global-traffic and observed-peak
     assumptions. Compute cost MUST name `flops_per_unit` and `service_per_unit`

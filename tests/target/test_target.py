@@ -17,9 +17,8 @@ import pytest
 
 from tests.fixtures.placed.moe_mega_kernel import MoEMegaKernel
 from tests.fixtures.placed.rmsnorm import RmsnormModule
-from tests.fixtures.placed.square_cuda import Model as SquareCudaModel
 from tests.installed.smoke_target.vendor_npu import VendorNpuTarget
-from tilefoundry import CompilerOptions, DType, build, jit, lower, module
+from tilefoundry import CompilerOptions, DType, build, jit, module
 from tilefoundry.analysis import AnalysisError, analyze
 from tilefoundry.codegen.registry import group_functions_by_target
 from tilefoundry.dsl import DimVar
@@ -36,6 +35,7 @@ from tilefoundry.target import (
     Target,
     TargetFactsError,
     ThroughputFacts,
+    TopologyFacts,
     TopologyLimitFacts,
     UnsupportedCapabilityError,
     facts_result,
@@ -73,11 +73,16 @@ class _NoBandwidthUnitRateCudaTarget(CudaTarget):
 
 class ExtraTopologyCudaTarget(CudaTarget):
     name = "tests.target.extra_topology_cuda"
-    topology_levels = (*CudaTarget.topology_levels, "custom", "unknown")
+    extra_levels = (TopologyLimitFacts("custom", 1), TopologyLimitFacts("unknown", 1))
 
     def get_facts(self, facts_type: type, query: object | None = None):
-        if facts_type is TopologyLimitFacts and query in {"custom", "unknown"}:
-            return TopologyLimitFacts(query, 1)
+        if facts_type is TopologyFacts and query is None:
+            inherited = super().get_facts(facts_type, query).topologies
+            return TopologyFacts((*inherited, *self.extra_levels))
+        if facts_type is TopologyLimitFacts:
+            for level in self.extra_levels:
+                if level.name == query:
+                    return level
         return super().get_facts(facts_type, query)
 
 
@@ -200,7 +205,7 @@ def test_cuda_mesh_topology_validation_uses_the_emission_target() -> None:
     custom = ExtraTopologyCudaTarget("nvidia.h200_sxm")
 
     validate_cuda_topology_levels(custom, ("custom",))
-    with pytest.raises(ValueError, match=r"supports \{cta, thread, custom, unknown\}"):
+    with pytest.raises(ValueError, match=r"supports \{gpu, cta, thread, custom, unknown\}"):
         validate_cuda_topology_levels(custom, ("warp",))
 
 
@@ -258,13 +263,6 @@ def test_authored_target_boundaries_accept_unregistered_target_instances() -> No
     assert module_value.target is target
     assert function.target is target
     assert Decorated.target is target
-
-
-def test_lower_rejects_a_topology_level_unsupported_by_the_target() -> None:
-    unsupported = replace(SquareCudaModel, topologies=(Topology("warp", 4),))
-
-    with pytest.raises(ValueError, match="unsupported topology level 'warp'"):
-        lower(unsupported)
 
 
 def test_program_topologies_use_target_resource_facts() -> None:
@@ -375,7 +373,6 @@ def test_target_conflict_diagnostics_use_stable_summaries() -> None:
     )
 
     for invoke, operation in (
-        (lambda: lower(module_value, target=explicit_target), "lower"),
         (lambda: build(module_value, target=explicit_target), "build"),
         (
             lambda: jit(

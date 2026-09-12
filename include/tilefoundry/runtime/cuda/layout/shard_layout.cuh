@@ -60,10 +60,140 @@ template <class A> CUTE_HOST_DEVICE constexpr bool attr_leaves_tensor_whole() {
     }
 }
 
+/// The mesh shape as the mesh states it: one entry per level when it names
+/// several, and one per axis when it names one. What a coord is shaped like.
+template <class SL>
+using shard_mesh_shape_t = cute::remove_cvref_t<decltype(cute::shape(
+    typename SL::mesh::layout_type{}))>;
+
+/// The same shape with the grouping taken back out, which is what the attrs
+/// are indexed against: an attr answers for one axis whichever level owns it.
+template <class SL>
+using shard_mesh_flat_t = cute::remove_cvref_t<decltype(cute::flatten(
+    cute::shape(typename SL::mesh::layout_type{})))>;
+
+/// The mesh axis that splits tensor axis ``Axis``, or -1 when none does.
+template <class SL, int Axis, size_t... Is>
+CUTE_HOST_DEVICE constexpr int
+shard_mesh_axis_over(std::index_sequence<Is...>) {
+    using attrs_t = typename SL::attrs;
+    int found = -1;
+    ((attr_axis<cute::remove_cvref_t<decltype(cute::get<Is>(attrs_t{}))>>::
+                  value == Axis
+          ? void(found = int(Is))
+          : void()),
+     ...);
+    return found;
+}
+
+/// Count mesh axes that name tensor axis Axis.
+template <class SL, int Axis, size_t... Is>
+CUTE_HOST_DEVICE constexpr int
+shard_mesh_axes_over(std::index_sequence<Is...>) {
+    using attrs_t = typename SL::attrs;
+    return (0 + ... +
+            int(attr_axis<cute::remove_cvref_t<decltype(cute::get<Is>(
+                    attrs_t{}))>>::value == Axis));
+}
+
+/// The mesh axis that names tensor axis ``Axis``, and ``-1`` where none does.
+template <class SL, int Axis> CUTE_HOST_DEVICE constexpr int shard_mesh_axis() {
+    using seq = std::make_index_sequence<
+        cute::tuple_size<shard_mesh_flat_t<SL>>::value>;
+    return shard_mesh_axis_over<SL, Axis>(seq{});
+}
+
+/// What tensor axis ``Axis`` is divided by: every mesh axis cutting it.
+///
+/// Several may. Two axes of one level cut a tensor axis into a grid, and so
+/// do two levels, one taking a block of what the other left. Each division is
+/// of what the previous one left, so their extents multiply.
+template <class SL, int Axis, size_t... Is>
+CUTE_HOST_DEVICE constexpr int shard_divisor_over(std::index_sequence<Is...>) {
+    using attrs_t = typename SL::attrs;
+    int divisor = 1;
+    ((attr_axis<cute::remove_cvref_t<decltype(cute::get<Is>(attrs_t{}))>>::
+                  value == Axis
+          ? void(divisor *=
+                 int(cute::size(cute::get<Is>(shard_mesh_flat_t<SL>{}))))
+          : void()),
+     ...);
+    return divisor;
+}
+
+template <class SL, int Axis> CUTE_HOST_DEVICE constexpr int shard_divisor() {
+    return shard_divisor_over<SL, Axis>(
+        std::make_index_sequence<
+            cute::tuple_size<shard_mesh_flat_t<SL>>::value>{});
+}
+
+/// How much of tensor axis ``Axis`` one step of mesh axis ``Ax`` steps over.
+///
+/// The axes cutting one tensor axis are ordered outermost first, so a step of
+/// one of them clears everything the axes inside it hold.
+template <class SL, size_t Ax, int Axis, size_t... Is>
+CUTE_HOST_DEVICE constexpr int shard_inner_over(std::index_sequence<Is...>) {
+    using attrs_t = typename SL::attrs;
+    int inner = 1;
+    ((Is > Ax && attr_axis<cute::remove_cvref_t<decltype(cute::get<Is>(
+                         attrs_t{}))>>::value == Axis
+          ? void(inner *=
+                 int(cute::size(cute::get<Is>(shard_mesh_flat_t<SL>{}))))
+          : void()),
+     ...);
+    return inner;
+}
+
+template <class SL, size_t Ax, int Axis>
+CUTE_HOST_DEVICE constexpr int shard_inner() {
+    return shard_inner_over<SL, Ax, Axis>(
+        std::make_index_sequence<
+            cute::tuple_size<shard_mesh_flat_t<SL>>::value>{});
+}
+
+/// Local extent of tensor axis I.
+template <size_t I, class L, class A, class M>
+CUTE_HOST_DEVICE constexpr auto local_extent(ShardLayout<L, A, M> const &sl) {
+    auto const ext = cute::get<I>(cute::shape(sl.layout_value));
+    constexpr int divisor = shard_divisor<ShardLayout<L, A, M>, int(I)>();
+    if constexpr (divisor == 1)
+        return ext;
+    else
+        return ext / cute::Int<divisor>{};
+}
+
+}
+
+/// Mesh axis ``Ax``'s stride, as ``cute::stride`` is a layout's: what one
+/// step along it costs the slice's origin. Broadcast and Partial leave the
+/// tensor whole, so a step along them costs nothing.
+template <size_t Ax, class L, class A, class M>
+CUTE_HOST_DEVICE constexpr auto stride(ShardLayout<L, A, M> const &sl) {
+    using attr_t = cute::remove_cvref_t<decltype(cute::get<Ax>(A{}))>;
+    constexpr int k = detail::attr_axis<attr_t>::value;
+    if constexpr (k >= 0) {
+        constexpr int inner =
+            detail::shard_inner<ShardLayout<L, A, M>, Ax, k>();
+        return detail::local_extent<size_t(k)>(sl) * cute::Int<inner>{} *
+               cute::stride<k>(sl.layout_value);
+    } else {
+        static_assert(detail::attr_leaves_tensor_whole<attr_t>(),
+                      "shard layout: this attr must leave the tensor whole");
+        return cute::Int<0>{};
+    }
+}
+
+namespace detail {
+
 /// Whether a shard layout says one thing about each of its mesh's axes.
+///
+/// Against the mesh's axes flattened, not its modes: a mesh naming several
+/// levels states them grouped one nest per level, and its rank is then how
+/// many levels it names rather than how many axes the attrs answer for.
 template <class SL> CUTE_HOST_DEVICE constexpr bool shard_attrs_match_mesh() {
     return int(cute::tuple_size<typename SL::attrs>::value) ==
-           decltype(cute::rank(typename SL::mesh::layout_type{}))::value;
+           int(cute::rank(
+               cute::flatten(cute::shape(typename SL::mesh::layout_type{}))));
 }
 
 /// A shard layout no mesh axis splits: every instance holds the whole tensor.
@@ -81,6 +211,44 @@ CUTE_HOST_DEVICE constexpr bool shard_layout_is_full_broadcast() {
     }(std::make_index_sequence<cute::tuple_size<attrs_t>::value>{});
 }
 
+/// The layout one mesh instance holds: each tensor axis narrowed by what
+/// cuts it, keeping the whole tensor's own strides. Every instance holds
+/// the same shape, so this does not depend on which instance it is.
+template <class L, class A, class M>
+CUTE_HOST_DEVICE constexpr auto local_layout(ShardLayout<L, A, M> const &sl) {
+    constexpr int t_rank =
+        cute::tuple_size<cute::remove_cvref_t<decltype(cute::shape(
+            typename ShardLayout<L, A, M>::layout{}))>>::value;
+    return [&]<size_t... Is>(std::index_sequence<Is...>) {
+        return cute::make_layout(
+            cute::make_shape(local_extent<Is>(sl)...),
+            cute::make_stride(cute::stride<int(Is)>(sl.layout_value)...));
+    }(std::make_index_sequence<t_rank>{});
+}
+
+/// What ``cute::slice_and_offset`` is to a Layout, this is to a ShardLayout:
+/// the instance at ``coord`` holds this layout, beginning this many elements
+/// into the whole tensor's engine.
+///
+/// The offset is a layout over the mesh applied to ``coord``: the attrs give
+/// one stride per mesh axis, flat, and ``unflatten`` regroups them to the
+/// mesh's own shape so ``mesh_coords`` indexes them as it stands.
+template <class L, class A, class M, class Coord>
+CUTE_HOST_DEVICE constexpr auto
+local_layout_and_offset(ShardLayout<L, A, M> const &sl, Coord const &coord) {
+    using SL = ShardLayout<L, A, M>;
+    static_assert(
+        shard_attrs_match_mesh<SL>(),
+        "one attr per mesh axis: this layout has one stride per attr");
+    return [&]<size_t... Ax>(std::index_sequence<Ax...>) {
+        auto mesh_shape = cute::shape(sl.mesh_value.layout);
+        auto flat = cute::make_stride(tilefoundry::stride<Ax>(sl)...);
+        auto mesh_layout =
+            cute::make_layout(mesh_shape, cute::unflatten(flat, mesh_shape));
+        return cute::make_tuple(local_layout(sl), int(mesh_layout(coord)));
+    }(std::make_index_sequence<
+               cute::tuple_size<shard_mesh_flat_t<SL>>::value>{});
+}
 }
 
 /// Build a ShardLayout from canonical pieces.

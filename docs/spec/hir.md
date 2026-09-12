@@ -98,9 +98,8 @@ signature and dispatch envelope only, and its variants carry the
 implementations (see **Shape dispatch and specializations** below).
 
 `Function` always returns by value; explicit output parameters are
-TIR-only (see [tir](./tir.md)). `HirToTirPass` materialises the HIR
-return value into a TIR explicit output buffer parameter at the
-HIR → TIR boundary.
+TIR-only (see [tir](./tir.md)). Crossing that boundary materialises the
+HIR return value into a TIR explicit output buffer parameter.
 
 The return type MAY carry a `Partial(reduction)` in a `TensorType`, or in any
 tensor field of a nested `TupleType`. Function construction, type inference,
@@ -144,7 +143,7 @@ Argument types bind to supplied parameters in order. A `ConstTensor` parameter
 owned by a direct child module is omitted from `Call.args` and keeps its
 declared type in the callee visitor memo; no value it stands for enters the IR,
 and what fills it comes from outside
-([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)). The
+([runtime §1.3](./runtime.md#13-runtimedecoratorpy)). The
 child-module resolver in the walk context
 ([visitor-registry §4](./visitor-registry.md#4-instance-1--typeinfer)) decides
 whether this omission is available before collection.

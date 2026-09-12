@@ -20,9 +20,9 @@ template <class Op, class Axes> struct CrossWarp {
                                int warps_per_group) const {
         static_assert(is_supported_reduce_op_v<Op>,
                       "tilefoundry::ops::reduce: unsupported Op");
-        auto s = detail::to_local(src);
-        auto &&d = detail::to_local(dst);
-        auto &&ws = detail::to_local(workspace);
+        auto s = tilefoundry::local_tensor(src);
+        auto &&d = tilefoundry::local_tensor(dst);
+        auto &&ws = tilefoundry::local_tensor(workspace);
         using value_type = cute::remove_cvref_t<decltype(d(0))>;
 
         constexpr int kCells = kept_cells<Axes, decltype(s)>();

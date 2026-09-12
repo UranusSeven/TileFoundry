@@ -1,4 +1,4 @@
-"""Top-level ``tilefoundry.lower`` / ``tilefoundry.build`` / ``tilefoundry.compile`` entries.
+"""Top-level ``tilefoundry.build`` / ``tilefoundry.compile`` entries.
 
 Three public verbs, all accept ``Module`` exclusively.
 """
@@ -10,12 +10,19 @@ import os
 import tempfile
 from dataclasses import dataclass, replace
 
+from tilefoundry.codegen.cpu.context import CpuCodegenContext
+from tilefoundry.codegen.cuda.context import CudaCodegenContext
+from tilefoundry.codegen.linker import link_modules
+from tilefoundry.codegen.registry import group_functions_by_target
+from tilefoundry.codegen.signature import symbol_table
+from tilefoundry.codegen.topology import launch_geometry, topology_domains
 from tilefoundry.inspection import as_script as _as_script
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.passes.pass_manager import PassManager
-from tilefoundry.passes.transforms import BufferizePass, HirToTirPass
-from tilefoundry.target import Target, default_target
+from tilefoundry.passes.transforms import InsertHostEntryPass
+from tilefoundry.runtime.loader import load_linked_module
+from tilefoundry.target import CpuTarget, CudaTarget, Target, default_target
 from tilefoundry.target.base import _target_summary, target_instance
 
 
@@ -64,61 +71,8 @@ def normalize_to_module(fn_or_mod: HirFunction | Module) -> Module:
 
 def _build_default_pipeline() -> PassManager:
     pm = PassManager()
-    pm.add(HirToTirPass())
-    pm.add(BufferizePass())
+    pm.add(InsertHostEntryPass())
     return pm
-
-
-def lower(
-    mod: Module,
-    /,
-    *,
-    target: Target | None = None,
-) -> Module:
-    """Run the default pass pipeline on *mod* and return a lowered ``Module`` (TIR).
-
-    *mod* must be a ``Module``.  Meshes are derived from the HIR body
-    (``ShardLayout.mesh`` attributes on reshard ops), not from external
-    parameters.
-    """
-    if not isinstance(mod, Module):
-        raise TypeError(
-            f"tilefoundry.lower: expected Module, got {type(mod).__name__}. "
-            f"Construct Module(name=..., functions=(fn,), entry=fn.name) explicitly."
-        )
-    if target is not None:
-        target = target_instance(target)
-
-    try:
-        module_target = mod.resolve_target()
-    except ValueError:
-        module_target = default_target() if target is None else target
-        mod = replace(mod, target=module_target)
-    else:
-        if target is not None and target != module_target:
-            raise ValueError(
-                f"tilefoundry.lower: explicit target {_target_summary(target)} "
-                f"conflicts with the Module Target {_target_summary(module_target)}"
-            )
-    for topology in mod.effective_topologies():
-        module_target.validate_program_topology(topology)
-
-    def lower_tree(node: Module) -> Module:
-        """Lower descendants first, retaining the tree for parent host entries."""
-        lowered_children = tuple(lower_tree(child) for child in node.modules)
-        result = _build_default_pipeline().run(node)
-        return Module(
-            name=result.name,
-            functions=result.functions,
-            entry=result.entry,
-            modules=lowered_children,
-            target=result.target,
-            topologies=result.topologies,
-            metadata=dict(result.metadata),
-            methods=result.methods,
-        )
-
-    return lower_tree(mod)
 
 
 def build(
@@ -148,6 +102,7 @@ def build(
             f"conflicts with the Module Target {_target_summary(module_target)}"
         )
 
+    mod = _build_default_pipeline().run(mod)
     workdir = os.path.join(
         tempfile.gettempdir(), f"tilefoundry_build_{mod.entry}_{os.getpid()}_split"
     )
@@ -157,84 +112,75 @@ def build(
 def _build_split_runtime_module(mod: Module, *, workdir: str) -> "RuntimeModule":
     """Codegen + compile + load *mod* through the split host/device pipeline.
 
-    All device-only modules route here: a CPU host entry is synthesized (or, for
-    a dispatch entry, the entry is retargeted to CPU), each target emits its own
-    ``LinkableModule``, and those modules are compiled separately and linked into
-    one host-callable ``.so``. Unsupported module shapes raise during
-    normalization / codegen — there is no fallback to a single-source path.
+    What every emitter has to agree on is settled first and once: the table of
+    how each function is called, and the geometry each launch runs at. Each
+    translation unit is then emitted, compiled with its own toolchain and
+    linked into one host-callable ``.so``. That library is built under a
+    directory named for the code in it, so two programs of one process never
+    load each other's. Unsupported module shapes raise during codegen -- there
+    is no fallback to a single-source path.
     """
-    # noqa lazy: keep these heavy codegen/runtime imports off the module load
-
-    from tilefoundry.codegen.cuda.emit import _output_count_from_fn  # noqa: PLC0415
-    from tilefoundry.codegen.cuda.tir.prim_function import (  # noqa: PLC0415
-        _is_hidden_shape_scalar,
-    )
-    from tilefoundry.codegen.linker import link_modules  # noqa: PLC0415
-    from tilefoundry.codegen.registry import (  # noqa: PLC0415
-        group_modules_by_target,
-    )
-    from tilefoundry.passes.transforms.host_entry import (  # noqa: PLC0415
-        insert_default_host_entry,
-    )
-    from tilefoundry.runtime.function import EntryABI, param_abi_of  # noqa: PLC0415
-    from tilefoundry.runtime.loader import load_linked_module  # noqa: PLC0415
-
-    linked = insert_default_host_entry(mod)
-    module_groups = group_modules_by_target(linked)
-    from tilefoundry.target import CpuTarget, CudaTarget  # noqa: PLC0415
-
-    device_groups = [
-        (owner, target, functions)
-        for owner, target, functions in module_groups
-        if isinstance(target, CudaTarget)
-    ]
-    if not device_groups:
-        raise ValueError(f"tilefoundry.build: module {linked.name!r} has no CUDA device functions")
-    device_target = device_groups[0][1]
-    if any(target != device_target for _, target, _ in device_groups[1:]):
-        from tilefoundry.target.base import _target_summary  # noqa: PLC0415
-
-        _, first_target, first_functions = device_groups[0]
-        _, second_target, second_functions = next(
-            group for group in device_groups[1:] if group[1] != device_target
-        )
-        raise ValueError(
-            f"tilefoundry: module {linked.name!r} mixes unequal device Targets: "
-            f"{_target_summary(first_target)} (function {first_functions[0].name!r}) "
-            f"vs {_target_summary(second_target)} (function {second_functions[0].name!r}); "
-            "multiple device translation units are not supported"
-        )
-    cpu_entry = linked.entry_function()
+    device_target = _device_target(mod)
+    cpu_entry = mod.entry_function()
     if not isinstance(cpu_entry.target, CpuTarget):
         raise ValueError(
             f"tilefoundry.build: entry {cpu_entry.name!r} is not a CPU host entry "
             f"after normalization"
         )
 
+    symbols = symbol_table(mod, device_target)
+    launches = launch_geometry(mod)
     device_modules = tuple(
-        device_target.get_code_generator().emit(owner, functions, device_target)
-        for owner, _, functions in device_groups
+        device_target.get_code_generator().emit(
+            domain,
+            device_fns,
+            device_target,
+            CudaCodegenContext(symbols=symbols, target=device_target, launches=launches),
+        )
+        for domain, device_fns in _device_domains(topology_domains(mod), device_target)
     )
-    host_module = cpu_entry.target.get_code_generator().emit(linked, (cpu_entry,), cpu_entry.target)
+    host_module = cpu_entry.target.get_code_generator().emit(
+        mod,
+        (cpu_entry,),
+        cpu_entry.target,
+        CpuCodegenContext(symbols=symbols, target=cpu_entry.target),
+    )
 
-    entry_buffer_params = tuple(
-        p for p in cpu_entry.params if not _is_hidden_shape_scalar(p, cpu_entry.params)
-    )
-    entry_type = EntryABI(
-        name=cpu_entry.name,
-        params=tuple(param_abi_of(p) for p in entry_buffer_params),
-        output_count=_output_count_from_fn(cpu_entry),
-    )
-
-    cuda_arch = device_target.arch.removeprefix("sm_")
+    units = (*device_modules, host_module)
+    digest = hashlib.sha256("".join(m.source for m in units).encode("utf-8")).hexdigest()[:16]
+    loaded_as = replace(symbols[id(cpu_entry)], name=cpu_entry.name)
     linked_module = link_modules(
-        (*device_modules, host_module),
-        workdir=workdir,
+        units,
+        workdir=os.path.join(workdir, digest),
         lib_name=cpu_entry.name,
-        entry=entry_type,
-        cuda_arch=cuda_arch,
+        entry=loaded_as,
+        cuda_arch=device_target.arch.removeprefix("sm_"),
     )
     return load_linked_module(linked_module)
+
+
+def _device_target(mod: Module) -> Target:
+    """The one device Target this module's functions run on.
+
+    A second unequal one is refused by the grouping that sees them both,
+    because one linked artifact holds one device architecture.
+    """
+    targets = [t for t in group_functions_by_target(mod) if isinstance(t, CudaTarget)]
+    if not targets:
+        raise ValueError(f"tilefoundry.build: module {mod.name!r} has no CUDA device functions")
+    return targets[0]
+
+
+def _device_domains(domains, device_target: Target):
+    """Each *domains* entry that has device functions, and which of them they are.
+
+    A module states its instance counts once, so one that states its own is one
+    translation unit; a domain holding only host functions is not one at all.
+    """
+    for domain, functions in domains:
+        device_fns = tuple(fn for fn in functions if fn.target == device_target)
+        if device_fns:
+            yield domain, device_fns
 
 
 def compile(
@@ -243,12 +189,11 @@ def compile(
     *,
     target: Target | None = None,
 ) -> "RuntimeModule":
-    """``build(lower(mod, target=target))`` — full compile shortcut.
+    """``build(mod, target=target)`` -- the full compile entry.
 
     *mod* must be a ``Module``.  Meshes are derived from the IR body.
     """
-    lowered = lower(mod, target=target)
-    return build(lowered)
+    return build(mod, target=target)
 
 
 def _canonical_module_text(mod: Module) -> str:
@@ -368,4 +313,4 @@ def _jit_cache_key_payload(
     )
 
 
-__all__ = ["lower", "build", "compile", "jit", "normalize_to_module", "CompilerOptions"]
+__all__ = ["build", "compile", "jit", "normalize_to_module", "CompilerOptions"]

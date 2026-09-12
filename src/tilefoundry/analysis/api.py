@@ -42,7 +42,7 @@ class AnalysisResult:
     module: Module
     function: Function
     analyses: tuple[str, ...]
-    level: str | None
+    topology_level: str | None
     executed: tuple[str, ...]
     metadata_types: tuple[type[IRMetadata], ...]
 
@@ -66,8 +66,7 @@ def _roots(analysis: str | Sequence[str]) -> tuple[str, ...]:
         raise AnalysisError("analyze: analysis must name at least one root")
     if any(not isinstance(item, str) or not item for item in requested):
         raise AnalysisError(
-            "analyze: every analysis must be a non-empty selector, "
-            f"got {analysis!r}"
+            f"analyze: every analysis must be a non-empty selector, got {analysis!r}"
         )
     return tuple(dict.fromkeys(requested))
 
@@ -107,17 +106,17 @@ def analyze(
     function: Function,
     *,
     analysis: str | Sequence[str],
-    level: str | None = None,
+    topology_level: str | None = None,
     options: object | None = None,
     dims: "Mapping[str, int] | None" = None,
 ) -> AnalysisResult:
     """Run the requested analyses' union dependency closure over *function*.
 
-    The module supplies target and topology; *level* defaults to its coarsest
-    level. *dims* selects a specialization and substitutes concrete extents
-    before measurement. The original function must be a prototype or variant
-    owned by the module, and the result identifies the concrete inlined view
-    that received records.
+    The module supplies target and topology; *topology_level* defaults to its
+    coarsest level. *dims* selects a specialization and substitutes concrete
+    extents before measurement. The original function must be a prototype or
+    variant owned by the module, and the result identifies the concrete inlined
+    view that received records.
     """
     if not isinstance(module, Module):
         raise TypeError(
@@ -125,13 +124,10 @@ def analyze(
             "carries no execution context; select the Module that owns it."
         )
     if not isinstance(function, Function):
-        raise TypeError(
-            f"analyze: expected an hir.Function, got {type(function).__name__}"
-        )
+        raise TypeError(f"analyze: expected an hir.Function, got {type(function).__name__}")
     if not module.owns(function):
         raise AnalysisError(
-            f"analyze: {function.name!r} is not a function of module "
-            f"{module.name!r}"
+            f"analyze: {function.name!r} is not a function of module {module.name!r}"
         )
     roots = _roots(analysis)
     result_module = module
@@ -147,14 +143,14 @@ def analyze(
 
     target = module.resolve_target()
     topologies = module.effective_topologies()
-    if level is None and topologies:
-        level = topologies[0].name
+    if topology_level is None:
+        topology_level = topologies[0].name if topologies else None
     closure = _closure(target, roots)
 
-    function = check_program(module, function, level=level, analyzers=closure)
+    function = check_program(module, function, topology_level=topology_level, analyzers=closure)
     functions = (function,)
     scope = ScopeBuilder(module, function).build()
-    context = AnalyzeContext(module, target, level, options, root=scope, current=scope)
+    context = AnalyzeContext(module, target, topology_level, options, root=scope, current=scope)
 
     order: list[type[IRMetadata]] = []
     written_records: set[tuple[int, type]] = set()
@@ -173,14 +169,17 @@ def analyze(
                 order.append(metadata_type)
 
     final = _metadata_snapshot(functions)
-    surviving = {metadata_type for key in written_records & final.keys()
-                 for _expr_id, metadata_type in (key,)}
+    surviving = {
+        metadata_type
+        for key in written_records & final.keys()
+        for _expr_id, metadata_type in (key,)
+    }
 
     result = AnalysisResult(
         module=result_module,
         function=function,
         analyses=roots,
-        level=level,
+        topology_level=topology_level,
         executed=tuple(algorithm.selector for algorithm in closure),
         metadata_types=tuple(item for item in order if item in surviving),
     )
@@ -191,7 +190,7 @@ def analyze(
                 module=result.module,
                 function=result.function,
                 analyses=result.analyses,
-                level=result.level,
+                topology_level=result.topology_level,
                 executed=result.executed,
                 metadata_types=result.metadata_types,
             )

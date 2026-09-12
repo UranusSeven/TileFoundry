@@ -57,7 +57,7 @@ truth for the directory's structure and invariants.
 | `inspection/` | [inspection](./inspection.md) | IR visualisation: DOT, Python printer, web viewer. |
 | `dump/` | [inspection](./inspection.md) | Dump flags, dynamically scoped dump contexts, and file/null dump sinks used by inspection and test integration. |
 | `dsl/` | [parser](./parser.md) (authoring namespace) | User-facing import surface: `tf/` (HIR namespace) / `T/` (TIR namespace, including `_platforms.py`) / `_namespace.py` / `_stub_gen.py` / `storage.py` / `__main__.py`. The `tf/__init__.pyi` and `T/__init__.pyi` stubs are produced by `python -m tilefoundry.dsl regen` and are gitignored. |
-| `compile.py` | [architecture](./architecture.md) | `tilefoundry.lower` / `build` / `compile` / `jit` top-level public verbs. |
+| `compile.py` | [architecture](./architecture.md) | `tilefoundry.build` / `compile` / `jit` top-level public verbs. |
 | `module.py` | [parser](./parser.md) | The `@module` decorator entry point and module-level topology authoring constants. |
 | `script.py` | [parser](./parser.md) | `@func` / `@prim_func` / `@intrinsic` decorator entry points. |
 | `__init__.py` | [inspection](./inspection.md) | The top-level `view` convenience entry and re-exports of public compiler surfaces. |
@@ -92,10 +92,11 @@ physical directory layout reflects that boundary directly.
   `tir/stmts/`, and `memory/` / `nn/` / `arith/` / `reduce/` /
   `tensor/` each have their own subdirectory. There is no
   `codegen/<target>/hir/`.
-- Authored launch attributes belong to `ir/tir/launch.py`; launch-geometry
-  derivation (grid / block extents) is an internal `codegen/cuda/emit.py`
-  helper (`_derive_launch_config`), consumed within codegen itself rather
-  than carried past it as a runtime-owned metadata type. The two launch
+- Authored launch attributes belong to `ir/tir/launch.py`; the geometry a
+  kernel is launched at is settled where the `Launch` is written
+  ([passes §7.3](./passes.md#73-insert_default_host_entry)) and read back off
+  it by `codegen/topology.py`, rather than derived a second time inside
+  codegen or carried past it as a runtime-owned metadata type. The two launch
   contracts are distinct even though both are consumed across the codegen
   boundary.
 
@@ -162,8 +163,12 @@ each get their own file. Codegen consumes TIR only.
 - **`<category>/aliases.py` file** (Rule 1a): `@register_alias(...)`
   declarations whose builders construct the target Op instance.
 
-**Rule 4 — what a target codegen file contains:** the
-`@register_codegen_<target>` for that (op / stmt) pair, and nothing else.
+**Rule 4 — what a target codegen file contains:** the `register_codegen`
+declaration naming that target, `Role.EMIT`, and that op / stmt class
+([visitor-registry §6](./visitor-registry.md#6-instance-3--codegen)), and
+nothing else. A target's own calling convention — how it declares a parameter
+and how a caller passes one — lives in that target's `abi.py`, not in a
+per-node file.
 
 **Rule 5 — `<category>/__init__.py` re-export rules:** real Op submodules are
 re-exported; aliases are imported only for registration side effects; user imports

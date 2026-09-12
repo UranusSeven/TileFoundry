@@ -9,13 +9,7 @@ checkpoint ``RuntimeResource``s, and ``check``. See
 from __future__ import annotations
 
 from .decorator import runtime_func, runtime_module
-from .function import (
-    EntryABI,
-    ParamABI,
-    RuntimeFunction,
-    entry_abi_of,
-    param_abi_of,
-)
+from .function import RuntimeFunction
 from .measure import (
     PREDICATES,
     AllClose,
@@ -34,6 +28,7 @@ from .measure import (
 )
 from .module import CompiledModule, RuntimeModule
 from .resource import Absolute, DictResource, Preprocessed, RuntimeResource, SafetensorsResource
+from .tensor import ShardTensor
 
 __all__ = [
     "PREDICATES",
@@ -42,13 +37,11 @@ __all__ = [
     "CompiledModule",
     "Cosine",
     "DictResource",
-    "EntryABI",
     "Equal",
     "MaxAbs",
     "MaxRel",
     "NanInf",
     "OutputCheck",
-    "ParamABI",
     "Predicate",
     "PredicateResult",
     "Preprocessed",
@@ -58,10 +51,9 @@ __all__ = [
     "RuntimeModule",
     "RuntimeResource",
     "SafetensorsResource",
+    "ShardTensor",
     "Ulp",
     "check",
-    "entry_abi_of",
-    "param_abi_of",
     "runtime_func",
     "runtime_module",
 ]

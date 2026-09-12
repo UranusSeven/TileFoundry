@@ -140,7 +140,7 @@ chain and is not copied onto each Module or Function.
   identical `TensorType`, or the access raises. There is no `states` field
   or persistent-state concept in the IR — a tensor that must survive across
   steps (e.g. a KV cache) is an ordinary `Tensor` param the caller passes in
-  and receives back explicitly ([runtime §1.1.2](./runtime.md#112-weight-converter-and-prepare--forward)).
+  and receives back explicitly ([runtime §1.3](./runtime.md#13-runtimedecoratorpy)).
   - Constructing a `Module` **seals** its functions: each base function and
   its specialization variants are finalized. Variants may be added to a
   base only during authoring, before the base enters a `Module`; once
@@ -184,7 +184,7 @@ step.
 
 - constraints:
   - When `entry` is present, it MUST name a function in `functions`.
-    `entry_function()` MUST return that function, and `tilefoundry.lower(...)`
+    `entry_function()` MUST return that function, and `tilefoundry.build(...)`
     and the emitter MUST start there. Other functions enter the output only when
     reachable from `entry`.
   - When `entry` is omitted (`None`), the Module MUST have no default step.

@@ -10,10 +10,11 @@ from .mesh import (
     Topology,
     check_topology,
     composed,
-    level_axes,
-    level_projection,
     positions_at,
+    topology_axes,
+    topology_projection,
 )
+from .placement import Placement
 from .scope_match import covered_by_scope, storage_reaches
 from .shard_layout import (
     B,
@@ -43,9 +44,10 @@ __all__ = [
     "Topology",
     "check_topology",
     "composed",
-    "level_axes",
-    "level_projection",
     "positions_at",
+    "topology_axes",
+    "topology_projection",
+    "Placement",
     "covered_by_scope",
     "storage_reaches",
     "Mesh",

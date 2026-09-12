@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-from tilefoundry.codegen.cuda.context import CodegenContext, register_codegen_cuda
+from tilefoundry.codegen.cuda.context import CudaCodegenContext
 from tilefoundry.ir.tir.reduce import Reduce, ReduceKind
+from tilefoundry.target import CudaTarget
+from tilefoundry.visitor_registry.registries import Role, register_codegen
 
 REDUCE_TAG = {
     ReduceKind.MEAN: "tilefoundry::ops::mean_op",
-    ReduceKind.SUM: "tilefoundry::ops::add_op",
+    ReduceKind.SUM: "tilefoundry::primitive::add_op",
     ReduceKind.ABS_MAX: "tilefoundry::ops::absmax_op",
-    ReduceKind.MAX: "tilefoundry::ops::max_op",
-    ReduceKind.MIN: "tilefoundry::ops::min_op",
+    ReduceKind.MAX: "tilefoundry::primitive::max_op",
+    ReduceKind.MIN: "tilefoundry::primitive::min_op",
 }
 
 
@@ -26,8 +28,8 @@ def _axes_pack_typename(axes: tuple) -> str:
     return f"cute::tuple<{args}>"
 
 
-@register_codegen_cuda(Reduce)
-def _emit(call, ctx: CodegenContext) -> None:
+@register_codegen(CudaTarget, Role.EMIT, Reduce)
+def _emit(call, ctx: CudaCodegenContext) -> None:
     src, dst = call.args[0], call.args[1]
     src_n = ctx.name_for(src)
     dst_n = ctx.name_for(dst)

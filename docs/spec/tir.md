@@ -1,8 +1,7 @@
 # TileFoundry Spec — tir (`@prim_func` imperative IR)
 
 TIR is the imperative target IR. A `@tilefoundry.prim_func` body parses
-into TIR; the lowering pass `HirToTirPass` ([passes](./passes.md))
-also produces TIR. TIR has no value return; effect-form Ops carry
+into TIR. TIR has no value return; effect-form Ops carry
 the work, structural Stmts carry control flow.
 
 - **Container**: `tir.PrimFunction(name, params, body, output_count, target)`.
@@ -16,8 +15,8 @@ the work, structural Stmts carry control flow.
 - **Value Ops** (`AllocTensor`, `MemorySpan`, `PtrOf`, `TensorView`)
   are anchored by `LetStmt` so their result `Var` has stable
   identity.
-- **No HIR Ops** reach TIR; HIR-to-TIR rewriting is owned by the
-  pass layer.
+- **No HIR Ops** reach TIR. A program is TIR before the pass pipeline
+  ([passes](./passes.md)) reads it.
 
 ## 1. TIR Stmt hierarchy
 
@@ -294,7 +293,7 @@ A valid participant set maps to exactly one hardware barrier:
 | whole block that is one warp | `__syncwarp()` |
 | a contiguous lane subset within one warp | `__syncwarp(mask)` under a participant predicate |
 | a warp-aligned contiguous multi-warp subset | a named `bar.sync <id>, <count>` under a participant predicate |
-| the full mesh over the `cta` topology (all CTAs of the grid) | the grid-wide software barrier ([runtime §3](./runtime.md#3-runtime-ops)) |
+| the full mesh over the `cta` topology (all CTAs of the grid) | the grid-wide software barrier ([runtime §2.6](./runtime.md#26-cudaops)) |
 
 Codegen MUST guard the `__syncwarp(mask)` and `bar.sync` cases with the
 participant predicate `base <= tid < base+count` (`tid =
@@ -310,7 +309,7 @@ supported barrier and MUST be rejected at verify. The grid barrier's correctness
 requires every CTA of the launch to be co-resident; that co-residency is the
 launch's occupancy contract, not something the barrier can enforce. The
 grid-barrier device helper and its counter protocol are specified in
-[runtime §3](./runtime.md#3-runtime-ops).
+[runtime §2.6](./runtime.md#26-cudaops).
 
 #### Named-barrier id allocation
 
@@ -428,29 +427,16 @@ class ShapeOf(Expr):
 ```
 
 - constraints:
-  - `type` is a rank-0 `i32` `TensorType` (scalar); it is the runtime-extent ABI
-    for a dynamic tensor dimension. Per-field and ABI rules below.
-
-- `ShapeOf.type` is rank-0 `TensorType` of dtype `i32` (a scalar).
-- `param` MUST resolve to a parameter `Var` of the enclosing
-  `PrimFunction`; `axis` MUST be a valid axis index of `param.type`.
-- The CUDA emitter lowers `ShapeOf(param, axis)` to a kernel scalar
-  parameter named `f"{param.name}_shape_{axis}"`. The host wrapper
-  reads the value from the runtime tensor's shape and forwards it to
-  the kernel.
-
-The `<param>_shape_<axis>` i32 scalar is the runtime-extent ABI for a
-dynamic tensor dimension, independent of how the `PrimFunction` was
-produced:
-
-- A device (CUDA) `PrimFunction` whose body references a dynamic tensor
-  dimension (a `DimVar` axis of a tensor parameter) MUST carry the
-  corresponding hidden `<param>_shape_<axis>` i32 scalar parameter, in
-  addition to the tensor parameter. The dimension maps to the first
-  tensor parameter / axis in which it occurs.
-- A CPU host entry MUST NOT expose such a scalar at its user-facing
-  surface — it reads the extent from its tensor argument's runtime shape
-  and forwards it ([§2.3](#23-tir-ops)).
+  - `type` is a rank-0 `i32` `TensorType` (scalar): one runtime tensor extent.
+  - `param` MUST resolve to a parameter `Var` of the enclosing
+    `PrimFunction`; `axis` MUST be a valid axis index of `param.type`.
+  - the type is the only record that an axis is open. A `PrimFunction` MUST
+    NOT carry a second parameter standing for an extent its own types already
+    state as a `DimVar`; the convention expands the tensor parameter into a
+    pointer plus one extent per open axis
+    ([codegen §4.4](./codegen.md#44-signatures)), so no parameter name is
+    reserved and a user parameter named `<something>_shape_<n>` is an ordinary
+    parameter.
 
 ### 2.3 TIR Ops
 
@@ -468,12 +454,10 @@ named enum members with the owning enum imported by the printed program.
 - `TensorType.storage` is a `StorageKind` ([types §2](./types.md#2-tensortype)).
   A memory-resident TIR tensor MUST carry a concrete level; the unmaterialized
   `umat` ([types §2](./types.md#2-tensortype)) is an HIR-only value and MUST
-  already be materialized to a concrete level by the time `HirToTirPass`
-  produces TIR — it never appears in TIR.
-- `Reshard` does not appear in TIR. HIR-side `Reshard` without a storage change
-  lowers to a `TensorView` and performs no allocation or copy; a storage change
-  lowers to `LetStmt(AllocTensor)` plus `Evaluate(Copy, ...)` during
-  `HirToTirPass` ([passes §7.1](./passes.md#71-hirtotirpass)).
+  already be materialized to a concrete level in TIR — it never appears there.
+- `Reshard` ([hir §1.3](./hir.md#13-op)) does not appear in TIR. A layout change
+  is a `TensorView` here and allocates and copies nothing; a storage change is a
+  `LetStmt(AllocTensor)` plus `Evaluate(Copy, ...)`.
 
 #### Memory Ops (`tir.memory.*`)
 
@@ -668,7 +652,7 @@ class Reduce(Op):
 `dst = sum(lhs * rhs)` in one statement, and not an `elementwise` followed by a
 `Reduce`: materialising the product first would cost a register per element of
 the row, which is what makes that pair the wrong spelling here ([runtime
-§3](./runtime.md#3-runtime-ops)).
+§2.6](./runtime.md#26-cudaops)).
 
 ```python
 class Dot(Op):
@@ -848,10 +832,11 @@ block_y, block_z, *forwarded_args)`:
   launch configuration, not kernel parameters: the device observes geometry
   through `gridDim` / `blockIdx` (the codegen `program_dim` / `program_shape`
   accessors), never as arguments.
-- **forwarded args**: the remaining `args` bind the callee's host-visible
-  parameters in declaration order. They MUST NOT include the hidden
-  `<param>_shape_<axis>` scalar parameters ([§2.2](#22-shapeof)) — the host fills
-  those from a tensor argument's runtime shape.
+- **forwarded args**: the remaining `args` bind the callee's parameters, one
+  each, in declaration order. An extent the callee's types leave open is not
+  among them: it travels with the pointer the convention expands that
+  parameter into ([codegen §4.4](./codegen.md#44-signatures)), read off the
+  tensor the host holds.
 - **attributes**: `cluster`, `dynamic_smem`, `stream`, and `attrs` carry the
   non-grid/block launch configuration. A `cluster` / `stream` / `attrs` value
   the active CUDA target does not support MUST be rejected in target lowering.
@@ -1072,7 +1057,7 @@ wait for a tile it did not fetch.
 Which instruction carries it is the runtime's choice from the operand shard
 layouts, not something this op names: a contiguous run takes `cp.async.bulk`,
 anything else takes an element path ([runtime
-§3](./runtime.md#3-runtime-ops)).
+§2.6](./runtime.md#26-cudaops)).
 Carrying that on the op would be codegen selecting a tier, which
 [§2.3](#23-tir-ops) forbids.
 
@@ -1105,7 +1090,7 @@ class TmaCopy(Op):
     the copy; a caller pairing this with its own `MBarrierArriveExpectTx` would
     be declaring a count the op already knows.
   - Lowers to `tilefoundry::ops::tma_copy(src, dst, bar)`
-    ([runtime §3](./runtime.md#3-runtime-ops)). `barrier` is a tensor here
+    ([runtime §2.6](./runtime.md#26-cudaops)). `barrier` is a tensor here
     because that is what TIR names a piece of shared memory with, and a word to
     the runtime, so the emitted call hands over the word's own address.
 
@@ -1121,7 +1106,7 @@ one is not the thread that waits for it.
 **Each lowers to its instruction, not to a runtime entry, and the runtime
 publishes no `ops::` entry for any of them:** an mbarrier is a shared-memory
 word, so nothing here reads a `ShardLayout` and none of it is an op
-([runtime §3](./runtime.md#3-runtime-ops)). Each entry below names the
+([runtime §2.6](./runtime.md#26-cudaops)). Each entry below names the
 `mbarrier.*` instruction its emitter writes at the call site, together with the
 generic-to-shared conversion the instruction takes — they name `.shared::cta`
 explicitly rather than leaving the assembler to redo that window conversion on
@@ -1155,7 +1140,7 @@ class MBarrierInit(Op):
     barrier separates this from the first arrival or wait.
   - Lowers to `mbarrier.init.shared::cta.b64`, written at the call site with
     `arrive_count` as an inline operand: the runtime publishes no entry for it
-    ([runtime §3](./runtime.md#3-runtime-ops)).
+    ([runtime §2.6](./runtime.md#26-cudaops)).
 
 ##### MBarrierArriveExpectTx
 

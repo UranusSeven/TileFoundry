@@ -14,6 +14,7 @@ CUTE_HOST_DEVICE constexpr auto program_dim<TopologyScope::cta>() noexcept {
 
 using namespace tilefoundry;
 using namespace tilefoundry::ops;
+using namespace tilefoundry::primitive;
 
 template <int... Es> __device__ auto tmesh() {
     return make_mesh<TopologyScope::thread>(
@@ -94,6 +95,8 @@ __global__ void k() {
         cute::Layout<cute::Shape<cute::Int<2>, cute::Int<32>>,
                      cute::Stride<cute::Int<64>, cute::Int<1>>>;
     using sparse_mesh = Mesh<sparse_layout, TopologyScope::thread>;
+    /// One id per level this program names, as program_ids() gives: cta,
+    /// thread.
     constexpr auto sparse_ids = cute::make_tuple(0, 0);
     static_assert(
         tilefoundry::contains(sparse_mesh{sparse_layout{}}, sparse_ids));
@@ -159,7 +162,7 @@ __global__ void k(float *p) {
                 decltype(mesh)>
         sl{layout, mesh};
     auto st = make_shard_tensor(t, layout, sl);
-    auto v = tilefoundry::detail::local(st);
+    auto v = tilefoundry::local_tensor(st);
     v(0) = 1.f;
 }
 #endif
@@ -176,13 +179,15 @@ __global__ void k(float *p) {
 #endif
 
 #if CASE == 5
-/// shard_offset itself, reached without going through local().
+/// the offset arithmetic itself, reached without going through local().
 __global__ void k(float *p) {
     auto mesh = tmesh<8, 32>();
     auto layout = cute::make_layout(cute::make_shape(cute::Int<256>{}));
     ShardLayout<decltype(layout), cute::tuple<shard::S<0>>, decltype(mesh)> sl{
         layout, mesh};
-    p[0] = float(tilefoundry::detail::shard_offset(sl));
+    p[0] = float(cute::get<1>(tilefoundry::detail::local_layout_and_offset(
+        sl,
+        tilefoundry::mesh_coords(sl.mesh_value, tilefoundry::program_ids()))));
 }
 #endif
 
@@ -195,7 +200,7 @@ __global__ void k(float *p) {
     ShardLayout<decltype(layout), cute::tuple<shard::Dynamic>, decltype(mesh)>
         sl{layout, mesh};
     auto st = make_shard_tensor(t, layout, sl);
-    tilefoundry::detail::local(st)(0) = 1.f;
+    tilefoundry::local_tensor(st)(0) = 1.f;
 }
 #endif
 
@@ -431,20 +436,6 @@ __global__ void k(float *p) {
     auto dst = flat_cell<48, false>(&b);
     reduce<add_op, cute::tuple<cute::Int<0>>>(src, dst);
     p[0] = b;
-}
-#endif
-
-#if CASE == 23
-/// Two mesh axes carrying a Split for one tensor axis.
-__global__ void k(float *p) {
-    auto mesh = tmesh<8, 32>();
-    auto lay = cute::make_layout(cute::make_shape(cute::Int<256>{}),
-                                 cute::make_stride(cute::Int<1>{}));
-    auto st = make_shard_tensor(
-        cute::make_tensor(cute::make_gmem_ptr(p), lay), lay,
-        make_shard_layout(lay, mesh,
-                          cute::make_tuple(shard::S<0>{}, shard::S<0>{})));
-    tilefoundry::detail::local(st)(0) = 1.f;
 }
 #endif
 

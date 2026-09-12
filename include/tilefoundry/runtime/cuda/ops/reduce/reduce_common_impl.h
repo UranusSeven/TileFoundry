@@ -4,7 +4,7 @@
 /// Included in-context from ``ops/reduce.cuh`` (which is itself included inside
 /// ``namespace tilefoundry::ops`` from runtime.cuh). This header therefore does
 /// NOT open ``namespace tilefoundry`` / ``ops`` and does NOT pull in system
-/// headers — cute/std and the surrounding names (``detail::to_local``,
+/// headers — cute/std and the surrounding names (``tilefoundry::local_tensor``,
 /// ``shard::S``/``shard::B``, ``TopologyScope``) are already in scope.
 #pragma once
 
@@ -17,32 +17,32 @@ inline constexpr no_workspace_t no_workspace{};
 
 /// Reduction traits define initialization, merge, and finalization.
 template <class Op> struct reduce_traits;
-template <> struct reduce_traits<add_op> {
-    using combine_op = add_op;
+template <> struct reduce_traits<primitive::add_op> {
+    using combine_op = primitive::add_op;
     static constexpr float init = 0.f;
     __device__ static float elem(float x) { return x; }
     __device__ static float finalize(float acc, float) { return acc; }
 };
 template <> struct reduce_traits<mean_op> {
-    using combine_op = add_op;
+    using combine_op = primitive::add_op;
     static constexpr float init = 0.f;
     __device__ static float elem(float x) { return x; }
     __device__ static float finalize(float acc, float n) { return acc / n; }
 };
-template <> struct reduce_traits<max_op> {
-    using combine_op = max_op;
+template <> struct reduce_traits<primitive::max_op> {
+    using combine_op = primitive::max_op;
     static constexpr float init = -INFINITY;
     __device__ static float elem(float x) { return x; }
     __device__ static float finalize(float acc, float) { return acc; }
 };
-template <> struct reduce_traits<min_op> {
-    using combine_op = min_op;
+template <> struct reduce_traits<primitive::min_op> {
+    using combine_op = primitive::min_op;
     static constexpr float init = INFINITY;
     __device__ static float elem(float x) { return x; }
     __device__ static float finalize(float acc, float) { return acc; }
 };
 template <> struct reduce_traits<absmax_op> {
-    using combine_op = max_op;
+    using combine_op = primitive::max_op;
     static constexpr float init = 0.f;
     __device__ static float elem(float x) { return fabsf(x); }
     __device__ static float finalize(float acc, float) { return acc; }
@@ -66,8 +66,8 @@ template <class T> CUTE_HOST_DEVICE constexpr bool folds_in_float() {
 /// What both operands have to be for any tier to be able to run.
 template <class Src, class Dst>
 CUTE_HOST_DEVICE constexpr void check_reduce_domain() {
-    using s_view = tilefoundry::detail::local_view_t<Src>;
-    using d_view = tilefoundry::detail::local_view_t<Dst>;
+    using s_view = tilefoundry::local_view_t<Src>;
+    using d_view = tilefoundry::local_view_t<Dst>;
     static_assert(
         folds_in_float<typename s_view::value_type>(),
         "ops::reduce: the element type must be one float holds exactly");
@@ -83,9 +83,9 @@ CUTE_HOST_DEVICE constexpr void check_reduce_domain() {
 
 template <class Op>
 inline constexpr bool is_supported_reduce_op_v =
-    std::is_same_v<Op, add_op> || std::is_same_v<Op, mean_op> ||
-    std::is_same_v<Op, absmax_op> || std::is_same_v<Op, max_op> ||
-    std::is_same_v<Op, min_op>;
+    std::is_same_v<Op, primitive::add_op> || std::is_same_v<Op, mean_op> ||
+    std::is_same_v<Op, absmax_op> || std::is_same_v<Op, primitive::max_op> ||
+    std::is_same_v<Op, primitive::min_op>;
 
 /// Whether ``Axis`` is one of the axes ``Axes`` names.
 template <class Axes, int Axis> CUTE_HOST_DEVICE constexpr bool is_reduced() {
@@ -181,8 +181,9 @@ __device__ float cta_combine_via_workspace(float warp_partial,
 /// Compile-time derivation of the reduction level and ``warps_per_group`` from
 /// the operand shard layouts, consumed by the public ``reduce`` entry.
 /// Classify each mesh axis from the operand shard attributes.
-using tilefoundry::detail::is_partial_attr_v;
-using tilefoundry::detail::is_split_attr_v;
+
+using detail::is_partial_attr_v;
+using detail::is_split_attr_v;
 
 /// An axis whose instances hold pieces of one value, either kind.
 template <class T>
@@ -231,8 +232,8 @@ CUTE_HOST_DEVICE constexpr reduce_dispatch_info reduce_dispatch() {
     constexpr bool is_thread = mesh_t::scope == TopologyScope::thread;
     using m_layout_t = typename mesh_t::layout_type;
     constexpr int m_rank = cute::tuple_size<src_attrs>::value;
-    static_assert(tilefoundry::detail::shard_attrs_match_mesh<SrcSL>() &&
-                      tilefoundry::detail::shard_attrs_match_mesh<DstSL>(),
+    static_assert(detail::shard_attrs_match_mesh<SrcSL>() &&
+                      detail::shard_attrs_match_mesh<DstSL>(),
                   "ops::reduce: both operands need one attr per mesh axis");
     static_assert(std::is_same_v<typename SrcSL::mesh, typename DstSL::mesh>,
                   "ops::reduce: the two operands must name one mesh");

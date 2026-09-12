@@ -31,6 +31,7 @@ template <class...> inline constexpr bool dependent_false_v = false;
 
 /// Program topology levels and sentinel.
 enum class TopologyScope {
+    gpu,
     cta,
     thread,
     scope_count,
@@ -42,32 +43,115 @@ template <TopologyScope T>
 CUTE_HOST_DEVICE constexpr auto program_dim() noexcept;
 
 namespace detail {
-/// Named levels as one shape. Each count is a dependent call, so the counts
-/// are read where the shape is asked for and not where it is written -- a
-/// translation unit states them after this header.
-template <TopologyScope... Ts>
-CUTE_HOST_DEVICE constexpr auto dims_of() noexcept {
-    return cute::make_shape(program_dim<Ts>()...);
+/// Start and every level under it, coarsest first, one constant each. A
+/// tuple rather than a count, so that how many there are and where one
+/// sits are cute::rank and cute::find instead of arithmetic of our own.
+template <TopologyScope Start, size_t... Is>
+CUTE_HOST_DEVICE constexpr auto
+topologies_from(std::index_sequence<Is...>) noexcept {
+    return cute::make_tuple(cute::C<TopologyScope(int(Start) + int(Is))>{}...);
+}
+
+template <TopologyScope Start>
+CUTE_HOST_DEVICE constexpr auto topologies_from() noexcept {
+    return topologies_from<Start>(
+        std::make_index_sequence<size_t(int(TopologyScope::scope_count) -
+                                        int(Start))>{});
 }
 }
 
 /// Level T and every level under it, one mode each. A mesh naming several
 /// levels is indexed against this shape: an axis belongs to the level whose
 /// extents its own multiply up to, and a stride counts the levels below it.
+///
+/// Each count is a dependent call, so the counts are read where the shape is
+/// asked for and not where it is written -- a translation unit states them
+/// after this header.
 template <TopologyScope T>
 CUTE_HOST_DEVICE constexpr auto program_shape() noexcept {
-    if constexpr (T == TopologyScope::cta)
-        return detail::dims_of<T, TopologyScope::thread>();
-    else
-        return detail::dims_of<T>();
+    return cute::transform(
+        detail::topologies_from<T>(),
+        []<TopologyScope S>(cute::C<S>) { return program_dim<S>(); });
+}
+
+/// The coarsest level this program names. It names a contiguous run of them
+/// ending at the finest, so this one end says which: a single-card program
+/// says ``cta`` and has no ``gpu`` at all.
+///
+/// A translation unit states it by defining TILEFOUNDRY_PROGRAM_TOPOLOGY
+/// before this header, the way the target macro selects a runtime. A macro
+/// rather than a function the .cu defines, because the levels decide how long
+/// a coord is and a length is read while this header is compiled.
+#if !defined(TILEFOUNDRY_PROGRAM_TOPOLOGY)
+#define TILEFOUNDRY_PROGRAM_TOPOLOGY tilefoundry::TopologyScope::cta
+#endif
+
+CUTE_HOST_DEVICE constexpr TopologyScope program_topology() noexcept {
+    return TILEFOUNDRY_PROGRAM_TOPOLOGY;
+}
+
+/// The topology levels this program names, coarsest first.
+///
+/// How many there are is cute::rank of it, and where level S sits among them
+/// is cute::find(program_topologies(), cute::C<S>{}) -- both are questions
+/// CuTe already answers about a tuple, so neither has a name of its own.
+CUTE_HOST_DEVICE constexpr auto program_topologies() noexcept {
+    return detail::topologies_from<program_topology()>();
+}
+
+/**
+ * @brief What a launch is told that it cannot read for itself.
+ *
+ * A card has no register naming which of the mesh's cards it is, so the host
+ * that placed it says so. Indexed by TopologyScope, so a slot says which
+ * level it answers for; levels the device reads for itself leave theirs
+ * unused. Only a program that names such a level is given one.
+ */
+struct ProgramMetaData {
+    int program_id[int(TopologyScope::scope_count)];
+};
+
+/**
+ * @brief The block's one copy of what the launch was told.
+ *
+ * Shared rather than global: the name is an offset into whichever block is
+ * running, so one name is one copy per block rather than one per device.
+ */
+CUTE_HOST_DEVICE ProgramMetaData &program_meta() {
+#if defined(__CUDA_ARCH__)
+    __shared__ ProgramMetaData held;
+    return held;
+#else
+    static ProgramMetaData held{};
+    return held;
+#endif
+}
+
+/**
+ * @brief Hand the block what this launch was told.
+ *
+ * Called once, before any divergence: one thread writes and the barrier
+ * orders that write against every read of it.
+ */
+CUTE_HOST_DEVICE void program_meta(ProgramMetaData const &meta) {
+#if defined(__CUDA_ARCH__)
+    if (threadIdx.x == 0)
+        program_meta() = meta;
+    __syncthreads();
+#else
+    program_meta() = meta;
+#endif
 }
 
 /// Linearized id within topology level T.
 template <TopologyScope T> CUTE_HOST_DEVICE size_t program_id() noexcept {
-    static_assert(T == TopologyScope::cta || T == TopologyScope::thread,
-                  "program_id: only cta and thread have an id");
+    static_assert(T == TopologyScope::gpu || T == TopologyScope::cta ||
+                      T == TopologyScope::thread,
+                  "program_id: only gpu, cta and thread have an id");
 #if defined(__CUDA_ARCH__)
-    if constexpr (T == TopologyScope::cta) {
+    if constexpr (T == TopologyScope::gpu) {
+        return size_t(program_meta().program_id[int(TopologyScope::gpu)]);
+    } else if constexpr (T == TopologyScope::cta) {
         return size_t(blockIdx.x) + size_t(blockIdx.y) * size_t(gridDim.x) +
                size_t(blockIdx.z) * size_t(gridDim.x) * size_t(gridDim.y);
     } else {
@@ -79,10 +163,19 @@ template <TopologyScope T> CUTE_HOST_DEVICE size_t program_id() noexcept {
 #endif
 }
 
-/// Every level's id, indexed by TopologyScope.
+namespace detail {
+/// One id per level this program names, from the coarsest it names inward.
+template <TopologyScope Start, size_t... Is>
+CUTE_HOST_DEVICE auto ids_of(std::index_sequence<Is...>) noexcept {
+    return cute::make_tuple(
+        program_id<TopologyScope(int(Start) + int(Is))>()...);
+}
+}
+
+/// Every level's id, indexed the way program_topologies() is.
 CUTE_HOST_DEVICE auto program_ids() noexcept {
-    return cute::make_tuple(program_id<TopologyScope::cta>(),
-                            program_id<TopologyScope::thread>());
+    return detail::ids_of<program_topology()>(
+        std::make_index_sequence<size_t(cute::rank(program_topologies()))>{});
 }
 
 #include "layout/cute_ext.cuh"
@@ -91,12 +184,18 @@ CUTE_HOST_DEVICE auto program_ids() noexcept {
 #include "tensor_view/shard_tensor.cuh"
 #include "utility/warp.cuh"
 
+/// Beside ops, not inside them: a primitive is a callable an op is handed,
+/// not a layer of the op surface.
+namespace primitive {
+
+#include "primitive/unary.h"
+#include "primitive/binary.h"
+
+}
+
 namespace ops {
 
 #include "ops/detail.cuh"
-/// Primitive callables precede entries that instantiate them.
-#include "primitive/unary.h"
-#include "primitive/binary.h"
 #include "ops/sync.cuh"
 #include "ops/elementwise.cuh"
 #include "ops/copy.cuh"
@@ -109,5 +208,4 @@ namespace ops {
 #include "ops/mma.cuh"
 
 }
-
 }

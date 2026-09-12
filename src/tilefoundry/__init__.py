@@ -15,7 +15,7 @@ __version__ = _distribution_version("tilefoundry")
 
 
 from tilefoundry.ir.core import (
-    AnalysisRegistry,
+    DispatchRegistry,
     Call,
     Constant,
     Expr,
@@ -80,7 +80,7 @@ from tilefoundry.script import func, intrinsic, prim_func
 from tilefoundry.module import module
 
 
-from tilefoundry.compile import build, compile, jit, lower, normalize_to_module, CompilerOptions
+from tilefoundry.compile import build, compile, jit, normalize_to_module, CompilerOptions
 from tilefoundry.inspection.viewer import Viewer as _Viewer
 
 
@@ -98,7 +98,7 @@ __all__ = [
 
     "Expr", "Var", "Constant", "Call", "Stmt", "TupleGetItem",
     "Op", "ParameterInfo",
-    "AnalysisRegistry",
+    "DispatchRegistry",
     "typeinfer_registry", "verify_stmt_registry", "cost_evaluator_registry",
     "register_typeinfer", "register_verify_stmt", "register_cost_evaluator",
     "TypeInferContext", "FunctionScope",
@@ -114,7 +114,7 @@ __all__ = [
 
     "func", "prim_func", "intrinsic", "module",
 
-    "lower", "build", "compile", "jit",
+    "build", "compile", "jit",
     "normalize_to_module", "CompilerOptions",
     "view",
 ]

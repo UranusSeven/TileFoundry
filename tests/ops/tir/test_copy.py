@@ -1,6 +1,6 @@
 """``ops::copy`` across the storage boundaries and both vector widths, one kernel.
 
-See [runtime §3](docs/spec/runtime.md#3-runtime-ops).
+See [runtime §2.6](docs/spec/runtime.md#26-cudaops).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from tilefoundry.target import CpuTarget, CudaTarget
 _CUDA = CudaTarget("nvidia.h200_sxm")
 
 
-@module(entry="copy_storage_host")
+@module(entry="copy_storage_host", target=_CUDA)
 class CopyStorage:
     """Five operand pairs in one device function, one per thing that can differ."""
 

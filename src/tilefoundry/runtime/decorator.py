@@ -1,18 +1,22 @@
 """``@runtime_func`` / ``@runtime_module``.
 
 ``@runtime_func`` / ``@runtime_module`` — authoring surface for the runtime
-twin of a semantic ``Module``. See [runtime §1.1](docs/spec/runtime.md#11-runtimemodule).
+twin of a semantic ``Module``. See [runtime §1.1](docs/spec/runtime.md#11-runtimemodulepy).
 """
 from __future__ import annotations
 
 import inspect
 import types
+from dataclasses import replace
 from typing import Callable
 
 from tilefoundry.ir.core.module import Module, _refuse_bare_call
+from tilefoundry.ir.types.shard import Placement, shard_layout_of
+from tilefoundry.ir.types.tensor_type import TensorType
 from tilefoundry.runtime.function import RuntimeFunction
 from tilefoundry.runtime.module import RuntimeModule
 from tilefoundry.runtime.resource import RuntimeResource
+from tilefoundry.runtime.tensor import ShardTensor
 
 _RUNTIME_FUNC_MARK = "_tilefoundry_runtime_func"
 
@@ -51,10 +55,14 @@ def _is_child_impl(value: object) -> bool:
 
 
 def _make_kernel_caller(instance: RuntimeModule, ir_fn, body: Callable) -> Callable:
-    """Bind *body* into a callable taking activations only.
+    """Bind *body* into a callable taking activations only, converting both ways.
 
-    Bind *body* into a callable taking activations only: ``is_const`` params
-    come from *instance*'s loaded weights by name, the rest positionally.
+    The way in is a ``forward_pre_hook`` and the way out a ``forward_hook``:
+    each ``ShardTensor`` argument is projected to this program's slice and each
+    ``is_const`` param comes from *instance*'s loaded weights by name, already
+    projected, so a body -- a Python reference or a launched kernel alike --
+    only sees ``torch.Tensor`` and never the mesh it came out of. The way out
+    wraps again only where the declared return type carries a ``ShardLayout``.
     """
     is_kernel_obj = isinstance(body, RuntimeFunction)
 
@@ -65,8 +73,9 @@ def _make_kernel_caller(instance: RuntimeModule, ir_fn, body: Callable) -> Calla
             if param.is_const:
                 args.append(instance._weight(param.name))
             else:
-                args.append(next(remaining))
-        return body(*args) if is_kernel_obj else body(instance, *args)
+                args.append(instance._to_local(next(remaining)))
+        out = body(*args) if is_kernel_obj else body(instance, *args)
+        return instance._from_local(out, ir_fn.return_type)
 
     return _call
 
@@ -85,16 +94,54 @@ class _Twin(RuntimeModule):
         """The authored ``Module`` this twin was generated from."""
         return self._ir
 
-    def load(self, resource: RuntimeResource) -> None:
+    def load(
+        self, resource: RuntimeResource, *, placement: "Placement | None" = None
+    ) -> None:
         self._resource = resource
+        self._placement = placement
         self._bound.clear()
         for child in self.modules:
-            child.load(resource.subtree(child.name))
+            child.load(resource.subtree(child.name), placement=placement)
+
+    def _to_local(self, value):
+        """Into a body: a ``ShardTensor`` projected to this program's slice.
+
+        Anything the mesh never spread is already what this program holds, so
+        it passes through -- the choice is made once here rather than at each
+        body. Named as ``DTensor.to_local``, which answers the same question.
+        """
+        if isinstance(value, ShardTensor):
+            return value.to_local(self._ir.effective_topologies(), self._placement)
+        return value
+
+    def _from_local(self, value, declared):
+        """Out of a body: a returned tensor as a ``ShardTensor`` when it is one.
+
+        The declared return type decides, not the value: what a body hands
+        back is a bare ``torch.Tensor`` with nothing on it saying whether it is
+        one program's slice or the whole. Only a return type the mesh divides
+        is a distributed value; anything else is one tensor and stays one. The
+        type paired with it states the shape the body actually returned and
+        carries no layout: narrowing it again would take a shard of a shard.
+        """
+        import torch  # noqa: PLC0415 -- optional runtime dep
+
+        if not isinstance(value, torch.Tensor) or not isinstance(declared, TensorType):
+            return value
+        if shard_layout_of(declared.layout) is None:
+            return value
+        return ShardTensor(value, replace(declared, shape=tuple(value.shape), layout=None))
 
     def _weight(self, name: str):
-        """Read and strongly memoize one declared weight for this twin."""
+        """Read one declared weight, narrow it to this program, and memoize it.
+
+        A narrowed weight is copied out of the read it came from, so the whole
+        canonical tensor is released once the shard it contributed is held;
+        only a weight the mesh does not divide is kept as the read itself.
+        """
+        key = name
         try:
-            return self._bound[name]
+            return self._bound[key]
         except KeyError:
             pass
         if self._resource is None:
@@ -124,8 +171,11 @@ class _Twin(RuntimeModule):
                 f"{value.dtype}, declared {declared.dtype}; the way out is a weight "
                 "converter on the model, not a flag on the read side"
             )
-        self._bound[name] = value
-        return value
+        local = ShardTensor(value, declared).to_local(
+            self._ir.effective_topologies(), self._placement
+        )
+        self._bound[key] = local if local is value else local.clone()
+        return self._bound[key]
 
     def forward(self, *acts):
         """Forward.
@@ -217,8 +267,9 @@ def runtime_module(sem: Module) -> Callable[[type], type]:
         def __init__(self, ir: Module | None = None) -> None:
             ir = sem if ir is None else ir
             self._ir = ir
-            self._bound: dict[str, object] = {}
+            self._bound: dict[tuple, object] = {}
             self._resource: RuntimeResource | None = None
+            self._placement: Placement | None = None
 
             children = []
             for child_ir in ir.modules:
