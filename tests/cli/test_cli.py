@@ -743,8 +743,8 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(tmp_path) ->
     assert annotated.count("reshard(tokens") == 2
     assert "v0 = reshard(tokens" in annotated
     assert "v3 = reshard(tokens" in annotated
-    assert "offset=0" in annotated
-    assert "offset=120" in annotated
+    assert "with cta[:120] as cta_2:" in annotated
+    assert "with cta_3[120:] as cta_4:" in annotated
 
     summary = payload["function_records"]["performance"]
     cost = payload["function_records"]["compute-cost"]
@@ -780,13 +780,19 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(tmp_path) ->
     }
 
     hoisted = {line.split(" = ", 1)[0] for line in lines if " = Mesh((Topology(" in line}
-    scoped = {line.lstrip().split()[1] for line in lines if line.lstrip().startswith("with ")}
-    assert hoisted == {"cta", "cta_2"} | scoped
+    scoped = {
+        line.rsplit(" as ", 1)[1].split(":", 1)[0]
+        for line in lines
+        if line.lstrip().startswith("with ")
+    }
+    assert hoisted == set()
+    assert scoped == {"cta", "cta_2", "cta_3", "cta_4"}
     annotated_types = [
         line.split("  # ", 1)[1].split("; ", 1)[0] for line in lines if "  # Tensor[" in line
     ]
-    assert 'Tensor[(120, 64), "f32", (120 @ cta_2.tile, 64)]' in annotated_types
-    assert 'Tensor[(120, 64), "f32", (12 @ cta_3.tile, 10, 64)]' in annotated_types
+    assert 'Tensor[(120, 64), "f32", ((120 @ cta_2.tile, 64), (64, 1))]' in annotated_types
+    assert 'Tensor[(120, 64), "f32", ((12 @ cta_3.tile, 10, 64), (640, 64, 1))]' in annotated_types
+    assert 'Tensor[(120, 64), "f32", ((120, 64), (64, 1), {cta.tile @ B()})]' in annotated_types
 
     rows = payload["calls"]
     assert len(rows) == 7
@@ -812,9 +818,9 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(tmp_path) ->
         else:
             assert "; performance=" not in statement
         annotated_meshes = set(re.findall(r"@ (\w+)\.", statement.split("  # ", 1)[1]))
-        assert annotated_meshes <= hoisted
+        assert annotated_meshes <= scoped
         placed_meshes = set(re.findall(r"mesh=(\w+),", statement))
-        assert placed_meshes <= hoisted
+        assert placed_meshes <= scoped
     assert len([line for line in lines if "; performance=" in line]) == len(timed)
     assert len({row["value"] for row in rows}) == len(rows)
     assert "units=" not in annotated

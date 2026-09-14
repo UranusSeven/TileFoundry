@@ -68,7 +68,6 @@ from .ast_pattern import (
     ParseError,
     ParserTypeInferContext,
     PatternFailure,
-    PlacedShapeRule,
     PredicatePattern,
     ReferencePattern,
     RepeatPattern,
@@ -305,81 +304,6 @@ class DTypePattern(ElementPattern):
     RULES: ClassVar[tuple[AstRule[Any], ...]] = (CanonicalDTypeRule(),)
 
 
-class ExplicitLayoutPattern(ElementPattern):
-    element_name = "explicit_layout"
-    syntax = LazyPattern(
-        lambda: BranchPattern(
-            "explicit_layout",
-            AstNodePattern(
-                ast.Tuple,
-                FieldPattern(
-                    "elts",
-                    SequencePattern(
-                        AstNodePattern(
-                            ast.Tuple,
-                            ChoicePattern(
-                                ConditionPattern(
-                                    "active Mesh",
-                                    lambda node, context: (
-                                        context.function is not None
-                                        and bool(context.function.state.mesh_stack)
-                                    ),
-                                    ChildPattern(
-                                        "shape",
-                                        lambda: TensorShapeLayoutPattern(),
-                                        "layout_shape",
-                                        "layout_shape",
-                                    ),
-                                ),
-                                ChildPattern(
-                                    "shape",
-                                    lambda: ShapePattern(),
-                                    "layout_shape",
-                                    "layout_shape",
-                                ),
-                            ),
-                        ),
-                        AstNodePattern(
-                            ast.Tuple,
-                            ChildPattern(
-                                "strides",
-                                lambda: ShapePattern(),
-                                "layout_strides",
-                                "layout_strides",
-                            ),
-                        ),
-                    ),
-                ),
-            ),
-            pattern_id="tensor.layout.explicit",
-        )
-    )
-
-    @staticmethod
-    def construct(match, children, context):
-        shape_or_layout = children["shape"]
-        strides = children["strides"]
-        if isinstance(shape_or_layout, runtime.ShardLayout):
-            shape = shape_or_layout.layout.shape
-        else:
-            shape = shape_or_layout
-        if len(shape) != len(strides):
-            raise ParseError.from_node(match.node, context, "layout shape/stride rank mismatch")
-        layout = runtime.Layout(shape=shape, strides=strides)
-        if isinstance(shape_or_layout, runtime.ShardLayout):
-            return runtime.ShardLayout(
-                layout=layout,
-                attrs=shape_or_layout.attrs,
-                mesh=shape_or_layout.mesh,
-            )
-        return layout
-
-    RULES: ClassVar[tuple[AstRule[Any], ...]] = (
-        LayoutShapeRule(),
-        LayoutPositionRule(),
-    )
-
-
 class PlainLayoutPattern(ElementPattern):
     element_name = "plain_layout"
     syntax = LazyPattern(
@@ -461,15 +385,11 @@ class MeshAxisPattern(ElementPattern):
         else:
             binding = node.value.id
             axis_name = node.attr
-        mesh = context.lexical_scope.lookup(binding)
-        if mesh is None:
-            try:
-                reference = node if isinstance(node, ast.Name) else node.value
-                mesh = _resolve_reference(reference, context)
-            except ParseError:
-                mesh = None
+        mesh = context.lexical_scope.lookup_mesh(binding)
         if not isinstance(mesh, runtime.Mesh):
-            raise ParseError.from_node(node, context, f"{binding!r} is not an active Mesh")
+            raise ParseError.from_node(
+                node, context, f"{binding!r} is not a lexical Mesh binding"
+            )
         if axis_name is None:
             if len(mesh.layout.shape) != 1:
                 raise ParseError.from_node(
@@ -514,41 +434,298 @@ class PlacedLayout:
     layout: object
 
 
-class PlacedLayoutPattern(ElementPattern):
-    element_name = "placed_layout"
-    syntax = LazyPattern(
-        lambda: BindPattern(
-            AstNodePattern(
-                ast.Tuple,
-                FieldPattern(
-                    "elts",
-                    RepeatPattern(
+def _layout_dims() -> AstPattern[Any]:
+    """``(extent, extent @ axis, ...)`` — the layout's own divided dimensions."""
+    pattern = AstNodePattern(
+        ast.Tuple,
+        FieldPattern(
+            "elts",
+            RepeatPattern(
+                ChoicePattern(
+                    AstNodePattern(
+                        ast.BinOp,
+                        FieldPattern("op", AstNodePattern(ast.MatMult)),
+                        FieldPattern("left", AstNodePattern(ast.expr)),
+                        FieldPattern(
+                            "right",
+                            ChoicePattern(
+                                AstNodePattern(
+                                    ast.Tuple,
+                                    FieldPattern(
+                                        "elts", RepeatPattern(MeshAxisPattern(), minimum=1)
+                                    ),
+                                ),
+                                MeshAxisPattern(),
+                            ),
+                        ),
+                    ),
+                    DimExprPattern(),
+                )
+            ),
+        ),
+    )
+    pattern.grammar_name = "layout_dims"
+    return pattern
+
+
+def _layout_strides() -> AstPattern[Any]:
+    """``(stride, ...)`` — how the divided positions are addressed."""
+    pattern = AstNodePattern(ast.Tuple, FieldPattern("elts", RepeatPattern(DimExprPattern())))
+    pattern.grammar_name = "layout_strides"
+    return pattern
+
+
+def _value_states() -> AstPattern[Any]:
+    """``{axis @ B(), axis @ P("sum")}`` — what unsplit mesh axes hold."""
+    pattern = AstNodePattern(
+        ast.Set,
+        FieldPattern(
+            "elts",
+            RepeatPattern(
+                AstNodePattern(
+                    ast.BinOp,
+                    FieldPattern("op", AstNodePattern(ast.MatMult)),
+                    FieldPattern("left", MeshAxisPattern()),
+                    FieldPattern(
+                        "right",
                         ChoicePattern(
                             AstNodePattern(
-                                ast.BinOp,
-                                FieldPattern("op", AstNodePattern(ast.MatMult)),
-                                FieldPattern("left", AstNodePattern(ast.expr)),
+                                ast.Call,
                                 FieldPattern(
-                                    "right",
-                                    ChoicePattern(
+                                    "func",
+                                    AstNodePattern(
+                                        ast.Name, FieldPattern("id", LiteralPattern("B"))
+                                    ),
+                                ),
+                                FieldPattern("args", SequencePattern()),
+                            ),
+                            AstNodePattern(
+                                ast.Call,
+                                FieldPattern(
+                                    "func",
+                                    AstNodePattern(
+                                        ast.Name, FieldPattern("id", LiteralPattern("P"))
+                                    ),
+                                ),
+                                FieldPattern(
+                                    "args",
+                                    SequencePattern(
                                         AstNodePattern(
-                                            ast.Tuple,
-                                            FieldPattern(
-                                                "elts",
-                                                RepeatPattern(
-                                                    MeshAxisPattern(),
-                                                    minimum=1,
-                                                ),
-                                            ),
-                                        ),
-                                        MeshAxisPattern(),
+                                            ast.Constant,
+                                            FieldPattern("value", LiteralPattern(value_type=str)),
+                                        )
                                     ),
                                 ),
                             ),
-                            DimExprPattern(),
-                        )
+                        ),
                     ),
                 ),
+                minimum=1,
+            ),
+        ),
+    )
+    pattern.grammar_name = "value_states"
+    return pattern
+
+
+def _layout_sugar_parts(node: object):
+    """Split layout sugar into its dims, its strides, and its value states.
+
+    ``(d, ...)`` states dims alone. Wrapping the dims in a tuple adds an
+    optional stride tuple and an optional ``{axis @ B(), axis @ P("sum")}``
+    set, in that order, so one production reads every form the printer emits.
+    Return ``None`` when the node is not layout sugar at all.
+    """
+    if not isinstance(node, ast.Tuple) or not node.elts:
+        return None
+    head, *extras = node.elts
+    if not extras or not isinstance(head, ast.Tuple):
+        return node, None, None
+    strides: ast.Tuple | None = None
+    states: ast.Set | None = None
+    for extra in extras:
+        if isinstance(extra, ast.Tuple) and strides is None and states is None:
+            strides = extra
+        elif isinstance(extra, ast.Set) and states is None:
+            states = extra
+        else:
+            return None
+    return head, strides, states
+
+
+def _value_state_parts(node: ast.AST):
+    """Read ``axis @ B()`` or ``axis @ P("reduction")`` as axis node and state."""
+    if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.MatMult):
+        return None
+    call = node.right
+    if not isinstance(call, ast.Call) or not isinstance(call.func, ast.Name) or call.keywords:
+        return None
+    if call.func.id == "B" and not call.args:
+        return node.left, "B", None
+    if call.func.id == "P" and len(call.args) == 1:
+        reduction = call.args[0]
+        if isinstance(reduction, ast.Constant) and isinstance(reduction.value, str):
+            if reduction.value:
+                return node.left, "P", reduction.value
+    return None
+
+
+@dataclass(frozen=True)
+class _PlacementCandidate:
+    shape: tuple
+    strides: tuple | None
+    splits: tuple[tuple[object, int, int], ...]
+    states: tuple[tuple[object, int, str, str | None], ...]
+
+
+def _placement_meshes(value: _PlacementCandidate, context: MatchContext, match):
+    referenced_ids = {id(entry[0]) for entry in (*value.splits, *value.states)}
+    if not referenced_ids:
+        return ()
+    if context.function is None:
+        raise ParseError.from_node(
+            match.node, context, "placed layout requires function context"
+        )
+    meshes = tuple(dict.fromkeys(entry[0] for entry in (*value.splits, *value.states)))
+    if len(meshes) != len(referenced_ids):
+        raise ParseError.from_node(
+            match.node, context, "placement references a non-lexical Mesh binding"
+        )
+    return meshes
+
+
+@dataclass(frozen=True)
+class LayoutStrideRankRule:
+    STATEMENT: ClassVar[str] = (
+        "A stated stride tuple must have the rank of the layout it addresses."
+    )
+
+    def apply(self, value, *, match, context):
+        if value.strides is not None and len(value.shape) != len(value.strides):
+            raise ParseError.from_node(match.node, context, "layout shape/stride rank mismatch")
+        return value
+
+
+@dataclass(frozen=True)
+class PlacementMeshResolutionRule:
+    STATEMENT: ClassVar[str] = "A placement's mesh must be a lexical mesh binding."
+
+    def apply(self, value, *, match, context):
+        _placement_meshes(value, context, match)
+        return value
+
+
+@dataclass(frozen=True)
+class PlacementLevelRule:
+    STATEMENT: ClassVar[str] = "A placement's meshes cannot name the same topology level."
+
+    def apply(self, value, *, match, context):
+        meshes = _placement_meshes(value, context, match)
+        levels = [topology.name for mesh in meshes for topology in mesh.topologies]
+        if len(levels) != len(set(levels)):
+            duplicates = sorted(name for name in set(levels) if levels.count(name) > 1)
+            raise ParseError.from_node(
+                match.node, context,
+                f"a layout can split one level once; two of these meshes name {duplicates}",
+            )
+        return value
+
+
+@dataclass(frozen=True)
+class MeshAxisBoundOnceRule:
+    STATEMENT: ClassVar[str] = "A placement binds each mesh axis at most once."
+
+    def apply(self, value, *, match, context):
+        seen: set[tuple[int, int]] = set()
+        for mesh, axis, *_ in (*value.splits, *value.states):
+            key = (id(mesh), axis)
+            if key in seen:
+                raise ParseError.from_node(match.node, context, "mesh axis is bound more than once")
+            seen.add(key)
+        return value
+
+
+@dataclass(frozen=True)
+class PlacementConstructionRule:
+    """Materialize the candidate only after placement invariants have run."""
+
+    STATEMENT: ClassVar[str] = "A placement must construct a valid shard layout."
+
+    def apply(self, value, *, match, context):
+        if not value.splits and not value.states:
+            return PlacedLayout(
+                shape=value.shape, layout=runtime.Layout(shape=value.shape, strides=value.strides)
+            )
+        meshes = _placement_meshes(value, context, match)
+        mesh = meshes[0] if len(meshes) == 1 else runtime.composed(meshes)
+        source_offsets: dict[int, int] = {}
+        offset = 0
+        for source in meshes:
+            source_offsets[id(source)] = offset
+            offset += len(source.layout.shape)
+        attrs: list[object] = [runtime.Broadcast() for _ in mesh.layout.shape]
+        for source, source_axis, tensor_axis in value.splits:
+            attrs[source_offsets[id(source)] + source_axis] = runtime.Split(tensor_axis)
+        for source, source_axis, kind, reduction in value.states:
+            target_axis = source_offsets[id(source)] + source_axis
+            attrs[target_axis] = runtime.Broadcast() if kind == "B" else runtime.Partial(reduction)
+        try:
+            canonical = runtime.canonical_shard_layout(value.shape, mesh, tuple(attrs))
+        except (TypeError, ValueError) as error:
+            raise ParseError.from_node(match.node, context, str(error)) from error
+        if value.strides is not None and len(canonical.layout.shape) != len(value.strides):
+            raise ParseError.from_node(match.node, context, "layout shape/stride rank mismatch")
+        return PlacedLayout(
+            shape=value.shape,
+            layout=runtime.ShardLayout(
+                layout=runtime.Layout(shape=canonical.layout.shape, strides=value.strides),
+                attrs=canonical.attrs,
+                mesh=canonical.mesh,
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class PlacementAnswerRule:
+    """A placement answers both halves: the shape written, and where it goes."""
+
+    STATEMENT: ClassVar[str] = (
+        "Placement sugar states both the shape as written and the layout it implies."
+    )
+
+    def apply(self, value, *, match, context):
+        if not isinstance(value, PlacedLayout):
+            raise ParseError.from_node(match.node, context, "placement did not answer a placement")
+        if not isinstance(value.shape, tuple):
+            raise ParseError.from_node(match.node, context, "placement shape is not a tuple")
+        if not isinstance(value.layout, runtime.LayoutBase):
+            raise ParseError.from_node(match.node, context, "placement did not carry a LayoutBase")
+        return value
+
+
+class PlacedLayoutPattern(ElementPattern):
+    """The one placement production, including dimensions, strides, and states."""
+
+    element_name = "placed_layout"
+    syntax = LazyPattern(
+        lambda: BindPattern(
+            ChoicePattern(
+                AstNodePattern(
+                    ast.Tuple,
+                    FieldPattern(
+                        "elts",
+                        SequencePattern(_layout_dims(), _layout_strides(), _value_states()),
+                    ),
+                ),
+                AstNodePattern(
+                    ast.Tuple,
+                    FieldPattern("elts", SequencePattern(_layout_dims(), _layout_strides())),
+                ),
+                AstNodePattern(
+                    ast.Tuple,
+                    FieldPattern("elts", SequencePattern(_layout_dims(), _value_states())),
+                ),
+                _layout_dims(),
             ),
             PlacedLayoutPattern._bind,
         )
@@ -556,7 +733,6 @@ class PlacedLayoutPattern(ElementPattern):
 
     @staticmethod
     def _placement_parts(node: ast.AST) -> tuple[ast.AST, tuple[ast.AST, ...]] | None:
-        """Flatten ``extent @ axis @ axis`` into one extent and its axes."""
         if not isinstance(node, ast.BinOp) or not isinstance(node.op, ast.MatMult):
             return None
         left = PlacedLayoutPattern._placement_parts(node.left)
@@ -570,11 +746,15 @@ class PlacedLayoutPattern(ElementPattern):
 
     @staticmethod
     def _bind(node: object, context: MatchContext, matched: AstMatch[Any]) -> AstMatch[Any] | None:
-        assert isinstance(node, ast.Tuple)
+        parts = _layout_sugar_parts(node)
+        if parts is None:
+            return None
+        dims_node, strides_node, states_node = parts
         children: list[AstChild] = []
         bindings: list[tuple[str, int]] = []
+        states: list[tuple[str, str, str | None]] = []
         found_placement = False
-        for tensor_axis, item in enumerate(node.elts):
+        for tensor_axis, item in enumerate(dims_node.elts):
             placement = PlacedLayoutPattern._placement_parts(item)
             extent_node = item
             axis_nodes: tuple[ast.AST, ...] = ()
@@ -584,99 +764,56 @@ class PlacedLayoutPattern(ElementPattern):
             extent_context = context.child(situation="layout_extent", role="layout_extent")
             if DimExprPattern().match(extent_node, extent_context) is None:
                 return None
-            children.append(
-                AstChild(
-                    f"extent_{tensor_axis}",
-                    DimExprPattern(),
-                    extent_node,
-                    "layout_extent",
-                    "layout_extent",
-                )
-            )
+            children.append(AstChild(f"extent_{tensor_axis}", DimExprPattern(), extent_node, "layout_extent", "layout_extent"))
             for mesh_axis, axis_node in enumerate(axis_nodes):
                 axis_context = context.child(situation="mesh_axis", role="mesh_axis")
                 if MeshAxisPattern().match(axis_node, axis_context) is None:
                     return None
                 child_name = f"binding_{tensor_axis}_{mesh_axis}"
                 bindings.append((child_name, tensor_axis))
-                children.append(
-                    AstChild(
-                        child_name,
-                        MeshAxisPattern(),
-                        axis_node,
-                        "mesh_axis",
-                        "mesh_axis",
-                    )
-                )
-        if not found_placement:
+                children.append(AstChild(child_name, MeshAxisPattern(), axis_node, "mesh_axis", "mesh_axis"))
+        if strides_node is not None:
+            for index, item in enumerate(strides_node.elts):
+                stride_context = context.child(situation="layout_strides", role="layout_strides")
+                if DimExprPattern().match(item, stride_context) is None:
+                    return None
+                children.append(AstChild(f"stride_{index}", DimExprPattern(), item, "layout_strides", "layout_strides"))
+        if states_node is not None:
+            for index, item in enumerate(states_node.elts):
+                state = _value_state_parts(item)
+                if state is None:
+                    return None
+                axis_node, kind, reduction = state
+                axis_context = context.child(situation="mesh_axis", role="mesh_axis")
+                if MeshAxisPattern().match(axis_node, axis_context) is None:
+                    return None
+                child_name = f"state_{index}"
+                states.append((child_name, kind, reduction))
+                children.append(AstChild(child_name, MeshAxisPattern(), axis_node, "mesh_axis", "mesh_axis"))
+        if not found_placement and not states and strides_node is None:
             return None
         return dataclasses.replace(
-            matched,
-            pattern_id="tensor.layout.placed",
-            branch_id="placed_layout",
+            matched, pattern_id="tensor.layout.placed", branch_id="placed_layout",
             captures={
-                **matched.captures,
-                "rank": len(node.elts),
-                "bindings": tuple(bindings),
-            },
-            children=tuple(children),
+                **matched.captures, "rank": len(dims_node.elts),
+                "stride_rank": None if strides_node is None else len(strides_node.elts),
+                "bindings": tuple(bindings), "states": tuple(states),
+            }, children=tuple(children),
         )
 
     @staticmethod
     def construct(match, children, context):
         rank = match.captures["rank"]
         shape = tuple(children[f"extent_{axis}"] for axis in range(rank))
-        bindings = tuple(
-            (*children[child_name], tensor_axis)
-            for child_name, tensor_axis in match.captures["bindings"]
-        )
-        referenced_ids = {id(mesh) for mesh, _, _ in bindings}
-        if context.function is None:
-            raise ParseError.from_node(
-                match.node, context, "placed layout requires function context"
-            )
-        meshes = tuple(
-            mesh for mesh in context.function.state.mesh_stack if id(mesh) in referenced_ids
-        )
-        if len(meshes) != len(referenced_ids):
-            meshes = tuple(dict.fromkeys(mesh for mesh, _, _ in bindings))
-            if len(meshes) != len(referenced_ids):
-                raise ParseError.from_node(
-                    match.node, context, "placement references an inactive Mesh"
-                )
-        levels = [topology.name for mesh in meshes for topology in mesh.topologies]
-        if len(levels) != len(set(levels)):
-            duplicates = sorted(name for name in set(levels) if levels.count(name) > 1)
-            raise ParseError.from_node(
-                match.node,
-                context,
-                f"a layout can split one level once; two of these meshes name {duplicates}",
-            )
-        mesh = meshes[0] if len(meshes) == 1 else runtime.composed(meshes)
-        source_offsets: dict[int, int] = {}
-        offset = 0
-        for source in meshes:
-            source_offsets[id(source)] = offset
-            offset += len(source.layout.shape)
-        attrs: list[object] = [runtime.Broadcast() for _ in mesh.layout.shape]
-        for source, source_axis, tensor_axis in bindings:
-            target_axis = source_offsets[id(source)] + source_axis
-            if not isinstance(attrs[target_axis], runtime.Broadcast):
-                raise ParseError.from_node(match.node, context, "mesh axis is bound more than once")
-            attrs[target_axis] = runtime.Split(tensor_axis)
-        try:
-            canonical = runtime.canonical_shard_layout(shape, mesh, tuple(attrs))
-            return runtime.ShardLayout(
-                layout=runtime.Layout(shape=canonical.layout.shape, strides=None),
-                attrs=canonical.attrs,
-                mesh=canonical.mesh,
-            )
-        except (TypeError, ValueError) as error:
-            raise ParseError.from_node(match.node, context, str(error)) from error
+        stride_rank = match.captures.get("stride_rank")
+        strides = None if stride_rank is None else tuple(children[f"stride_{index}"] for index in range(stride_rank))
+        splits = tuple((*children[child_name], tensor_axis) for child_name, tensor_axis in match.captures["bindings"])
+        states = tuple((*children[child_name], kind, reduction) for child_name, kind, reduction in match.captures.get("states", ()))
+        return _PlacementCandidate(shape, strides, splits, states)
 
     RULES: ClassVar[tuple[AstRule[Any], ...]] = (
-        LayoutShapeRule(),
-        LayoutPositionRule(),
+        LayoutStrideRankRule(), MeshAxisBoundOnceRule(), PlacementMeshResolutionRule(),
+        PlacementLevelRule(), PlacementConstructionRule(), PlacementAnswerRule(),
     )
 
 
@@ -711,7 +848,6 @@ class LayoutPattern(ElementPattern):
                 ),
                 pattern_id="tensor.layout.call",
             ),
-            ExplicitLayoutPattern(),
             PlacedLayoutPattern(),
             PlainLayoutPattern(),
         )
@@ -831,36 +967,11 @@ def _states_a_layout_slot(elts: object, context: "MatchContext") -> bool:
         return False
 
 
-class PlacedShapePattern(ElementPattern):
-    """Placement sugar read by a slot that states a shape rather than a layout.
-
-    Same syntax as `PlacedLayoutPattern`, different answer. That pattern serves
-    the layout slot, whose question is only where a value goes, so a layout is
-    the whole answer. A shape slot has no operand to read a shape from, and the
-    layout's own shape is the divided one, so it needs the extents as written
-    kept beside the layout instead of recovered from it.
-    """
-
-    element_name = "placed_shape"
-    syntax = LazyPattern(lambda: PlacedLayoutPattern().syntax)
-
-    @staticmethod
-    def construct(match, children, context):
-        layout = PlacedLayoutPattern.construct(match, children, context)
-        rank = match.captures["rank"]
-        return PlacedLayout(
-            shape=tuple(children[f"extent_{axis}"] for axis in range(rank)),
-            layout=layout,
-        )
-
-    RULES: ClassVar[tuple[AstRule[Any], ...]] = (PlacedShapeRule(),)
-
-
 class TensorShapeLayoutPattern(ElementPattern):
     element_name = "tensor_shape_layout"
     syntax = LazyPattern(
         lambda: ChoicePattern(
-            PlacedShapePattern(),
+            PlacedLayoutPattern(),
             ShapePattern(),
         )
     )
@@ -1009,6 +1120,8 @@ class TensorPattern(ElementPattern):
                 shape, layout = placed, None
         else:
             shape, layout = children["shape"], children["layout"]
+        if isinstance(layout, PlacedLayout):
+            layout = layout.layout
         storage = children.get("storage")
         return runtime.TensorType(
             shape=shape,
@@ -2421,7 +2534,9 @@ class CallPattern(ElementPattern):
                     value for name, value in children.items() if name.startswith("input_")
                 )
             attrs = {
-                name.removeprefix("attr_"): value
+                name.removeprefix("attr_"): (
+                    value.layout if isinstance(value, PlacedLayout) else value
+                )
                 for name, value in children.items()
                 if name.startswith("attr_")
             }
@@ -3239,7 +3354,7 @@ class MeshContextPattern(ElementPattern):
         binding = context.values.get("mesh_binding")
         _enter_mesh_scope(context, mesh, match)
         if isinstance(binding, str):
-            context.lexical_scope.define(binding, mesh)
+            context.lexical_scope.define_mesh(binding, mesh)
         context.function.state.mesh_stack.append(mesh)
         return mesh
 
@@ -4846,7 +4961,6 @@ __all__ = [
     "ConstantPattern",
     "DTypePattern",
     "DimExprPattern",
-    "ExplicitLayoutPattern",
     "ExpressionPattern",
     "ForPattern",
     "FunctionDialectRule",
