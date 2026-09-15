@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from tilefoundry.codegen.cuda.context import CudaCodegenContext
 from tilefoundry.codegen.cuda.tir.memory.tensor_view import render_shard_layout_value
+from tilefoundry.codegen.emitter import CudaEmitter
 from tilefoundry.codegen.signature import TensorSignature, tensor_signature_of
 from tilefoundry.ir.core.pattern import DimVarRangePat
 from tilefoundry.ir.tir.prim_function import PrimFunction
@@ -40,10 +41,7 @@ def _wrap_buffer(signature: TensorSignature, ctx: CudaCodegenContext) -> None:
     )
     for line in preamble:
         ctx.emit(line)
-    ctx.emit(
-        f"auto {name}_tensor = tilefoundry::make_shard_tensor("
-        f"{pointer}, {layout}, {value});"
-    )
+    ctx.emit(f"auto {name}_tensor = tilefoundry::make_shard_tensor({pointer}, {layout}, {value});")
 
 
 def _dispatch(fn: PrimFunction, ctx: CudaCodegenContext) -> None:
@@ -104,4 +102,4 @@ def _emit(fn: PrimFunction, ctx: CudaCodegenContext) -> None:
     ctx.bind_extents(params)
     for signature in params:
         _wrap_buffer(signature, ctx)
-    ctx.emit_node(fn.body)
+    CudaEmitter(context=ctx).visit(fn.body)

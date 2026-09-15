@@ -166,7 +166,8 @@ def test_analyze_help_explains_topology_effects_and_assumptions(capsys) -> None:
     help_text = capsys.readouterr().out
     for family in ("compute-cost", "memory", "roofline", "performance"):
         assert family in help_text
-    assert "every level's per-unit share" in help_text
+    assert "logical" in help_text and "per-unit share" in help_text
+    assert "traffic" in help_text
     assert "global traffic is the device's and counted once" in help_text
     assert "is an observation, not a bound" in help_text
 
@@ -356,7 +357,7 @@ def test_named_provider_registers_only_decorated_targets_and_replays_them(
         "from tilefoundry.target import Target, register_target\n"
         "@dataclass(frozen=True)\n"
         "class _VendorBase(Target):\n"
-        "    pass\n"
+        "    topology_levels = ('core',)\n"
         "@register_target\n"
         "@dataclass(frozen=True)\n"
         "class VendorOne(_VendorBase):\n"
@@ -679,18 +680,6 @@ def test_analyze_binds_an_extent_on_a_root_that_reaches_a_child(tmp_path, capsys
     assert "leaf(" not in expanded
 
 
-def _shares_text(per_unit: list, topologies: list) -> str:
-    """One quantity's per-level shares, as the comment renders a dict."""
-    return ",".join(f"{name}:{value}" for name, value in zip(topologies, per_unit))
-
-
-def _bytes_shares_text(per_unit: list, topologies: list) -> str:
-    """The same for read/write pairs."""
-    return ",".join(
-        f"{name}:r{moved['read']}/w{moved['write']}" for name, moved in zip(topologies, per_unit)
-    )
-
-
 def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(tmp_path) -> None:
     source = Path(__file__).parents[1] / "fixtures" / "placed" / "moe_mega_kernel.py"
     selector = f"{source}:MoEMegaKernel"
@@ -712,7 +701,7 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(tmp_path) ->
     assert cli.main(["analyze", selector, str(operands_path), *flags, "--operands"]) == 0
     asked = operands_path.read_text(encoding="utf-8")
     assert "operands=" not in first
-    assert "operands=0:r30720/w0,result:r0/w30720" in asked
+    assert "operands=0:r30720/w0;result:r0/w30720" in asked
     assert (
         cli.main(["analyze", selector, str(operands_json_path), *flags, "--operands", "--json"])
         == 0
@@ -757,12 +746,14 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(tmp_path) ->
         f"# selection requested={','.join(payload['requested'])} "
         f"executed={','.join(payload['executed'])}",
         "# compute-cost "
-        f"flops=f32:{cost['flops']['f32']['total']}"
-        f"@{_shares_text(cost['flops']['f32']['per_unit'], cost['topologies'])}",
+        f"flops=f32:{cost['flops']['f32']['logical']}@logical,"
+        f"{cost['flops']['f32']['total']}@total,"
+        f"{cost['flops']['f32']['per_unit'][0]}@{payload['topology']}",
         "# traffic "
         f"traffic=gmem:r{moved['storage']['gmem']['total']['read']}"
-        f"/w{moved['storage']['gmem']['total']['write']}"
-        f"@{_bytes_shares_text(moved['storage']['gmem']['per_unit'], moved['topologies'])}",
+        f"/w{moved['storage']['gmem']['total']['write']}@total,"
+        f"r{moved['storage']['gmem']['per_unit'][0]['read']}"
+        f"/w{moved['storage']['gmem']['per_unit'][0]['write']}@{payload['topology']}",
         f"# peak-footprint=gmem:{peak[0]['peak_bytes']}",
         f"# roofline ideal-ns={bound['ideal_ns']} bound-by={bound['bound_by']}",
         "# performance root=MoEMegaKernel::experts "
@@ -770,13 +761,10 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(tmp_path) ->
         f"waves={summary['waves']}",
     ]
     assert payload["totals"]["flops"] == {
-        kind: value["total"] for kind, value in cost["flops"].items()
+        name: spread["total"] for name, spread in cost["flops"].items()
     }
     assert payload["totals"]["traffic"] == {
-        level: value["total"] for level, value in moved["storage"].items()
-    }
-    assert payload["totals"]["communication"] == {
-        level: value["total"] for level, value in moved["communication"].items()
+        name: value["total"] for name, value in moved["storage"].items()
     }
 
     hoisted = {line.split(" = ", 1)[0] for line in lines if " = Mesh((Topology(" in line}

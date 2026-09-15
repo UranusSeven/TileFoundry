@@ -194,6 +194,11 @@ class Cost:
     """
 
     @property
+    def ops(self) -> Mapping[str, int]:
+        """Program-work spelling for non-floating-point operation counts."""
+        return self.service
+
+    @property
     def bytes(self) -> int:
         """Every operand's traffic, in either direction."""
         return sum(moved.total_bytes for moved in self.traffic)

@@ -31,8 +31,8 @@ _NO_BOUND = 0
 
 
 def _totals(held) -> tuple[tuple[str, int], ...]:
-    """One category's kinds with their whole-program counts."""
-    return tuple((kind, spread.total) for kind, spread in held.kinds)
+    """One typed work category's whole-program counts."""
+    return tuple((name, spread.total) for name, spread in held.kinds)
 
 
 def _compute_ns(flops: tuple[tuple[str, int], ...], facts: ThroughputFacts) -> int:

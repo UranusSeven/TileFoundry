@@ -23,10 +23,12 @@ from tilefoundry.codegen.cuda.templates import render
 from tilefoundry.codegen.linkable import LinkableFunction, LinkableModule
 from tilefoundry.codegen.registry import CodeGenerator
 from tilefoundry.codegen.signature import CallableSignature
-from tilefoundry.codegen.topology import Geometry, coarsest_topology
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.tir.prim_function import PrimFunction
+from tilefoundry.ir.types.shape_helpers import static_dim_value
 from tilefoundry.target import Target
+
+Geometry = tuple[tuple[object, object, object], tuple[object, object, object]]
 
 
 def _emit_function(fn: PrimFunction, ctx: CudaCodegenContext) -> LinkableFunction:
@@ -56,9 +58,7 @@ def _define(
     _define_shim(shim, kernel, ctx)
 
 
-def _define_kernel(
-    fn: PrimFunction, kernel: CallableSignature, ctx: CudaCodegenContext
-) -> None:
+def _define_kernel(fn: PrimFunction, kernel: CallableSignature, ctx: CudaCodegenContext) -> None:
     """The ``__global__``: what it was told, then what it was written to do."""
     ctx.reset_barrier_ids()
     ctx.emit(f"__global__ void {kernel.name}({ctx.parameters(kernel)}) {{")
@@ -77,15 +77,10 @@ def _define_shim(
     ctx.emit(f'extern "C" void {shim.name}({ctx.parameters(shim, exported=True)}) {{')
     ctx.indent()
     _tell_the_block(shim, ctx)
-    grid_x, grid_y, grid_z, block_x, block_y, block_z, smem, stream = (
-        signature.name for signature in shim.trailing
-    )
-    ctx.emit(f"dim3 grid({grid_x}, {grid_y}, {grid_z});")
-    ctx.emit(f"dim3 block({block_x}, {block_y}, {block_z});")
-    ctx.emit(
-        f"{kernel.name}<<<grid, block, {smem}, (cudaStream_t){stream}>>>"
-        f"({kernel_arguments(kernel, ctx)});"
-    )
+    grid_x, block_x, smem = (signature.name for signature in shim.trailing)
+    ctx.emit(f"dim3 grid({grid_x}, 1, 1);")
+    ctx.emit(f"dim3 block({block_x}, 1, 1);")
+    ctx.emit(f"{kernel.name}<<<grid, block, {smem}, nullptr>>>({kernel_arguments(kernel, ctx)});")
     ctx.dedent()
     ctx.emit("}")
 
@@ -102,8 +97,7 @@ def _tell_the_block(shim: CallableSignature, ctx: CudaCodegenContext) -> None:
     for signature in shim.leading:
         scope = topology_scope_str(signature.topology_level)
         ctx.emit(
-            f"{PROGRAM_META.name}.program_id[int({scope})] = "
-            f"static_cast<int>({signature.name});"
+            f"{PROGRAM_META.name}.program_id[int({scope})] = static_cast<int>({signature.name});"
         )
 
 
@@ -143,9 +137,15 @@ def _program_dims(geometry: Geometry) -> list[dict[str, str]]:
     """
     grid, block = geometry
     dims = []
-    if grid[0] is not None:
-        dims.append({"scope": topology_scope_str("cta"), "count": str(math.prod(grid))})
-    dims.append({"scope": topology_scope_str("thread"), "count": str(math.prod(block))})
+    static_grid = tuple(static_dim_value(value) for value in grid)
+    if all(value is not None for value in static_grid):
+        dims.append({"scope": topology_scope_str("cta"), "count": str(math.prod(static_grid))})
+    elif static_grid[1:] != (1, 1):
+        raise ValueError("codegen: only grid.x may be a host-computed dynamic expression")
+    static_block = tuple(static_dim_value(value) for value in block)
+    if any(value is None for value in static_block):
+        raise ValueError("codegen: thread topology extents must be compile-time constants")
+    dims.append({"scope": topology_scope_str("thread"), "count": str(math.prod(static_block))})
     return dims
 
 
@@ -160,14 +160,14 @@ def emit_cuda_module(
     geometry = _one_geometry(kernels, ctx)
     preamble = render(
         "cuda_preamble.cu.j2",
-        program_topology=topology_scope_str(coarsest_topology(module)),
+        program_topology=topology_scope_str(
+            module.effective_topologies()[0].name if module.effective_topologies() else "cta"
+        ),
         program_dims=_program_dims(geometry),
-        dynamic_cta=geometry[0][0] is None,
+        dynamic_cta=static_dim_value(geometry[0][0]) is None,
         grid_barrier_state=ctx.needs_grid_barrier_state,
     )
-    return LinkableModule(
-        target="cuda", language="cu", preamble=preamble, functions=functions
-    )
+    return LinkableModule(target="cuda", language="cu", preamble=preamble, functions=functions)
 
 
 CUDA_CODE_GENERATOR = CodeGenerator(emit_cuda_module)

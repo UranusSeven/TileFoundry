@@ -14,23 +14,22 @@ from dataclasses import replace
 
 import pytest
 
-from tests.fixtures.placed.fused_boundary import FusedBoundary
 from tests.fixtures.placed.performance_findings import _CrossScopePerformance
 from tests.fixtures.placed.symbolic_offset import (
     _LiteralStoreOffset,
     _SymbolicStoreOffset,
 )
-from tests.fixtures.placed.tp_all_to_all import GPUS, SENT_BYTES, TransposeShard
 from tilefoundry import func, module
 from tilefoundry.analysis import (
+    Breakdown,
     ComputeCostMetadata,
     MemoryHierarchyFacts,
     MemoryMetadata,
-    ParallelCapacityFacts,
     PerformanceMetadata,
     PerformanceServiceFacts,
     PerformanceSummaryMetadata,
     RooflineMetadata,
+    Spread,
     ThroughputFacts,
     TrafficMetadata,
 )
@@ -39,7 +38,6 @@ from tilefoundry.analysis.compute_cost import (
     _local_duration_ns,
 )
 from tilefoundry.analysis.errors import AnalysisError
-from tilefoundry.analysis.metadata import Breakdown, Spread, shares
 from tilefoundry.dsl import ConstTensor, DimVar, Mesh, Tensor, Topology, tf
 from tilefoundry.ir.core import (
     Call,
@@ -235,9 +233,11 @@ def test_a_symbolic_store_stride_preserves_the_literal_control_result() -> None:
         bound = get_metadata(result.function, RooflineMetadata)
         summary = get_metadata(result.function, PerformanceSummaryMetadata)
         assert cost is not None and bound is not None and summary is not None
+        integer_ops = cost.other_ops.of("integer")
+        assert integer_ops is not None
         observed[name] = (
-            shares(cost.service, cost.topologies)["integer"],
-            shares(cost.service, cost.topologies, "cta")["integer"],
+            integer_ops.total,
+            integer_ops.per_unit[0],
             bound.ideal_ns,
             summary.timeline.end_ns - summary.timeline.start_ns,
         )
@@ -323,9 +323,11 @@ def test_a_matmul_counts_its_rows_once_whichever_axis_the_mesh_split() -> None:
         )
         cost = get_metadata(product, ComputeCostMetadata)
         summary = get_metadata(report.function, PerformanceSummaryMetadata)
+        bf16 = cost.flops.of("bf16")
+        assert bf16 is not None
         per_layout[name] = (
-            shares(cost.flops, cost.topologies)["bf16"],
-            shares(cost.flops, cost.topologies, "cta")["bf16"],
+            bf16.total,
+            bf16.per_unit[0],
             summary.timeline.end_ns,
         )
 
@@ -359,7 +361,7 @@ def test_a_program_whose_buffers_have_nowhere_to_sit_is_refused() -> None:
     held = get_metadata(
         analyze(_SharedTile, unrestated, analysis="memory").function, MemoryMetadata
     ).footprint
-    assert next(item.peak_bytes for item in held if item.memory_level == "smem") == 422_400
+    assert next(item.peak_bytes for item in held if item.level == "smem") == 422_400
 
     fits = analyze(
         roomy,
@@ -378,10 +380,10 @@ def test_a_program_whose_buffers_have_nowhere_to_sit_is_refused() -> None:
         analysis="memory",
     )
     assert [
-        (item.binding, item.memory_level, item.bytes, item.defined_at, item.last_used_at)
+        (item.binding, item.level, item.bytes, item.defined_at, item.last_used_at)
         for item in get_metadata(fits.function, MemoryMetadata).lifetimes
     ] == [
-        (item.binding, item.memory_level, item.bytes, item.defined_at, item.last_used_at)
+        (item.binding, item.level, item.bytes, item.defined_at, item.last_used_at)
         for item in get_metadata(relieved.function, MemoryMetadata).lifetimes
     ]
 
@@ -405,7 +407,8 @@ def test_a_price_is_refused_where_the_machine_states_no_rate_to_pay_it_at() -> N
     work = next(
         record
         for record in records
-        if record is not None and any(shares(record.flops, record.topologies, "cta").values())
+        if record is not None
+        and any(spread.per_unit[0] for _name, spread in record.flops.kinds)
     )
 
     with pytest.raises(
@@ -413,18 +416,17 @@ def test_a_price_is_refused_where_the_machine_states_no_rate_to_pay_it_at() -> N
         match=r"^performance: selected topology level 'thread', but the target's "
         r"one-unit throughputs are stated for 'cta'$",
     ):
-        _local_duration_ns(work, throughput, services, topology_level="thread")
+        _local_duration_ns(work, throughput, services, level="thread")
 
     with pytest.raises(AnalysisError, match=r"unknown compute dtype 'f9e9m9'"):
         _local_duration_ns(
             replace(
                 work,
-                topologies=("cta",),
-                flops=Breakdown((("f9e9m9", Spread(8, (8,))),)),
+                flops=Breakdown((*work.flops.kinds, ("f9e9m9", Spread(8, 8, (8,))))),
             ),
             throughput,
             services,
-            topology_level="cta",
+            level="cta",
         )
 
     crossed = TrafficMetadata(
@@ -433,7 +435,11 @@ def test_a_price_is_refused_where_the_machine_states_no_rate_to_pay_it_at() -> N
             (
                 (
                     throughput.bandwidth_level,
-                    Spread(TrafficBytes(read=4096), (TrafficBytes(read=4096),)),
+                    Spread(
+                        TrafficBytes(read=4096),
+                        TrafficBytes(read=4096),
+                        (TrafficBytes(read=4096),),
+                    ),
                 ),
             )
         ),
@@ -447,73 +453,5 @@ def test_a_price_is_refused_where_the_machine_states_no_rate_to_pay_it_at() -> N
             throughput,
             replace(services, unit_bandwidth=()),
             moved=crossed,
-            topology_level="cta",
+            level="cta",
         )
-
-
-def test_one_pass_states_the_work_at_every_level_and_prices_it_there() -> None:
-    """The numbers this program reports at each level it declares, not the relations.
-
-    One analysis states one unit's work at every declared level, and what one
-    unit gets through is the device peak over however many of that unit the
-    device holds, so a thread is priced far slower than a CTA for the same
-    share. Nothing here is sharded across ``thread``, so a thread repeats its
-    CTA's share rather than dividing it: asking at ``thread`` unrolls that
-    repetition into the whole-program total and leaves the shares alone.
-    """
-    function = FusedBoundary.entry_function()
-    reported = {}
-    for level in ("cta", "thread"):
-        result = analyze(FusedBoundary, function, analysis=("performance",), topology_level=level)
-        cost = get_metadata(result.function, ComputeCostMetadata)
-        summary = get_metadata(result.function, PerformanceSummaryMetadata)
-        reported[level] = {
-            "answered_at": result.topology_level,
-            "levels": cost.topologies,
-            "whole_program": shares(cost.flops, cost.topologies),
-            "per_cta": shares(cost.flops, cost.topologies, "cta"),
-            "per_thread": shares(cost.flops, cost.topologies, "thread"),
-            "end_ns": summary.timeline.end_ns,
-        }
-
-    assert reported == {
-        "cta": {
-            "answered_at": "cta",
-            "levels": ("cta", "thread"),
-            "whole_program": {"bf16": 576, "f32": 128},
-            "per_cta": {"bf16": 72, "f32": 16},
-            "per_thread": {"bf16": 72, "f32": 16},
-            "end_ns": 6,
-        },
-        "thread": {
-            "answered_at": "thread",
-            "levels": ("cta", "thread"),
-            "whole_program": {"bf16": 576, "f32": 2112},
-            "per_cta": {"bf16": 72, "f32": 16},
-            "per_thread": {"bf16": 72, "f32": 16},
-            "end_ns": 1849,
-        },
-    }
-    capacity = FusedBoundary.resolve_target().get_facts(ParallelCapacityFacts, "gpu")
-    assert capacity.parallel_units == 1, "a target that never said how many cards is one card"
-
-
-def test_a_reshard_that_changes_shards_says_what_left_the_card() -> None:
-    """Splitting one tensor two ways is an exchange, and it costs both resources.
-
-    What crosses is counted against the boundary it crossed, which no storage
-    level names: the data is global memory at both ends and has still gone to
-    another card. A unit inside the boundary is not one of the parties, so it
-    states no share of the crossing.
-    """
-    result = analyze(
-        TransposeShard, TransposeShard.entry_function(), analysis=("compute-cost", "memory")
-    )
-    moved = get_metadata(result.function, TrafficMetadata)
-
-    crossing = moved.communication.of("gpu")
-    assert crossing.total == TrafficBytes(read=SENT_BYTES * GPUS, write=SENT_BYTES * GPUS)
-    by_level = dict(zip(moved.topologies, crossing.per_unit, strict=True))
-    assert by_level["gpu"] == TrafficBytes(read=SENT_BYTES, write=SENT_BYTES)
-    assert by_level["cta"] == TrafficBytes()
-    assert moved.communication.of("cta") is None

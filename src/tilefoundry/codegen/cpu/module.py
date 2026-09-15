@@ -162,9 +162,9 @@ def _as_this_scope_names_it(
     states keep their names: the entry was told them under exactly those.
     """
     geometry = (
-        *(_extent(arg) for arg in launch.args[1:7]),
+        _extent(launch.args[1]),
+        _extent(launch.args[4]),
         str(_static_smem(launch.callable.dynamic_smem)),
-        "nullptr",
     )
     return replace(
         shim,
@@ -222,10 +222,7 @@ def _declare_callee(callee: PrimFunction, ctx: CpuCodegenContext) -> str:
     it cannot come to disagree about what the symbol takes.
     """
     shim = ctx.signature_of(callee)
-    return (
-        f'extern "C" void {shim.name}'
-        f"({ctx.parameters(shim, callee.target, exported=True)});"
-    )
+    return f'extern "C" void {shim.name}({ctx.parameters(shim, callee.target, exported=True)});'
 
 
 def _host_entry(
@@ -266,7 +263,7 @@ def emit_host_module(
     declarations: dict[str, str] = {}
     body_lines: list[str] = []
     for launch in _launch_statements(entry):
-        callee = module.lookup(launch.args[0].name)
+        callee = ctx.callee_of(launch)
         declarations[ctx.signature_of(callee).name] = _declare_callee(callee, ctx)
         body_lines += _one_launch(entry, launch, callee, ctx)
     return LinkableModule(
