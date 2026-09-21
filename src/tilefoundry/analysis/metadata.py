@@ -123,7 +123,7 @@ class TrafficMetadata(IRMetadata):
 
 @dataclass(frozen=True)
 class MemoryLevelFootprint:
-    """How much of one memory level a function needs at its peak.
+    """One level's solved high-water mark or largest logical value.
 
     ``persistent_bytes`` is the part that cannot be reclaimed within the
     function, so it is the floor the peak can never fall below.
@@ -174,7 +174,7 @@ class LoopFootprintMetadata(IRMetadata):
 
 @dataclass(frozen=True)
 class ValueLifetime:
-    """One value's residency, as positions in the function's definition order.
+    """One value's residency on the function's structured SSA event timeline.
 
     ``persistent`` marks a value that is resident for the whole function rather
     than until its last use. Every parameter is persistent because a function
@@ -199,10 +199,11 @@ class ValueLifetime:
 
 @dataclass(frozen=True)
 class AllocationMetadata:
-    """What showing this function's buffers fit took.
+    """What showing this function's addressable buffers fit took.
 
     Where any of them would sit is the solver's business and appears nowhere
-    here. What a reader can act on is whether the question was settled.
+    here. ``feasible`` means the first validated placement was returned without
+    claiming that its high-water mark is minimal.
     """
 
     solver_status: str
@@ -212,10 +213,10 @@ class AllocationMetadata:
 class MemoryMetadata(IRMetadata):
     """Record one function's memory behavior against a target hierarchy.
 
-    Function attachment reflects that peaks span all live ranges. Advisories
-    report cache working-set and order-dependent peak overflow; only a single
-    value exceeding an addressable level is an error because no schedule can
-    place it.
+    Function attachment reflects that peaks span all live ranges. ``errors``
+    reports a solved placement whose high-water exceeds stated capacity without
+    suppressing the rest of the analysis result. Advisories carry lower-severity
+    capacity findings.
 
     ``allocation`` is absent when the function has no addressable buffer to
     place at the level being analysed, which is a different answer from having
@@ -224,6 +225,7 @@ class MemoryMetadata(IRMetadata):
 
     footprint: tuple[MemoryLevelFootprint, ...] = ()
     lifetimes: tuple[ValueLifetime, ...] = ()
+    errors: tuple[str, ...] = ()
     advisories: tuple[str, ...] = ()
     allocation: "AllocationMetadata | None" = None
 

@@ -272,7 +272,8 @@ class MemoryLevelFootprint:
 
     Attributes:
         memory_level: attribute; The memory level name.
-        peak_bytes: attribute; The largest simultaneous claim on the level.
+        peak_bytes: attribute; The solved address high-water mark for gmem/smem,
+            or the largest single logical value for rmem.
         persistent_bytes: attribute; The part that cannot be reclaimed.
         capacity_bytes: attribute; The stated capacity, or None when unknown.
     """
@@ -333,7 +334,7 @@ class AllocationMetadata:
     """What showing this function's buffers fit came to.
 
     Attributes:
-        solver_status: attribute; `"optimal"` or `"feasible"`.
+        solver_status: attribute; `"feasible"` for the first validated placement.
     """
 
     solver_status: str
@@ -344,12 +345,14 @@ class MemoryMetadata(IRMetadata):
     Attributes:
         footprint: attribute; One row per level the function places values in.
         lifetimes: attribute; One entry per value residency.
+        errors: attribute; Solved placement peaks that exceed stated capacity.
         advisories: attribute; Capacity findings that do not invalidate the program.
         allocation: attribute; What showing the addressable buffers fit came to.
     """
 
     footprint: tuple[MemoryLevelFootprint, ...] = ()
     lifetimes: tuple[ValueLifetime, ...] = ()
+    errors: tuple[str, ...] = ()
     advisories: tuple[str, ...] = ()
     allocation: AllocationMetadata | None = None
 ```
@@ -376,13 +379,16 @@ anything; it does not say how much, and an Op with no relation fails closed.
     it empty.
 
 Capacity is settled against the authored definition order, which fixes every
-buffer's lifetime before any of them is measured, so the only open question is
-whether the ones live at once fit together. An arrangement answers that question
-without being reported: no address or per-value buffer identity is a conclusion
-of this analysis.
+buffer's lifetime before any of them is measured. For `gmem` and `smem`, exact
+polyhedral access relations may let the solver overlap a dead pointwise operand
+with its result or embed an `insert_slice` update in its result. Every logical
+SSA box remains in the model, including outside the container's lifetime. The
+concrete arrangement is not reported: no address or per-value buffer identity
+is a conclusion of this analysis. `rmem` is not address-solved and reports only
+the largest single projected logical value.
 
 - constraints:
-  - Capacity MUST be settled for the addressable levels `gmem` and `smem` only,
+  - Placement MUST be settled for the addressable levels `gmem` and `smem` only,
     once per capacity domain that holds a buffer -- the whole target for a level
     owned target-wide, one per owning position otherwise -- with two buffers in
     one domain never live in the same bytes at once. Residency at another level
@@ -392,12 +398,13 @@ of this analysis.
   - `allocation` MUST be absent only when no level could be projected against. A
     function with nothing addressable MUST record a settled `allocation`: the
     question was asked and there was nothing to decide. An attached
-    `solver_status` MUST be `"optimal"` or `"feasible"`; a domain that cannot
-    fit, cannot be expressed, or does not settle in time MUST raise
-    `AnalysisError` saying which of the three happened and leave no record. A
-    domain that fits at once MUST be settled without searching, and one whose
-    simultaneously live bytes exceed the capacity MUST be refused without
-    searching.
+    `solver_status` MUST be `"feasible"`; a domain that cannot be expressed or
+    does not settle in time MUST raise `AnalysisError` and leave no record. The
+    solver MUST stop at its first feasible assignment rather than spend the
+    remaining timeout proving a minimum. Its reported peak is that assignment's
+    actual address high-water mark, not a mathematical optimum. Capacity MUST
+    NOT restrict that address space: after solving, a high-water mark above
+    capacity MUST add a non-fatal `errors` entry and preserve the complete result.
   - Every `Spread` MUST state a share for each declared topology level, not
     only for the level the call selected, and the record MUST name those
     levels once in `topologies` rather than beside each share.
@@ -438,19 +445,29 @@ of this analysis.
 | `ValueLifetime.binding` | Use the parameter or binding name, suffixed with `:` and the line of the value's source span when it has one. Repeated names already differ by the printer's numeric suffix in definition order; the line locates the row in authored source, which a suffix cannot. A value with neither name nor span is `<value N>` in definition order. | No |
 | `ValueLifetime.memory_level` | Emit one lifetime per storage level occupied by the value's Type. | No |
 | `ValueLifetime.bytes` | Project the Type through every authored split at or coarser than the explicit level's `owner`, then take its logical bytes; a target-owned or undeclared level remains global. | `MemoryHierarchyFacts.explicit_levels[].owner` |
-| `ValueLifetime.defined_at` | Position in the order of parameters followed by body Calls and Constants in SSA postorder. | No |
-| `ValueLifetime.last_used_at` | Greatest recorded consumer position; the last position for a parameter, and also for the Function body when that body is itself a recorded value. | No |
+| `ValueLifetime.defined_at` | Definition event on the function-wide structured SSA timeline. | No |
+| `ValueLifetime.last_used_at` | Greatest ordinary-consumer, region-entry, loop-backedge, or region-exit use event; the final timeline event for a parameter. | No |
 | `ValueLifetime.persistent` | True for parameters and false for body allocations. | No |
 | `MemoryLevelFootprint.memory_level` | Each storage level with at least one lifetime, sorted by name. | No |
-| `MemoryLevelFootprint.peak_bytes` | Largest sum of simultaneously live bytes at that level over the value order. | No |
+| `MemoryLevelFootprint.peak_bytes` | For `gmem` and `smem`, the address high-water mark of the first feasible whole-Function placement. Exact pointwise relations and exact `insert_slice` partitions may permit overlap; widened or unknown relations do not. For `rmem`, the largest single projected logical value, without address placement or cross-value summation. | No |
 | `MemoryLevelFootprint.persistent_bytes` | Sum of persistent lifetimes at that level. | No |
 | `MemoryLevelFootprint.capacity_bytes` | Capacity of the matching explicit level, or `None` when it is unknown or undeclared. | `MemoryHierarchyFacts.explicit_levels[].capacity_bytes` |
 | `MemoryMetadata.footprint` | One `MemoryLevelFootprint` per occupied storage level. | As above |
 | `MemoryMetadata.lifetimes` | Every value residency except a `Reshape` or a `Transpose`, each of which describes bytes its operand already holds. | As above |
-| `MemoryMetadata.advisories` | Explicit peak overflow, cache/shared-capacity division, and same-scope authored-loop access-footprint findings. | `MemoryHierarchyFacts` |
+| `MemoryMetadata.errors` | One non-fatal error for each solved `gmem` or `smem` placement whose `peak_bytes` exceeds stated `capacity_bytes`; this includes a single value larger than capacity. | `MemoryHierarchyFacts.explicit_levels[].capacity_bytes` |
+| `MemoryMetadata.advisories` | Cache/shared-capacity division and same-scope authored-loop access-footprint findings. | `MemoryHierarchyFacts` |
 | `TrafficMetadata.storage` | One occurrence's per-boundary movement asked of the Op's access relations, charged to the storage levels its operand Types name. The total is asked in the whole program's window and each level's share in that level's, over Types projected through the authored `Split`s at or coarser than it. On a Function, summed over every reachable occurrence, each counted as often as its authored loops repeat it. A Type with leaves at several levels keeps those leaf bytes separate. A `UMAT` leaf has no residency of its own: when it appears in `Call.args`, charge its own bytes at the target's established `rmem` materialization level; when it appears only in an Op attribute, charge nothing. A Function Call takes the callee's grouped total. | No; projection reads resolved Mesh and effective Module topology extents. |
 | `TrafficMetadata.communication` | What a Reshard sends off the unit it was on, when the shards on its two sides differ across a mesh axis that level owns. Zero where they agree. | No; the share each unit keeps follows from the mesh extents the shards name. |
 | `TrafficMetadata.operands` | One occurrence's per-boundary movement in order `(*call.args, call)`, the same relation-derived amounts `storage` groups. Empty on a Function and on a Function Call, neither of which has a split. | No |
+
+One ordinary expression event uses its operands and defines its result. A region
+adds separate binding and exit events: a mesh argument is used before its
+parameter is defined, and a loop initial value is used before its induction and
+carried parameters are defined. One representative loop-body iteration is
+recorded without expanding the trip count; a carried parameter spans entry to
+exit, and a yielded value remains live through the backedge event. Event
+positions are monotonic across the whole Function, including nested and sibling
+regions.
 
 The target-aware loop projection is report data rather than another metadata
 record. `LoopFootprintMetadata` remains target-independent:
@@ -542,16 +559,17 @@ line per advisory:
 ```text
 traffic traffic=<memory-level>:r<int>/w<int>@total,r<int>/w<int>@<topology>[,...][;<memory-level>:...]
 peak-footprint=<level>:<int>[,<level>:<int>...]
+error="<text>"
 advisory="<text>"
 ```
 
-An empty footprint states the family name alone; each advisory is its own line
-and is quoted and escaped
+An empty footprint states the family name alone; each error and advisory is its
+own line and is quoted and escaped
 ([inspection §2.8](./inspection.md#28-record-comment-forms)). The record's own
 comment form projects the footprint it holds, and `lifetimes` is read from JSON:
 
 ```text
-memory peak=<level>:<int>[,...] persistent=<int> advisories=<int>
+memory peak=<level>:<int>[,...] persistent=<int> errors=<int> advisories=<int>
 ```
 
 Every measured Call also receives a `traffic` annotation, whose `operands` split
@@ -575,6 +593,7 @@ attached only to the Function. Its full JSON projection is under
  "lifetimes": [{"binding": <name>, "memory_level": <level>, "bytes": <int>,
                 "defined_at": <int>, "last_used_at": <int>,
                 "persistent": <bool>}, ...],
+ "errors": [<text>, ...],
  "advisories": [<text>, ...]}
 ```
 
@@ -612,10 +631,10 @@ attached only to the Function. Its full JSON projection is under
     owner.
   - Analysis MUST NOT infer memory ownership from a storage level's name or
     capacity scope.
-  - One value exceeding an explicit level's capacity MUST raise `AnalysisError`.
-    An aggregate explicit peak or an authored-loop access footprint exceeding an
-    implicit cache capacity MUST instead produce an advisory and MUST NOT fail
-    the call.
+  - A solved explicit-level peak exceeding capacity, whether from one value or
+    the aggregate placement, MUST produce a report `error` and MUST NOT fail the
+    call. An authored-loop access footprint exceeding an implicit cache capacity
+    MUST instead produce an advisory.
 
 #### 1.2.3 `roofline`
 

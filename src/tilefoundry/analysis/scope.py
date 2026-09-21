@@ -43,6 +43,7 @@ class Access:
 
     relation: isl.map
     buffer: Expr
+    exact: bool = True
 
 
 @dataclass(eq=False)
@@ -55,6 +56,7 @@ class Scope:
     depth: int
     domain: isl.set
     accesses: dict[str, dict[int, tuple[Call, tuple[Access, ...]]]] = field(default_factory=dict)
+    outputs: dict[str, dict[int, tuple[Call, tuple[Access, ...]]]] = field(default_factory=dict)
     relations: dict[int, tuple[Call, AccessRelations]] = field(default_factory=dict)
     refused: dict[str, frozenset[Call]] = field(default_factory=dict)
     _variance: dict[int, frozenset[int]] = field(default_factory=dict, repr=False)
@@ -277,6 +279,7 @@ def _bind_access(
     narrow: bool,
 ) -> Access | None:
     relation = relation_of(boundary.pattern)
+    exact = True
     loops = []
     cursor = scope
     while cursor is not None:
@@ -301,6 +304,7 @@ def _bind_access(
                 term = None
             if term is None:
                 term = _widest_allowed(relation, name, operand.type)
+                exact = False
             if term is None:
                 relation = relation.project_out(isl.dim_type.PARAM, 0, 1)
                 continue
@@ -336,7 +340,9 @@ def _bind_access(
         folded = renaming_relation(operand, ctx, stated=scope.stated_relations(operand, ctx))
         relation = relation.apply_range(relation_of(folded))
         operand = operand.args[0]
-    return Access(relation, operand)
+    if relation.dim(isl.dim_type.PARAM):
+        exact = False
+    return Access(relation, operand, exact)
 
 
 def build_scopes(
@@ -381,6 +387,12 @@ def build_scopes(
                 if access is not None:
                     built.append(access)
             scope.accesses.setdefault(view, {})[id(expr)] = (expr, tuple(built))
+            written: list[Access] = []
+            for boundary in local_relations.outputs:
+                access = _bind_access(expr, expr, boundary, scope, type_ctx, narrow=narrow)
+                if access is not None:
+                    written.append(access)
+            scope.outputs.setdefault(view, {})[id(expr)] = (expr, tuple(written))
 
     def record_variance(expr: Expr, operands: tuple[Expr, ...]) -> None:
         changing: set[int] = set()
