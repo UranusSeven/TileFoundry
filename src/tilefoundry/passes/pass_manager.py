@@ -16,6 +16,8 @@ from tilefoundry.ir.hir.function import Function as HirFunction
 from tilefoundry.ir.hir.verify import verify_function as verify_hir_function
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.verify import verify_prim_function
+from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
+from tilefoundry.visitor_registry.typeinfer import inference_type
 
 from .pass_base import Pass
 
@@ -52,8 +54,14 @@ class PassManager:
                 continue
             if isinstance(fn, HirFunction):
                 verify_hir_function(fn)
+                inference_type(
+                    fn,
+                    TypeInferContext(scope=FunctionScope(curr, fn)),
+                    ranges=True,
+                )
             elif isinstance(fn, PrimFunction):
                 verify_prim_function(fn, module_fns=curr)
+
     def _check_requires(self) -> None:
         seen: set[str] = set()
         for p in self.passes:

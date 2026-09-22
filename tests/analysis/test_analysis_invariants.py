@@ -45,6 +45,7 @@ from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.pattern import Tensor as TensorPattern
 from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
 from tilefoundry.ir.hir.tensor.slice import Slice as SliceOp
+from tilefoundry.ir.isl_interop import index_set
 from tilefoundry.ir.types import (
     DType,
     TensorType,
@@ -61,7 +62,6 @@ from tilefoundry.visitor_registry.access_relation import (
     AffineAccess,
     BoundaryRelation,
     access_relation_registry,
-    index_set,
     local_relations_of,
     relation_of,
     relations_of,

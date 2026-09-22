@@ -11,8 +11,9 @@ answer for -- it only lets the ones it owns be asked about at a size.
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
+import isl
 import pytest
 
 from tests.fixtures.placed.gqa_decode import GqaOnline
@@ -31,9 +32,10 @@ from tilefoundry.analysis import (
     TrafficMetadata,
     analyze,
 )
-from tilefoundry.analysis.compute_cost import _local_duration_ns
+from tilefoundry.analysis.access import Access, AccessPrecision
+from tilefoundry.analysis.compute_cost import local_duration_ns
 from tilefoundry.analysis.errors import AnalysisError
-from tilefoundry.analysis.scope import build_scopes, walk_scopes
+from tilefoundry.analysis.iteration_scope import IterationScope, build_scopes, walk_scopes
 from tilefoundry.ir.core import Call, describe_expr, get_metadata
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
@@ -42,6 +44,7 @@ from tilefoundry.ir.hir.specialize import (
     residual_dims,
     variant_for,
 )
+from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
 from tilefoundry.ir.types.shard import (
     Topology,
 )
@@ -53,6 +56,16 @@ DIMS = {"ctx_len": CONTEXT}
 FAMILIES = ("compute-cost", "memory", "roofline", "performance")
 CASES = placed_cases()
 INVENTORY = [pytest.param(case, id=case.id) for case in CASES]
+
+
+@dataclass(frozen=True)
+class _PersistentScheduleExpectation:
+    loop_trips: tuple[tuple[str, int], ...]
+    store_loop: str
+    store_precision: AccessPrecision
+    compared_units: tuple[tuple[int, ...], tuple[int, ...]]
+
+
 EXPECTED_MEMORY_PEAKS = {
     "derived_prefill.DerivedPrefill.prefill[prefill_n=64,topology_only=128]": {
         "gmem": 288,
@@ -137,10 +150,20 @@ EXPECTED_MEMORY_PEAKS = {
         "rmem": 16_384,
     },
     "performance_findings.LocalTier.kernel[static]": {"gmem": 68_096, "rmem": 512},
+    "persistent_gemm_flat.PersistentGemmFlat.gemm[static]": {
+        "gmem": 2_375_680,
+        "rmem": 16_384,
+        "smem": 12_288,
+    },
+    "persistent_gemm_tiled.PersistentGemmTiled.gemm[static]": {
+        "gmem": 2_375_680,
+        "rmem": 16_384,
+        "smem": 12_288,
+    },
     "prefill_decode_attention.PrefillDecodeAttention.attend[ctx=128,seq=128]": {
         "gmem": 1_310_720,
         "rmem": 0,
-        "smem": 245_760,
+        "smem": 229_376,
     },
     "qwen3_1_7b_pd.PrefillLayer.layer_decode[ctx_len=128,seq=128]": {
         "gmem": 145_933_316,
@@ -199,8 +222,61 @@ EXPECTED_MEMORY_PEAKS = {
     "tp_all_to_all.TransposeShard.transpose_shard[static]": {"gmem": 256},
     "weighted_twin.Weighted.scaled[static]": {"gmem": 1_348, "rmem": 4},
 }
+EXPECTED_PERSISTENT_SCHEDULES = {
+    "persistent_gemm_flat.PersistentGemmFlat.gemm[static]": _PersistentScheduleExpectation(
+        loop_trips=(("t", 4), ("ki", 4)),
+        store_loop="t",
+        store_precision=AccessPrecision.WIDENED,
+        compared_units=((0,), (1,)),
+    ),
+    "persistent_gemm_tiled.PersistentGemmTiled.gemm[static]": _PersistentScheduleExpectation(
+        loop_trips=(("mi", 2), ("ni", 2), ("ki", 4)),
+        store_loop="ni",
+        store_precision=AccessPrecision.EXACT,
+        compared_units=((0, 0), (1, 0)),
+    ),
+}
 
 assert set(EXPECTED_MEMORY_PEAKS) == {case.id for case in CASES}
+assert set(EXPECTED_PERSISTENT_SCHEDULES) <= {case.id for case in CASES}
+
+
+def _loop_scopes(result: AnalysisResult) -> dict[str, IterationScope]:
+    return {
+        scope.owner.induction_var.name: scope
+        for scope in walk_scopes(build_scopes(result.module, result.function))
+        if isinstance(scope.owner, LoopRegion)
+    }
+
+
+def _insert_slice_output(scope: IterationScope) -> Access:
+    for call, accesses in scope.outputs.get("narrow", {}).values():
+        if isinstance(call.target, InsertSlice):
+            assert len(accesses) == 1
+            return accesses[0]
+    raise AssertionError("loop has no InsertSlice output")
+
+
+def _at_unit(image: isl.set, coordinates: tuple[int, ...]) -> isl.set:
+    assert image.dim(isl.dim_type.PARAM) == len(coordinates)
+    for axis, coordinate in enumerate(coordinates):
+        image = image.fix_si(isl.dim_type.PARAM, axis, coordinate)
+    return image
+
+
+def _assert_persistent_schedule(
+    result: AnalysisResult,
+    expected: _PersistentScheduleExpectation,
+) -> None:
+    scopes = _loop_scopes(result)
+    for name, trips in expected.loop_trips:
+        assert scopes[name].trips() == trips
+
+    store = _insert_slice_output(scopes[expected.store_loop])
+    assert store.precision is expected.store_precision
+    written = store.relation.range()
+    first, second = (_at_unit(written, unit) for unit in expected.compared_units)
+    assert first.is_disjoint(second)
 
 
 def _aimed():
@@ -249,7 +325,7 @@ def assert_performance_contract(result: AnalysisResult) -> None:
             continue
         cost = get_metadata(expr, ComputeCostMetadata)
         assert cost is not None
-        duration = _local_duration_ns(
+        duration = local_duration_ns(
             cost,
             throughput,
             services,
@@ -408,6 +484,9 @@ def test_every_concrete_program_predicts_coherently(case: ConcreteCase) -> None:
     assert placement is not None
     observed = {item.level: item.peak_bytes for item in placement.footprint}
     assert observed == EXPECTED_MEMORY_PEAKS[case.id]
+    expected_schedule = EXPECTED_PERSISTENT_SCHEDULES.get(case.id)
+    if expected_schedule is not None:
+        _assert_persistent_schedule(result, expected_schedule)
 
 
 @pytest.mark.parametrize("family", FAMILIES)

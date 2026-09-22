@@ -25,6 +25,7 @@ from tilefoundry.ir.constraints import (
 from tilefoundry.ir.constraints.layout import _LAYOUT_WILDCARD
 from tilefoundry.ir.core import (
     BindingMetadata,
+    RangeMetadata,
     attach_metadata,
     get_metadata,
 )
@@ -3162,6 +3163,7 @@ class MeshCoordinatePattern(ElementPattern):
             return cached
         index = _constant(axis)
         coordinate = _infer_call(runtime.MeshCoord(mesh=mesh), (index,), context)
+        attach_metadata(coordinate, RangeMetadata(0, extent))
         context.function.state.mesh_coordinates[cache_key] = coordinate
         return coordinate
 
@@ -3856,7 +3858,14 @@ class LoopIteratorPattern(ElementPattern):
                     FieldPattern("keywords", SequencePattern()),
                     FieldPattern(
                         "args",
-                        SequencePattern(AstNodePattern(ast.expr), AstNodePattern(ast.expr)),
+                        ChoicePattern(
+                            SequencePattern(AstNodePattern(ast.expr), AstNodePattern(ast.expr)),
+                            SequencePattern(
+                                AstNodePattern(ast.expr),
+                                AstNodePattern(ast.expr),
+                                AstNodePattern(ast.expr),
+                            ),
+                        ),
                     ),
                 ),
                 pattern_id="loop.iterator.tile",
@@ -3895,6 +3904,34 @@ class LoopIteratorPattern(ElementPattern):
     RULES: ClassVar[tuple[AstRule[Any], ...]] = ()
 
 
+def _mentions_mesh_coordinate(node: ast.AST, context: MatchContext) -> bool:
+    """Whether *node* references a mesh bound in the active lexical scope."""
+    for subnode in ast.walk(node):
+        if not isinstance(subnode, ast.Attribute) or not isinstance(subnode.value, ast.Name):
+            continue
+        if isinstance(context.lexical_scope.lookup(subnode.value.id), runtime.Mesh):
+            return True
+    return False
+
+
+def _iterator_arity_failure(
+    kind: str, count: int, node: ast.Call
+) -> PatternFailure | None:
+    """Describe an invalid tile/range arity, if this call has one."""
+    if count in ({2, 3} if kind == "tile" else {1, 2, 3}):
+        return None
+    if kind == "tile" and count == 1:
+        detail = "tile(extent) is not supported; use range(extent)"
+    elif kind == "tile":
+        detail = (
+            "tile() takes 2 or 3 arguments, (stop, step) or "
+            f"(start, stop, step), got {count}"
+        )
+    else:
+        detail = f"range() takes 1 to 3 arguments, got {count}"
+    return PatternFailure("loop_header", node, detail)
+
+
 class LoopHeaderPattern(ElementPattern):
     element_name = "loop_header"
     syntax = LazyPattern(
@@ -3916,6 +3953,14 @@ class LoopHeaderPattern(ElementPattern):
             LoopHeaderPattern._bind,
         )
     )
+
+    @staticmethod
+    def _bound_pattern(node: ast.AST, context: MatchContext) -> AstPattern[Any]:
+        if context.function is not None and context.function.dialect == "tir":
+            return ChoicePattern(ExpressionPattern(), StaticValuePattern())
+        if _mentions_mesh_coordinate(node, context):
+            return ExpressionPattern()
+        return StaticValuePattern()
 
     def match(self, node: object, context: MatchContext) -> AstMatch[Any] | MatchFailure | None:
         """Name the invalid iterator before the shape-exact syntax rejects it.
@@ -3943,14 +3988,8 @@ class LoopHeaderPattern(ElementPattern):
                     node.iter,
                     "tile()/range() does not accept keyword args (positional-only at the IR level)",
                 )
-            if (kind == "tile" and count != 2) or (kind == "range" and count not in {1, 2, 3}):
-                if kind == "tile" and count == 1:
-                    detail = "tile(extent) is not supported; use range(extent)"
-                elif kind == "tile":
-                    detail = f"tile() takes 2 arguments (extent, step), got {count}"
-                else:
-                    detail = f"range() takes 1 to 3 arguments, got {count}"
-                return PatternFailure("loop_header", node.iter, detail)
+            if failure := _iterator_arity_failure(kind, count, node.iter):
+                return failure
         return super().match(node, context)
 
     @staticmethod
@@ -3969,21 +4008,14 @@ class LoopHeaderPattern(ElementPattern):
                 node.iter,
                 "tile()/range() does not accept keyword args (positional-only at the IR level)",
             )
-        if (kind == "tile" and count != 2) or (kind == "range" and count not in {1, 2, 3}):
-            if kind == "tile" and count == 1:
-                detail = "tile(extent) is not supported; use range(extent)"
-            elif kind == "tile":
-                detail = f"tile() takes 2 arguments (extent, step), got {count}"
-            else:
-                detail = f"range() takes 1 to 3 arguments, got {count}"
-            return PatternFailure(
-                "loop_header",
-                node.iter,
-                detail,
-            )
-        if kind == "tile":
+        if failure := _iterator_arity_failure(kind, count, node.iter):
+            return failure
+        if kind == "tile" and count == 2:
             fields = ("extent", "step")
             defaults = {"start": 0}
+        elif kind == "tile":
+            fields = ("start", "extent", "step")
+            defaults = {}
         elif count == 1:
             fields = ("extent",)
             defaults = {"start": 0, "step": 1}
@@ -4004,9 +4036,7 @@ class LoopHeaderPattern(ElementPattern):
         children.extend(
             AstChild(
                 field_name,
-                ChoicePattern(ExpressionPattern(), StaticValuePattern())
-                if context.function is not None and context.function.dialect == "tir"
-                else StaticValuePattern(),
+                LoopHeaderPattern._bound_pattern(argument, context),
                 argument,
                 "loop_bound",
                 field_name,

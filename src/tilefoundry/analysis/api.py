@@ -13,11 +13,11 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from tilefoundry.analysis.check import _resolve_program_geometry, check_program
+from tilefoundry.analysis.check import check_program, resolve_program_geometry
 from tilefoundry.analysis.errors import AnalysisError
+from tilefoundry.analysis.iteration_scope import ScopeBuilder
 from tilefoundry.analysis.registry import Analyzer
 from tilefoundry.analysis.report import render_json, report_data
-from tilefoundry.analysis.scope import ScopeBuilder
 from tilefoundry.analysis.visitor import AnalyzeContext
 from tilefoundry.dump import DumpFlags, dump
 from tilefoundry.ir.core import IRMetadata
@@ -141,7 +141,7 @@ def analyze(
     roots = _roots(analysis)
     result_module = module
     try:
-        module, function = _resolve_program_geometry(
+        module, function = resolve_program_geometry(
             module,
             function,
             dims,

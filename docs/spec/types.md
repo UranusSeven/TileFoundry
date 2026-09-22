@@ -525,8 +525,31 @@ def ceildiv(a, b) -> Expr:
   - `is_dim_expr` MUST accept non-boolean integers, `DimVar`, integer-valued
     `Constant`, and recursively valid calls to the seven dimension arithmetic
     operations, and MUST reject other values.
+  - `has_symbolic_dims(value)` MUST report whether a `DimVar` is reachable, not
+    whether dimension arithmetic contains a runtime `Expr`. A dimension call
+    recursively checks its operands; non-dimension expressions do not become
+    symbolic merely by participating in that arithmetic.
   - `ceildiv(a, b)` MUST compose the existing add, subtract, and floor-divide
     operations; it does not introduce a distinct Op.
+  - `ir.types.dim` MUST own dimension IR definitions, construction, and
+    structural predicates without depending on isl. `ir.isl_interop` MUST own
+    conversion between dimension and shape IR values and isl, affine
+    normalization, shape-domain construction, and conservative value-range
+    queries.
+  - `dim_to_isl_expr` MUST render one dimension expression while registering
+    its leaf parameters; `isl_to_dim` MUST decode an isl affine expression using
+    that parameter map. `shape_to_isl_domain` MUST return one shape's iteration
+    domain and parameter map.
+  - `index_set` MUST be the non-negative, all-literal shape specialization of
+    `shape_to_isl_domain`. It MUST return `None` for a negative, boolean, or
+    non-literal extent rather than constructing a symbolic or empty domain.
+  - `dim_range(value)` MUST return conservative half-open bounds from
+    `RangeMetadata` before attempting structural dimension arithmetic. A value
+    with neither stored nor structurally derivable bounds returns `None`.
+    Unsupported symbolic divisors remain an error rather than an unknown range.
+  - A bounded non-dimension `Expr` leaf in dimension arithmetic MUST become one
+    identity-deduplicated isl parameter carrying its stored bounds. An unbounded
+    leaf remains an unconstrained parameter for consumers that permit one.
 
 ---
 

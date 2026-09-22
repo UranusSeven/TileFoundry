@@ -63,6 +63,10 @@ class Function(Expr):
     rules are stated below.
   - mutable during the compiler's authorised typing, metadata, and specialization updates;
     fields that are not updated retain structural equality and hashing semantics.
+  - value-range metadata is refreshed by a non-type-writing whole-function
+    inference walk. Parser construction MAY attach an already-proved range to a leaf
+    whose value is fixed by lexical geometry; `MeshCoord` uses its concrete mesh
+    axis extent for this purpose.
   - a `Function` MUST NOT declare or override execution context. The `Module`
     that owns it declares the `Target` and the ordered `Topology` hierarchy its
     body runs against ([core-ir §1](./core-ir.md#1-module)).
@@ -360,14 +364,15 @@ binds a parser-side Python `slice`, while `range` binds a scalar; see
 [parser §2.1](./parser.md#21-syntax)). `range` is not unrolled. `induction_var` ranges
 over `range(start, extent, step)`: `start` and `extent` are the **half-open**
 `[start, extent)` Python-range endpoints (so `extent` is the **stop** value,
-not a count). `start` defaults to `0` (`tile(...)` and `range(stop)`); the
-`range(start, stop[, step])` surface sets it. Each of `start` / `extent` /
-`step` is a `ShapeDim` ([types §4](./types.md#4-dim--symbolic-shape-dimensions)).
+not a count). `start` defaults to `0` for `tile(stop, step)` and `range(stop)`;
+the `tile(start, stop, step)` and `range(start, stop[, step])` surfaces set it.
+Each of `start` / `extent` / `step` is a `ShapeDim`
+([types §4](./types.md#4-dim--symbolic-shape-dimensions)).
 
-For a two-argument `tile(extent, step)`, the parser-side window at one
-iteration is `[induction_var, induction_var + step)`. The induction value is
-already a coordinate in `range(0, extent, step)`, not an ordinal to multiply by
-`step`.
+For `tile(stop, step)` or `tile(start, stop, step)`, the parser-side window at
+one iteration is `[induction_var, induction_var + step)`. The induction value
+is already a coordinate in `range(start, stop, step)`, not an ordinal to
+multiply by `step`.
 
 - When `start` / `extent` / `step` are static `int`, the trip count is
   recoverable from the node alone, without the parser-side window binding
@@ -1686,4 +1691,6 @@ def is_concrete(fn: Function) -> bool:
     re-pointed instead would answer both with whichever was written last.
   - `residual_dims` and `dim_vars_reached` MUST inspect the whole function
     graph, including signatures, bodies, Op attributes, loop bounds, variants,
-    and called functions. `is_concrete` additionally checks the return type.
+    and called functions. `is_concrete` additionally checks the return type and
+    is false exactly when a reachable required extent still contains a `DimVar`;
+    runtime values without a `DimVar` are rejected later by their consumer.

@@ -6,7 +6,7 @@ import copy
 
 import pytest
 
-import tilefoundry.ir.types.dim_isl as dim_isl
+import tilefoundry.ir.isl_interop as isl_interop
 import tilefoundry.ir.types.substitute as dim_substitute
 from tilefoundry.ir.core import Tuple, TypeInferContext
 from tilefoundry.ir.core.expr import Call, Constant, Var
@@ -29,7 +29,7 @@ from tilefoundry.ir.types.dim import (
 )
 from tilefoundry.ir.types.shard import ComposedLayout, Layout, Mesh, ShardLayout, Topology
 from tilefoundry.ir.types.shard.shard_layout import Broadcast
-from tilefoundry.visitor_registry.visitors import TypeInferVisitor
+from tilefoundry.visitor_registry.typeinfer import TypeInferVisitor
 
 
 def _i64(v: int) -> Constant:
@@ -265,7 +265,7 @@ def test_static_op_attributes_do_not_enter_dim_normalization(
     def fail_if_called(_):
         raise AssertionError("static attributes must not enter isl normalization")
 
-    monkeypatch.setattr(dim_isl, "normalize_dim", fail_if_called)
+    monkeypatch.setattr(isl_interop, "normalize_dim", fail_if_called)
 
     assert Reshape(new_shape=(8, 16)).new_shape == (8, 16)
 

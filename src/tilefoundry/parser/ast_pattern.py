@@ -48,6 +48,7 @@ from tilefoundry.ir.hir.tensor.arange import Arange
 from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.slice import Slice, slice_size
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
+from tilefoundry.ir.isl_interop import normalize_dim
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.shape import ShapeOf
 from tilefoundry.ir.tir.stmts import (
@@ -73,7 +74,6 @@ from tilefoundry.ir.types.dim import (
     dim_expr,
     simplify_dim,
 )
-from tilefoundry.ir.types.dim_isl import normalize_dim
 from tilefoundry.ir.types.shard import (
     Broadcast,
     Layout,
@@ -91,7 +91,7 @@ from tilefoundry.ir.types.storage import StorageKind, resolve_storage
 from tilefoundry.ir.visitor import BindingSubstitutionCloner
 from tilefoundry.target import MemoryHierarchyFacts, Target, UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
-from tilefoundry.visitor_registry.visitors import TypeInferVisitor
+from tilefoundry.visitor_registry.typeinfer import TypeInferVisitor, inference_type
 
 T = TypeVar("T")
 _TYPE_INFER_CONTEXT = "<type_infer_context>"
@@ -1192,6 +1192,13 @@ class ModuleBuildContext:
         for function in functions:
             if isinstance(function, runtime.Function):
                 verify_function(function, module=result)
+                inference_type(
+                    function,
+                    runtime.TypeInferContext(
+                        scope=runtime.FunctionScope(result, function)
+                    ),
+                    ranges=True,
+                )
             elif isinstance(function, runtime.PrimFunction):
                 verify_prim_function(function, module_fns=result)
         return result

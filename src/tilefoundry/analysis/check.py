@@ -14,6 +14,7 @@ from tilefoundry.ir.core import (
     BindingMetadata,
     Call,
     Expr,
+    RangeMetadata,
     Var,
 )
 from tilefoundry.ir.core.module import (
@@ -48,7 +49,7 @@ from tilefoundry.ir.types.substitute import (
 from tilefoundry.ir.visitor import BindingSubstitutionCloner, collect_exprs
 from tilefoundry.target import UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
-from tilefoundry.visitor_registry.visitors import inference_type
+from tilefoundry.visitor_registry.typeinfer import inference_type
 
 from .errors import AnalysisError
 from .facts import ParallelCapacityFacts, PerformanceServiceFacts
@@ -67,6 +68,7 @@ _DERIVED_METADATA = {
     MemoryMetadata,
     PerformanceMetadata,
     PerformanceSummaryMetadata,
+    RangeMetadata,
     RooflineMetadata,
     TrafficMetadata,
 }
@@ -160,7 +162,7 @@ def _program_dim_vars(module: Module, function: Function) -> dict[str, object]:
     return found
 
 
-def _resolve_program_geometry(
+def resolve_program_geometry(
     module: Module,
     function: Function,
     dims: Mapping[str, int] | None,
@@ -595,7 +597,11 @@ def check_program(
             f"got {budget!r}"
         )
     derived = InlineCloner(module, function, budget).clone()
-    inference_type(derived.body, TypeInferContext(scope=FunctionScope(module, derived)))
+    inference_type(
+        derived,
+        TypeInferContext(scope=FunctionScope(module, derived)),
+        ranges=True,
+    )
     _require_concrete_geometry(module, derived, error_type=AnalysisError)
     target = module.resolve_target()
     for topology in module.effective_topologies():

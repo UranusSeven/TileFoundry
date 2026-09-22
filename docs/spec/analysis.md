@@ -388,6 +388,9 @@ is a conclusion of this analysis. `rmem` is not address-solved and reports only
 the largest single projected logical value.
 
 - constraints:
+  - An access relation that keeps a parameter with a stated finite range is
+    exact and MAY prove overlap. A widened relation, and one with an unbounded
+    parameter, MUST NOT.
   - Placement MUST be settled for the addressable levels `gmem` and `smem` only,
     once per capacity domain that holds a buffer -- the whole target for a level
     owned target-wide, one per owning position otherwise -- with two buffers in
@@ -1203,12 +1206,13 @@ def analyze(
     renderings of it and of the Metadata on the IR, and MUST NOT be fields of
     it.
 
-### 2.1 Shared Scope and Access
+### 2.1 Shared IterationScope and Access
 
 The normalized HIR is visited once per `analyze()` call. That visit produces a
-`Scope` tree parallel to Function/LoopRegion nesting and `Access` relations
-for the narrow and device views. `Scope.domain` is the accumulated authored
-loop domain; `Scope.accesses` and `Scope.refused` are the only family inputs for
+`IterationScope` tree parallel to Function/LoopRegion nesting and `Access`
+relations for the narrow and device views. `IterationScope.domain` is the
+accumulated authored loop domain; `IterationScope.accesses` and
+`IterationScope.refused` are the only family inputs for
 loop footprints, movement, and placement. An `Access` stores only its relation
 and allocation expression; storage level and element width are read from the
 allocation type. A refused descendant makes its owning scope unknown for that
@@ -1218,6 +1222,27 @@ call site, source expressions shared by identity remain one shared expression
 in the clone; sharing never aliases the independently cloned body of another
 call site.
 
+`analysis.loop_terms` resolves HIR values to `LoopTerm` without depending on
+isl. `analysis.access` turns those terms into isl constraints and owns access
+widening; the two modules do not define a second affine graph representation.
+
+- constraints:
+  - A loop `start` or `extent` MAY be unit-dependent. Every runtime leaf in one
+    MUST carry a half-open value range, and `IterationScope.domain` MUST keep the
+    whole affine expression with each such leaf as one identity-deduplicated
+    isl parameter constrained by that range. A leaf without a range MUST be
+    refused.
+  - A loop `step` MUST be a literal; a parametric stride has no isl
+    representation.
+  - `cardinality` MUST enumerate every feasible integer point of a parameter box
+    of at most `PARAM_POINT_LIMIT` points and return the maximum, and MUST
+    report unknown for a larger box. It MUST count directly when every retained
+    parameter is already fixed to one integer point. An empty parameter context
+    MUST count as zero; a non-empty context with an unbounded parameter MUST
+    report unknown.
+  - `IterationScope.trips()` MUST fix child and parent domains to the same parameter
+    point before dividing, and take the maximum of those ratios.
+
 ### 2.2 Target-selected Analyzers
 
 ```python
@@ -1226,8 +1251,8 @@ class AnalyzeContext:
     target: Target
     topology_level: str | None
     options: object | None
-    root: Scope
-    current: Scope
+    root: IterationScope
+    current: IterationScope
 
 
 AnalysisCallable = Callable[
@@ -1271,7 +1296,7 @@ class Target:
 - constraints:
   - `AnalysisCallable` MUST receive the normalized Function graph and one
     `AnalyzeContext` carrying the exact Module, Target, resolved topology level,
-    caller options, and the shared root/current `Scope` view. The
+    caller options, and the shared root/current `IterationScope` view. The
     `topology_level` MAY be `None` only when the Module declares no topology;
     options MAY be `None`.
   - Analyze MUST obtain every root and dependency from the same exact Target
