@@ -4,12 +4,19 @@ Walks a HIR ``Function`` body and returns concrete torch values.
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import torch
 
 from tilefoundry.evaluator.context import EvaluateContext
 from tilefoundry.evaluator.dim import resolve_dim
+from tilefoundry.evaluator.distributed import (
+    DistributedValue,
+    distribute,
+    evaluate_distributed_op,
+    reconstruct,
+)
 from tilefoundry.evaluator.registry import eval_registry
 from tilefoundry.evaluator.value import (
     EvalError,
@@ -24,6 +31,7 @@ from tilefoundry.ir.core.pattern import locate_dim_var
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
+from tilefoundry.ir.hir.sharding.collective import device_mesh_shape
 from tilefoundry.ir.types.dim import DimVar
 from tilefoundry.ir.types.utils import types_compatible
 from tilefoundry.ir.visitor import ExprVisitor
@@ -73,11 +81,12 @@ def _bind_dim_vars(params, values) -> dict[str, int]:
     for p, v in zip(params, values):
         shape = getattr(p.type, "shape", None)
         data = getattr(v, "data", None)
-        if shape is None or data is None:
+        data_shape = v.type.shape if isinstance(v, DistributedValue) else getattr(data, "shape", None)
+        if shape is None or data_shape is None:
             continue
         for axis, dim in enumerate(shape):
-            if isinstance(dim, DimVar) and axis < len(data.shape):
-                size = int(data.shape[axis])
+            if isinstance(dim, DimVar) and axis < len(data_shape):
+                size = int(data_shape[axis])
                 prev = binding.get(dim.name)
                 if prev is not None and prev != size:
                     raise EvalError(
@@ -122,6 +131,11 @@ class EvaluatorVisitor(ExprVisitor):
                 f"evaluator: MeshRegion expects {len(region.params)} args, got {len(args)}"
             )
         memo = {id(param): (param, value) for param, value in zip(region.params, args)}
+        if ctx.distributed:
+            device_mesh_shape(region.mesh)
+            if ctx.mesh is not None and ctx.mesh != region.mesh:
+                raise EvalError("distributed evaluation does not support nested different meshes")
+            ctx = replace(ctx, mesh=region.mesh)
         return EvaluatorVisitor(memo=memo).visit(region.body, ctx)
 
     def visit_leaf_Var(self, var: Var, _operands, ctx: EvaluateContext) -> Value:
@@ -146,7 +160,10 @@ class EvaluatorVisitor(ExprVisitor):
             handler = eval_registry.lookup(type(target))
             if handler is None:
                 raise EvalError(f"no @register_eval handler for {type(target).__name__}")
-            return handler(ctx.for_op(target, args, call.type))
+            op_context = ctx.for_op(target, args, call.type)
+            if ctx.distributed:
+                return evaluate_distributed_op(op_context, handler)
+            return handler(op_context)
         except Exception as error:
             raise EvalError(f"evaluator: {describe_expr(call)}: {error}") from error
 
@@ -181,7 +198,15 @@ class EvaluatorVisitor(ExprVisitor):
             loaded_module=child if child is not None else ctx.loaded_module,
             device=ctx.device,
             dim_bindings=_bind_dim_vars(target.params, args),
+            distributed=ctx.distributed,
         )
+        if ctx.distributed:
+            args = [
+                distribute(arg, param.type, function_context.dim_bindings)
+                if isinstance(arg, TensorValue)
+                else arg
+                for param, arg in zip(target.params, args)
+            ]
         memo = {id(param): (param, arg) for param, arg in zip(target.params, args)}
         return EvaluatorVisitor(memo=memo).visit(target.body, function_context)
 
@@ -304,7 +329,9 @@ def _child_constant(loaded_module, callee: Function, param, device: str) -> Tens
     return TensorValue(data=value, type=param.type)
 
 
-def _run_selected(loaded_module, fn: Function, *activations, device: str | None):
+def _run_selected(
+    loaded_module, fn: Function, *activations, device: str | None, distributed: bool = False
+):
     """Run one loaded function, reading constants lazily at first use.
 
     *device* is where the activations already are; a weight somewhere else is
@@ -323,7 +350,7 @@ def _run_selected(loaded_module, fn: Function, *activations, device: str | None)
         else next(supplied)
         for param in fn.params
     ]
-    return _run_bound(fn, args, device=device, reading=loaded_module)
+    return _run_bound(fn, args, device=device, reading=loaded_module, distributed=distributed)
 
 
 def _unwrap(value: Value) -> Any:
@@ -347,10 +374,13 @@ def _select_variant(callee: Function, arg_values) -> Function:
         if loc is None:
             continue
         pi, axis = loc
-        data = getattr(arg_values[pi], "data", None)
-        if data is None or axis >= len(data.shape):
+        value = arg_values[pi]
+        data_shape = value.type.shape if isinstance(value, DistributedValue) else getattr(
+            getattr(value, "data", None), "shape", None
+        )
+        if data_shape is None or axis >= len(data_shape):
             continue
-        if pat.match(int(data.shape[axis])):
+        if pat.match(int(data_shape[axis])):
             matches.append(v)
     if len(matches) != 1:
         raise EvalError(
@@ -383,7 +413,9 @@ def _selected_body(fn: Function, args) -> Function:
     return _select_variant(fn, _bound_values(fn, args))
 
 
-def _run_bound(fn: Function, args, *, device: str | None = None, reading=None):
+def _run_bound(
+    fn: Function, args, *, device: str | None = None, reading=None, distributed: bool = False
+):
     """Evaluate *fn* over fully bound *args*, with *reading* in hand.
 
     The entry a resource reading runs through: every child call reached from
@@ -392,21 +424,23 @@ def _run_bound(fn: Function, args, *, device: str | None = None, reading=None):
     """
     values = _bound_values(fn, args)
     target = _select_variant(fn, values) if fn.variants else fn
-    memo = {id(param): (param, value) for param, value in zip(target.params, values)}
     dim_env = _bind_dim_vars(target.params, values)
-    return _unwrap(
-        EvaluatorVisitor(memo=memo).visit(
-            target.body,
-            EvaluateContext(
-                loaded_module=reading,
-                device=device,
-                dim_bindings=dim_env,
-            ),
-        )
+    if distributed:
+        values = [distribute(value, param.type, dim_env) for param, value in zip(target.params, values)]
+    memo = {id(param): (param, value) for param, value in zip(target.params, values)}
+    result = EvaluatorVisitor(memo=memo).visit(
+        target.body,
+        EvaluateContext(
+            loaded_module=reading,
+            device=device,
+            dim_bindings=dim_env,
+            distributed=distributed,
+        ),
     )
+    return _unwrap(reconstruct(result) if distributed else result)
 
 
-def evaluate(target, *inputs):
+def evaluate(target, *inputs, distributed: bool = False):
     """Evaluate a HIR ``Function`` or a loaded module and return torch value(s).
 
     *target* answers which function to run and which reading, if any, supplies
@@ -416,10 +450,10 @@ def evaluate(target, *inputs):
     fn, reading = target.evaluation_target()
     device = _device_of(inputs)
     if reading is not None:
-        return _run_selected(reading, fn, *inputs, device=device)
+        return _run_selected(reading, fn, *inputs, device=device, distributed=distributed)
 
     if len(inputs) != len(fn.params):
         raise EvalError(
             f"evaluator: {fn.name!r} expects {len(fn.params)} inputs, got {len(inputs)}"
         )
-    return _run_bound(fn, inputs, device=device)
+    return _run_bound(fn, inputs, device=device, distributed=distributed)

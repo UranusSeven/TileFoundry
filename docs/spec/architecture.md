@@ -119,6 +119,12 @@ objects — DOT, Python DSL pretty-printer, dump integration, and the
 interactive viewer — and never introduces new semantic ownership.
 Concrete presentation contracts live in [inspection](./inspection.md).
 
+Distributed programs use the same HIR, with explicit device collectives owned
+by [HIR](./hir.md#3-device-collectives) and ownership carried by shard layouts.
+The [evaluator](./evaluator.md#7-distributed-evaluation) can simulate local tensors
+and communication on one torch device. The [CLI](./cli.md#check) compares that
+program with an explicitly selected reference HIR.
+
 ## 5. Analysis & optimization
 
 This stage layers two concerns on top of the same IR:

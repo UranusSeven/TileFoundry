@@ -602,6 +602,9 @@ Let `sl: ShardLayout`, `T: TensorType`, and `G = sl.layout.shape`.
 - `local_shape(sl)[k] = G[k]` otherwise.
 - The canonical regroup rule ([§8](#8-layout-propagation)) defines how `T.shape` aligns with
   `G`.
+- Mapping layout factors to a zero-length logical axis MUST consume factors
+  through the first zero factor. That zero axis MUST retain its factors rather
+  than assigning their `Split` ownership to the following logical axis.
 
 #### 7.1.2 `layout.strides`
 

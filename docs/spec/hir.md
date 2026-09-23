@@ -1694,3 +1694,71 @@ def is_concrete(fn: Function) -> bool:
     and called functions. `is_concrete` additionally checks the return type and
     is false exactly when a reachable required extent still contains a `DimVar`;
     runtime values without a `DimVar` are rejected later by their consumer.
+
+## 3. Device collectives
+
+Device communication is explicit value-producing HIR. These operations live in
+`ir/hir/sharding/collective.py` and use the input's `ShardLayout.mesh`. A selected
+mesh axis varies within each group; all other coordinates remain fixed. Thus a
+two-axis mesh can express independent reduction groups without a strategy node.
+
+```python
+class AllReduce(Op):
+    """Reduce partial values and broadcast the complete result within each group."""
+
+    x: Tensor
+    mesh_axis: int
+
+class AllGather(Op):
+    """Concatenate equal partitions in increasing mesh-coordinate order."""
+
+    x: Tensor
+    mesh_axis: int
+
+class ReduceScatter(Op):
+    """Reduce partial values and partition the result equally within each group."""
+
+    x: Tensor
+    mesh_axis: int
+    tensor_axis: int
+```
+
+- constraints:
+  - The input MUST carry a `ShardLayout` whose mesh is bound by the current
+    `MeshRegion`. The mesh MUST have one concrete `gpu` topology and positive
+    concrete extents with contiguous C-order positions within that topology.
+    `mesh_axis` MUST be a nonnegative integer indexing this mesh.
+  - Each mesh axis MUST have a `Broadcast`, `Split` or `Partial` attribute. Each
+    logical tensor axis MAY be split by at most one mesh axis. Partitions MUST
+    be equal and contiguous, splitting at the leading nonunit layout factor of the
+    logical axis; nondivisible concrete shapes MUST fail.
+  - `AllReduce` and `ReduceScatter` MUST consume `Partial("sum")`,
+    `Partial("max")` or `Partial("min")` on `mesh_axis`; that attribute supplies
+    the reduction operation. `AllReduce` changes it to `Broadcast`.
+  - `AllGather` MUST consume `Split` on `mesh_axis` and changes it to
+    `Broadcast`. It preserves logical shape rather than introducing a rank
+    dimension or multiplying the global extent.
+  - `ReduceScatter.tensor_axis` MUST index the logical tensor shape and MUST
+    NOT already be split by another mesh axis. The result replaces the selected
+    `Partial` with a `Split` of that logical axis.
+  - All three preserve global logical shape, dtype, storage and ownership on
+    other mesh axes. Output layouts use canonical factorization; attributes
+    referring to unaffected logical axes are remapped accordingly.
+  - Every participant in a group participates in each collective occurrence,
+    including when a payload contains zero elements. Calls have value semantics:
+    they produce results without mutating their inputs.
+  - Collective occurrence order is the deterministic depth-first traversal of
+    operands in their declared order, with shared DAG nodes evaluated once per
+    execution scope. Function bodies and uniform `LoopRegion` iterations expand
+    in that order. All participants execute that same order. A runtime lowering
+    MUST preserve it within each group, and MUST NOT introduce rank-dependent
+    participation or reorder collectives independently on different ranks.
+  - Numerical evaluation requires [distributed evaluation](./evaluator.md#7-distributed-evaluation).
+    Ordinary logical evaluation MUST refuse these operations. Numerical simulation
+    checks value semantics; it does not verify a physical communication backend.
+  - Logical tensor-coordinate access is identity: every output index consumes
+    that same index in the input. Rank participation and ownership changes are
+    defined by the collective contract above. These operations have no registered
+    cost evaluator. An analysis needing that evaluator MUST report them as
+    unsupported, never as zero-cost layout views. The existing `Reshard` cost
+    classification is unchanged.

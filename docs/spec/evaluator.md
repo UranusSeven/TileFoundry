@@ -14,6 +14,7 @@ flowchart TB
     Value["<b>Value</b>"]
     TensorValue["<b>TensorValue</b><br/>(data, type)"]
     TupleValue["<b>TupleValue</b><br/>(elements)"]
+    DistributedValue["<b>DistributedValue</b><br/>(shards, type, mesh)"]
 
     evaluate --> Evaluator
     Evaluator -. "Call(target=Op)" .-> registry
@@ -22,12 +23,14 @@ flowchart TB
     Evaluator -. produces .-> Value
     Value --> TensorValue
     Value --> TupleValue
+    Value --> DistributedValue
 ```
 
 ```python
 def evaluate(
     target: "Function | LoadedModule",
     *inputs: "torch.Tensor",
+    distributed: bool = False,
 ) -> "torch.Tensor | tuple[torch.Tensor, ...]":
     ...
 ```
@@ -47,7 +50,8 @@ default.
 ## 1. `Value`
 
 The values that flow through evaluation form a small hierarchy: a
-single-output node produces a `TensorValue`; a multi-output node (a
+single-output node produces a `TensorValue`, or a `DistributedValue` under
+[distributed evaluation](#7-distributed-evaluation); a multi-output node (a
 `Tuple`, a `TupleType` `Call`, or a multi-carry `LoopRegion`)
 produces a `TupleValue`.
 
@@ -56,7 +60,8 @@ class Value:
     """Provide the base of every evaluated value."""
 ```
 
-- constraints: none — abstract base; concrete values are `TensorValue` / `TupleValue`
+- constraints: none — abstract base; concrete values are `TensorValue`,
+  `TupleValue`, and `DistributedValue`.
 
 ### `TensorValue`
 
@@ -154,6 +159,8 @@ class EvaluateContext:
         loaded_module: attribute; Runtime module reading, when one is active.
         device: attribute; Where the inputs are, or None to leave it to torch.
         dim_bindings: attribute; concrete values for symbolic ShapeDims.
+        distributed: attribute; Whether to simulate device participants.
+        mesh: attribute; Device mesh active in the current evaluation scope.
     """
 
     op: Any = None
@@ -162,6 +169,8 @@ class EvaluateContext:
     loaded_module: Any | None = None
     device: str | None = None
     dim_bindings: Mapping[str, int] = field(default_factory=dict)
+    distributed: bool = False
+    mesh: "Mesh | None" = None
 
     def for_op(self, op: Any, args: tuple[Any, ...], result_type: Any) -> EvaluateContext: ...
 
@@ -238,8 +247,8 @@ separate `eval_grid` function.
 
 ## 6. Layout domain
 
-Evaluation models a **single mesh participant** and operates on logical
-values:
+Ordinary evaluation (`distributed=False`) models a **single mesh participant**
+and operates on logical values:
 
 - An axis-bearing op (`Reduce`, `rms_norm`, …) addresses its `axis` /
   `axes` in the operand's **logical** `TensorType.shape`, regardless of
@@ -264,3 +273,57 @@ values:
   raise `EvalError` saying that the evaluator models one mesh participant and
   linking to this section, until the mesh evaluator models that path. An
   unmodelled path MUST identify itself rather than leaking a torch exception.
+
+## 7. Distributed evaluation
+
+`evaluate(..., distributed=True)` executes device-local tensors and explicit
+[collectives](./hir.md#3-device-collectives) on the device holding the supplied
+torch inputs. It returns reconstructed logical outputs using the same public
+return structure as ordinary evaluation.
+
+```python
+class DistributedValue(Value):
+    """Hold each participant's tensor with the global ownership type."""
+
+    shards: tuple[torch.Tensor, ...]
+    type: TensorType
+    mesh: Mesh
+```
+
+- constraints:
+  - Meshes MUST be concrete, contiguous, single-level `gpu` meshes. Shards use
+    lexicographic coordinate order, with the last mesh axis varying fastest.
+    Nested different meshes, sliced meshes and mixed device/thread meshes MUST
+    be refused. The topology name identifies device ownership; simulation does
+    not require physical GPUs.
+  - Distributed ownership MUST use `Broadcast`, `Split` or `Partial`. A logical
+    axis MAY be split by one mesh axis. Equal contiguous partitions MUST be
+    represented by splits at the leading nonunit layout factor of each logical axis;
+    other partitions MUST be refused. Canonical factorization and dynamically
+    bound unfactored axes satisfy this rule. Bound symbolic dimensions MUST satisfy
+    runtime divisibility and shape checks.
+  - Logical inputs with declared `Split` ownership are partitioned at the entry
+    boundary; `Broadcast` inputs are replicated. These are input placement,
+    not communication operations. Logical inputs MUST NOT declare `Partial`:
+    a complete tensor cannot specify each rank's independent contribution.
+  - Unplaced inputs/constants supply the same complete value to each participant.
+    Inside a device region, `Reshard` MAY retain local ownership or select a
+    subset already present on each participant. It MUST refuse a destination
+    requiring another participant's data, creating partial contributions or
+    completing a partial reduction.
+  - `Binary`, `Unary`, `MatMul`, `Cast`, `Transpose`, and `Reduce` reuse their
+    registered evaluators with local shapes. A `Reduce` over an axis carrying
+    `Split` ownership MUST be refused. Tuple construction/projection, calls and
+    uniform structured loops preserve distributed values. Other device-local
+    operations MUST report unsupported semantics rather than execute their
+    global logical operation.
+  - Every returned `Split` tensor is assembled by its declared ownership.
+    `Broadcast` replicas MUST agree exactly, treating matching NaNs as equal.
+    Returning `Partial` MUST fail and name the missing explicit reduction.
+    Reconstruction is an evaluator observation boundary; it inserts no HIR
+    collective and establishes no runtime transfer cost.
+  - Persistent state uses ordinary returned tensors and subsequent inputs.
+    There is no hidden state store. A caller MAY feed reconstructed state into
+    the next invocation, where the declared input placement applies again.
+  - Without `distributed=True`, existing logical evaluation semantics remain
+    unchanged and device collectives MUST raise `EvalError`.

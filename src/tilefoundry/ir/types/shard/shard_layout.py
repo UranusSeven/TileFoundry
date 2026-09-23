@@ -215,7 +215,9 @@ def layout_axis_to_tensor_axis(layout_shape: tuple, tensor_shape: tuple) -> list
                 layout_idx += 1
             continue
         running = 1
-        while layout_idx < len(layout_shape) and running < t_dim_int:
+        while layout_idx < len(layout_shape) and (
+            running < t_dim_int or (t_dim_int == 0 and running != 0)
+        ):
             sh = static_dim_value(layout_shape[layout_idx])
             running *= 1 if sh is None else sh
             result.append(t_axis)
