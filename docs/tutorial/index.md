@@ -4,6 +4,10 @@ TileFoundry is source to source: the reference is source code, the fast
 implementation is source code, and either can be pointed at any command.
 `check` says whether two of them agree; `analyze` says what one costs.
 
+For device-parallel HIR, [distributed checking](./distributed-check.md) shows
+how to compare explicit collectives and state outputs against a reference using
+`check --reference ... --distributed`.
+
 ```text
   step one — describe it, until it agrees
 

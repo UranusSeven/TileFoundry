@@ -63,8 +63,15 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "source", metavar="SOURCE", help="FILE.py:Selector — a Module, a leaf, or a twin"
     )
-    parser.add_argument(
+    reference = parser.add_mutually_exclusive_group()
+    reference.add_argument(
         "--expected", action="append", metavar="PATH", help="compare against this file"
+    )
+    reference.add_argument(
+        "--reference", metavar="SOURCE", help="compare against an explicitly selected HIR"
+    )
+    parser.add_argument(
+        "--distributed", action="store_true", help="simulate the candidate's device ranks"
     )
     parser.add_argument(
         "--inputs",
@@ -212,6 +219,8 @@ class CheckRequest:
     expected: tuple[Any, ...] | None
     device: str
     expectations: dict[str, tuple[Predicate, ...]]
+    reference: Module | None = None
+    distributed: bool = False
 
 
 def _refuse_orchestration(module: Module, method: str) -> None:
@@ -304,10 +313,21 @@ def _scope(resource: RuntimeResource, children: Sequence[str]) -> RuntimeResourc
 
 
 def check_concrete(request: CheckRequest):
+    if request.reference is not None and (request.twin is not None or request.expected is not None):
+        raise ValueError("--reference requires a HIR candidate and cannot accompany --expected")
+    if request.distributed and request.twin is not None:
+        raise ValueError("--distributed requires a HIR candidate")
+    if request.reference is not None:
+        _compatible_reference(request.module, request.reference)
     loaded = request.module.load(request.weights)
     def reference_run(*args):
-        return evaluate(loaded, *args)
-    if request.expected is not None:
+        return evaluate(loaded, *args, distributed=request.distributed)
+    if request.reference is not None:
+        reference_loaded = request.reference.load(request.weights)
+        def selected_reference_run(*args):
+            return evaluate(reference_loaded, *args)
+        reference = selected_reference_run
+    elif request.expected is not None:
         expected = request.expected[0] if len(request.expected) == 1 else request.expected
         def expected_run(*_args):
             return expected
@@ -320,6 +340,29 @@ def check_concrete(request: CheckRequest):
         request.twin.load(request.weights)
         candidate = getattr(request.twin, request.module.entry_function().name)
     return check(candidate, reference, request.inputs, expect=request.expectations)
+
+
+def _compatible_reference(candidate: Module, reference: Module) -> None:
+    """Require one logical input and weight binding shared by both programs."""
+    def activations(module):
+        return tuple(
+            (param.type.shape, param.type.dtype)
+            for param in module.entry_function().params if not param.is_const
+        )
+
+    def weights(module, prefix=""):
+        result = {
+            prefix + name: (type_.shape, type_.dtype)
+            for name, type_ in module.weights.items()
+        }
+        for child in module.modules:
+            result.update(weights(child, prefix + child.name + "."))
+        return result
+
+    if activations(candidate) != activations(reference):
+        raise ValueError("reference and candidate must declare matching logical activation shapes and dtypes")
+    if weights(candidate) != weights(reference):
+        raise ValueError("reference and candidate must declare matching weight paths, shapes and dtypes")
 
 
 def _walk_twin(
@@ -532,6 +575,7 @@ def _render(source: str, runs: Sequence[dict[str, Any]], warnings: Sequence[str]
         if run.get("dims"):
             lines += ["", "  " + ", ".join(f"{k}={v}" for k, v in run["dims"].items())]
         lines.append(f"  reference: {run.get('reference', 'none')}")
+        lines.append(f"  evaluation: {run.get('evaluation', 'local')}")
         activations = run["inputs"]["activations"]
         lines.append(
             f"  inputs:    {activations['source']}; activations actual "
@@ -581,6 +625,16 @@ def run_check(arguments: argparse.Namespace) -> int:
     """Compare one selected implementation against its semantic reference."""
     expect = expectations(getattr(arguments, "comparison", None))
     selection = select(arguments.source)
+    distributed = getattr(arguments, "distributed", False)
+    if distributed and selection.twin is not None:
+        raise ValueError("--distributed requires a HIR candidate")
+    evaluation = "runtime" if selection.twin is not None else "distributed" if distributed else "local"
+    reference_source = getattr(arguments, "reference", None)
+    reference_selection = select(reference_source) if reference_source else None
+    if reference_selection is not None:
+        if reference_selection.twin is not None or selection.twin is not None:
+            raise ValueError("--reference selects two HIR programs, not runtime twins")
+        _compatible_reference(selection.module, reference_selection.module)
     stated = parse_dims(arguments.dim) or {}
     if arguments.inputs is None:
         raise ValueError("no inputs stated")
@@ -625,6 +679,8 @@ def run_check(arguments: argparse.Namespace) -> int:
                 expected,
                 device,
                 expect,
+                reference_selection.module if reference_selection is not None else None,
+                distributed,
             )
         )
         declared = tuple(
@@ -632,7 +688,9 @@ def run_check(arguments: argparse.Namespace) -> int:
             for param in (concrete.params if concrete is not None else ())
             if not param.is_const
         )
-        if arguments.expected:
+        if reference_source:
+            reference = reference_source
+        elif arguments.expected:
             reference = ", ".join(arguments.expected)
         elif selection.twin is not None:
             fn_name = selection.module.entry_function().name
@@ -647,6 +705,7 @@ def run_check(arguments: argparse.Namespace) -> int:
             "outputs": [_output_dict(output) for output in report.outputs],
             "dims": dims,
             "reference": reference,
+            "evaluation": evaluation,
             "variant": selected_variant,
             "inputs": {
                 "activations": {

@@ -14,6 +14,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from tests.fixtures.distributed import projection
 from tests.fixtures.placed import gqa_decode, leaf_weights
 from tests.fixtures.shapes.composed_leaf_source import composed_leaf_source
 from tests.models.corpus import MODELS_ROOT
@@ -707,3 +708,51 @@ def test_a_pinned_extent_on_a_root_that_reaches_a_child(tmp_path, capsys) -> Non
         == 0
     )
     assert "PASS" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("candidate", ["TensorParallel", "ReduceScatterProjection"])
+def test_explicit_reference_checks_distributed_outputs_and_state(candidate, tmp_path, capsys):
+    reference = f"{projection.__file__}:Reference"
+    report_path = tmp_path / "distributed.json"
+    arguments = [
+        "check", f"{projection.__file__}:{candidate}", "--reference", reference,
+        "--distributed", "--inputs", "random", "--weights", "random", "--device", "cpu",
+        "--out", "output[0]", "--fn", "allclose", "--atol", "1e-5", "--rtol", "1e-5",
+        "--out", "output[1]", "--fn", "allclose", "--atol", "1e-5", "--rtol", "1e-5",
+    ]
+    assert cli.main(arguments) == 0
+    shown = capsys.readouterr().out
+    assert reference in shown and "evaluation: distributed" in shown and "PASS" in shown
+    assert cli.main([*arguments, "--json", str(report_path)]) == 0
+    assert capsys.readouterr().out == ""
+    report = json.loads(report_path.read_text())
+    assert report["passed"]
+    assert report["runs"][0]["reference"] == reference
+    assert report["runs"][0]["evaluation"] == "distributed"
+
+
+def test_explicit_reference_reports_real_disagreement(tmp_path, capsys):
+    changed = tmp_path / "changed.py"
+    changed.write_text(Path(projection.__file__).read_text().replace(
+        "return tf.neg(updated), updated", "return updated, updated", 1,
+    ))
+    assert cli.main([
+        "check", f"{projection.__file__}:TensorParallel", "--reference", f"{changed}:Reference",
+        "--distributed", "--inputs", "random", "--weights", "random", "--device", "cpu",
+        "--out", "output[0]", "--fn", "allclose", "--atol", "1e-5", "--rtol", "1e-5",
+        "--out", "output[1]", "--fn", "allclose", "--atol", "1e-5", "--rtol", "1e-5",
+    ]) == 1
+    assert "FAIL" in capsys.readouterr().out
+
+
+def test_explicit_reference_refuses_different_weight_bindings(tmp_path, capsys):
+    changed = tmp_path / "changed.py"
+    changed.write_text(Path(projection.__file__).read_text().replace(
+        'w: ConstTensor', 'other: ConstTensor', 1,
+    ).replace('tf.matmul(x, w)', 'tf.matmul(x, other)', 1))
+    assert cli.main([
+        "check", f"{projection.__file__}:TensorParallel", "--reference", f"{changed}:Reference",
+        "--distributed", "--inputs", "random", "--weights", "random", "--device", "cpu",
+        "--out", "output[0]", "--fn", "equal", "--out", "output[1]", "--fn", "equal",
+    ]) == 1
+    assert "matching weight paths" in capsys.readouterr().err

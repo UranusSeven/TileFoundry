@@ -168,6 +168,20 @@ bounds the caller stated.
     authored Module the implementation stands for. With no reference at all, only
     a predicate that judges the candidate alone is admissible; every two-sided
     predicate MUST be refused, because there is nothing to compare against.
+  - `--reference SOURCE` MAY select an explicit reference HIR using the same
+    source/selector syntax as the candidate. Both selections MUST be HIR modules
+    or functions; runtime twins and `--expected` MUST NOT accompany this mode.
+    Activation parameters MUST match in declaration order by logical shape and
+    dtype. The selected module trees MUST declare matching weight paths, shapes
+    and dtypes. Placement annotations MAY differ. Both programs receive the
+    same activations and the same weight resource scoped at the candidate's
+    selected module; relative child/weight paths MUST retain their meaning.
+  - `--distributed` enables rank simulation for the HIR candidate according to
+    [evaluator §7](./evaluator.md#7-distributed-evaluation). The explicit reference
+    uses ordinary logical evaluation. The flag MUST be refused for a runtime
+    twin. Existing expected-output and candidate-only predicates remain usable.
+    Text and JSON reports MUST identify the explicit reference source and the
+    candidate evaluation mode (`local` or `distributed`).
   - Each output MUST report the norm of its reference. Near zero, a relative
     measure divides by nothing, so the report MUST state what it measured instead
     rather than a number with no scale to read it against.
@@ -235,9 +249,12 @@ granularity.
     every source file's leading docstring without importing or executing it. An
     unknown family MUST name the available families. Checkout and installed
     lookups MUST report the same shipped families and files.
-  - Its pages are `index`, `migrate`, `optimize`, and `showcase`; the first three
+  - Its pages are `index`, `migrate`, `optimize`, `showcase`, and
+    `distributed-check`; the first three
     are the workflow and `showcase` is one kernel taken through six analyze-driven
     stages, exercising the authoring surface the other pages touch in part.
+    `distributed-check` compares a device-parallel HIR with its reference using
+    simulated ranks and explicit collectives.
     Causal-LM decode sources are listed through `tutorial orchestrator`. A bare
     `tutorial` MUST print the `index` page followed by its own help, which names
     the pages a reader may ask for and `orchestrator`. `index` is that overview's
