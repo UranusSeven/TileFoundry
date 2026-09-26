@@ -783,3 +783,9 @@ class Target:
     state. It only converts what the specification already records.
   - There MUST be no public Facts registration step or global Target Facts
     table. A custom Target provider registers only its Target class.
+
+Engine deployment profiles supply directed network paths and per-rank memory
+budgets separately from target-owned device capabilities. Their immutable
+schema and validation are owned by
+[analysis](./analysis.md#3-portable-engine-profiles); missing path facts remain
+unstated rather than being inferred from an accelerator architecture name.

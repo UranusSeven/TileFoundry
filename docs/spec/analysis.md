@@ -1251,3 +1251,131 @@ class Target:
     removal alike: deleting another analysis's record changes the IR as much as
     overwriting it. An equal-valued overwrite of another analysis's record MUST
     also count as a violation.
+
+## 3. Portable engine profiles
+
+`analysis/engine_profile.py` owns immutable deployment and workload inputs.
+These records separate per-device target facts from deployment connectivity,
+reserved memory, useful work and routing assumptions.
+
+```python
+class DeviceBudget:
+    """State one rank's capacity override and runtime reserve."""
+
+    rank: int
+    capacity_bytes: int | None = None
+    reserve_bytes: int = 0
+
+class NetworkRoute:
+    """State one effective directed path and its shared network resources."""
+
+    source: int
+    destination: int
+    bandwidth_bytes_per_second: int | None = None
+    latency_ns: int | None = None
+    resources: tuple[str, ...] = ()
+
+class EngineDeployment:
+    """Collect deployment facts with their supplied provenance."""
+
+    devices: tuple[DeviceBudget, ...] = ()
+    routes: tuple[NetworkRoute, ...] = ()
+    source: str = "unspecified"
+
+class EngineWorkload:
+    """State useful work and the execution budget of one invocation."""
+
+    work_items: int | None = None
+    work_unit: str = "tokens"
+    latency_budget_ns: int | None = None
+    state_inputs: tuple[str, ...] = ()
+
+class RoutingProfile:
+    """State a dispatch's distinct peer tokens, expert routes and active expert rows."""
+
+    operation: str
+    peer_tokens: tuple[tuple[int, ...], ...]
+    peer_routes: tuple[tuple[int, ...], ...]
+    expert_counts: tuple[tuple[int, ...], ...]
+
+class EngineOptions:
+    """Collect the assumptions supplied to an engine analysis."""
+
+    deployment: EngineDeployment
+    workload: EngineWorkload
+    routing: tuple[RoutingProfile, ...] = ()
+
+    def to_dict(self) -> dict: ...
+
+def engine_options_from_dict(data: dict) -> EngineOptions:
+    """Validate a portable engine profile."""
+    ...
+
+def load_engine_options(path: str | Path) -> EngineOptions:
+    """Load and validate a JSON engine profile."""
+    ...
+```
+
+- constraints:
+  - All profile records MUST be frozen dataclasses. Collections in Python
+    records MUST be tuples; JSON collections MUST be arrays. Round trips MUST
+    preserve missing facts as `None`/`null`.
+  - Rank IDs, capacity, reserve, work counts, latency budgets and route counts
+    MUST be nonnegative integers; booleans are not integers in this contract.
+    A stated bandwidth MUST be a positive integer in bytes per second.
+    A stated startup latency is in nanoseconds. Missing capacity, bandwidth,
+    latency and useful work MUST NOT acquire fabricated numeric defaults.
+  - Device ranks and directed routes MUST be unique. Routes MUST connect
+    different ranks. Resource names and state-input names MUST be nonempty and
+    unique within each record. Deployment provenance and work units MUST be
+    nonempty strings. Unknown JSON fields MUST be rejected.
+  - A routing profile names one operation. Peer matrices MUST be square, have
+    the same rank count, and include self traffic. `peer_tokens[s][d]` counts
+    distinct source tokens sent to destination `d`; `peer_routes[s][d]` counts
+    their expanded expert choices. Tokens MUST NOT exceed routes and their
+    zero/nonzero status MUST agree.
+  - `expert_counts[d]` lists destination `d`'s live expert rows in local batch
+    then local expert order. Its sum MUST equal incoming peer routes. Entries
+    are nonnegative; alignment with a program's experts/capacity is checked by
+    the consuming analysis. Profiles for the same operation MUST NOT repeat.
+
+## 4. Engine result records
+
+`analysis/engine_metadata.py` owns device-level records. `EngineWork` describes
+one rank's floating-point work by dtype, other operations by service, and HBM
+read/write bytes. `EngineTransfer` identifies directed bytes, phase, shared
+resources and an optional interval. `EngineOperation` retains operation ID,
+source provenance, participants, work, transfers, repetition count and traffic
+classification. `EngineBuffer` names a live allocation, its kind and bytes.
+`EngineRank` records resident weights/state/inputs, returned storage, peak HBM,
+reserve and capacity, feasibility, total work/traffic and peak allocations.
+
+```python
+class EngineMetadata(IRMetadata):
+    """Describe one invocation under explicit deployment and workload assumptions."""
+
+    model: str
+    deployment_source: str
+    ranks: tuple[EngineRank, ...]
+    operations: tuple[EngineOperation, ...]
+    predicted_ns: int | None
+    work_items: int | None
+    work_unit: str
+    throughput_per_second: float | None
+    latency_budget_ns: int | None
+    capacity_fits: bool | None
+    routing_safe: bool | None
+    slo_met: bool | None
+    feasible: bool | None
+    assumptions: tuple[str, ...]
+    diagnostics: tuple[str, ...]
+```
+
+- constraints:
+  - Result records MUST be immutable. Unknown times, capacities and feasibility
+    findings are `None`; zero is a modeled numerical value, not an unknown.
+  - Work and communication records MUST retain the operation that produced
+    them. Repetition counts describe compact structured execution rather than
+    materializing an event per token or loop iteration.
+  - Allocation capacity, bytes read, network payload and useful workload items
+    are distinct quantities and MUST remain separately named in records.

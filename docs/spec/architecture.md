@@ -128,6 +128,10 @@ Routed MoE dispatch/combine uses bounded ordinary tensors and explicit routing
 metadata; expert compute remains HIR composition. Its semantic owner is
 [HIR](./hir.md#31-bounded-moe-dispatch-and-combine).
 
+Portable deployment/workload inputs and device-level result records are owned
+by [analysis](./analysis.md#3-portable-engine-profiles). They complement target
+device facts without introducing another authored program representation.
+
 ## 5. Analysis & optimization
 
 This stage layers two concerns on top of the same IR:
