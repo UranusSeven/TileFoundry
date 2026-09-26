@@ -311,7 +311,7 @@ class DistributedValue(Value):
     subset already present on each participant. It MUST refuse a destination
     requiring another participant's data, creating partial contributions or
     completing a partial reduction.
-  - `Binary`, `Unary`, `MatMul`, `Cast`, `Transpose`, and `Reduce` reuse their
+  - `Binary`, `Unary`, `MatMul`, `Cast`, `Transpose`, `ReLU`, and `Reduce` reuse their
     registered evaluators with local shapes. A `Reduce` over an axis carrying
     `Split` ownership MUST be refused. Tuple construction/projection, calls and
     uniform structured loops preserve distributed values. Other device-local
@@ -327,3 +327,10 @@ class DistributedValue(Value):
     the next invocation, where the declared input placement applies again.
   - Without `distributed=True`, existing logical evaluation semantics remain
     unchanged and device collectives MUST raise `EvalError`.
+  - `AllToAll` exchanges rank-local slices rather than reconstructing a global
+    tensor to satisfy a changed layout. Routed
+    [dispatch and combine](./hir.md#31-bounded-moe-dispatch-and-combine) consume
+    actual expert IDs and metadata, preserving independent groups. Dispatch
+    returns a `TupleValue` of four `DistributedValue` fields; combine uses live
+    counts and source indices to return contributions to their original owners.
+    The evaluator retains no routing handle between calls.

@@ -124,6 +124,9 @@ by [HIR](./hir.md#3-device-collectives) and ownership carried by shard layouts.
 The [evaluator](./evaluator.md#7-distributed-evaluation) can simulate local tensors
 and communication on one torch device. The [CLI](./cli.md#check) compares that
 program with an explicitly selected reference HIR.
+Routed MoE dispatch/combine uses bounded ordinary tensors and explicit routing
+metadata; expert compute remains HIR composition. Its semantic owner is
+[HIR](./hir.md#31-bounded-moe-dispatch-and-combine).
 
 ## 5. Analysis & optimization
 

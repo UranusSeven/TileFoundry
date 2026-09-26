@@ -12,9 +12,12 @@ from tilefoundry.evaluator.value import EvalError, TensorValue, TupleValue, Valu
 from tilefoundry.ir.hir.math.binary import Binary
 from tilefoundry.ir.hir.math.unary import Unary
 from tilefoundry.ir.hir.nn.matmul import MatMul
+from tilefoundry.ir.hir.nn.relu import ReLU
+from tilefoundry.ir.hir.sharding.alltoall import AllToAllCombine, AllToAllDispatch
 from tilefoundry.ir.hir.sharding.collective import (
     AllGather,
     AllReduce,
+    AllToAll,
     ReduceScatter,
     device_mesh_shape,
 )
@@ -47,6 +50,15 @@ class DistributedValue(Value):
 def coordinates(mesh):
     """Enumerate independent participants, with the last mesh axis fastest."""
     return tuple(product(*(range(size) for size in device_mesh_shape(mesh))))
+
+
+def participant_groups(mesh, axis):
+    """Group rank indices by all coordinates except the selected mesh axis."""
+    groups = {}
+    for rank, coord in enumerate(coordinates(mesh)):
+        key = coord[:axis] + coord[axis + 1:]
+        groups.setdefault(key, []).append(rank)
+    return tuple(tuple(ranks) for ranks in groups.values())
 
 
 def _shape(type_, bindings):
@@ -186,17 +198,17 @@ def _collective(ctx, value):
     mesh = value.mesh
     axis = ctx.op.mesh_axis
     coords = coordinates(mesh)
-    groups = {}
-    for rank, coord in enumerate(coords):
-        key = coord[:axis] + coord[axis + 1 :]
-        groups.setdefault(key, []).append(rank)
     result_type = substitute_dims(ctx.result_type, ctx.dim_bindings)
     _attrs(result_type, mesh)
     source_attr = _attrs(value.type, mesh)[axis]
     result = [None] * len(coords)
-    for ranks in groups.values():
+    for ranks in participant_groups(mesh, axis):
         shards = [value.shards[rank] for rank in ranks]
-        if isinstance(ctx.op, AllGather):
+        if isinstance(ctx.op, AllToAll):
+            sends = [torch.tensor_split(shard, len(ranks), dim=ctx.op.tensor_axis) for shard in shards]
+            for destination, rank in enumerate(ranks):
+                result[rank] = torch.cat([send[destination] for send in sends], dim=source_attr.axis)
+        elif isinstance(ctx.op, AllGather):
             gathered = torch.cat(shards, dim=source_attr.axis)
             for rank in ranks:
                 result[rank] = gathered
@@ -236,11 +248,13 @@ def evaluate_distributed_op(ctx, handler):
         raise EvalError("distributed operands must use the current device mesh")
     if isinstance(ctx.op, Reshard):
         return _reshard(ctx, mesh, ctx.args[0])
-    if isinstance(ctx.op, (AllReduce, AllGather, ReduceScatter)):
+    if isinstance(ctx.op, (AllToAllDispatch, AllToAllCombine)):
+        return handler(ctx)
+    if isinstance(ctx.op, (AllReduce, AllGather, ReduceScatter, AllToAll)):
         if not isinstance(ctx.args[0], DistributedValue):
             raise EvalError("collective requires distributed input")
         return _collective(ctx, ctx.args[0])
-    if not isinstance(ctx.op, (Binary, Unary, MatMul, Cast, Transpose, Reduce)):
+    if not isinstance(ctx.op, (Binary, Unary, MatMul, Cast, Transpose, Reduce, ReLU)):
         raise EvalError(
             f"distributed local semantics are not supported for {type(ctx.op).__name__}"
         )

@@ -62,6 +62,15 @@ class AllGather(Op):
 
 
 @register_op
+class AllToAll(Op):
+    """Exchange equal peer blocks to move Split ownership to another tensor axis."""
+
+    x = ParamDef(kind="input", pattern=Tensor)
+    mesh_axis = ParamDef(kind="attribute", annotation=int)
+    tensor_axis = ParamDef(kind="attribute", annotation=int)
+
+
+@register_op
 class ReduceScatter(Op):
     """Complete a partial reduction and equally partition one logical axis."""
 
@@ -101,17 +110,17 @@ def _collective_type(call, ctx):
     if len(set(split_axes)) != len(split_axes):
         ctx.error(call, "collectives support one mesh split per logical tensor axis")
     selected = attrs[axis]
-    if isinstance(call.target, AllGather):
+    if isinstance(call.target, (AllGather, AllToAll)):
         if not isinstance(selected, Split):
-            ctx.error(call, "AllGather requires Split on mesh_axis")
+            ctx.error(call, f"{type(call.target).__name__} requires Split on mesh_axis")
     elif not isinstance(selected, Partial) or selected.reduction not in ("sum", "max", "min"):
         ctx.error(call, "reduction collective requires Partial(sum, max or min) on mesh_axis")
-    if isinstance(call.target, ReduceScatter):
+    if isinstance(call.target, (ReduceScatter, AllToAll)):
         tensor_axis = call.target.tensor_axis
         if type(tensor_axis) is not int or not 0 <= tensor_axis < len(source.shape):
             ctx.error(call, "tensor_axis must index the logical tensor shape")
         if tensor_axis in split_axes:
-            ctx.error(call, "ReduceScatter tensor_axis is already split by another mesh axis")
+            ctx.error(call, "tensor_axis must be an unsplit logical tensor axis")
         attrs[axis] = Split(tensor_axis)
     else:
         attrs[axis] = Broadcast()
@@ -126,7 +135,7 @@ def _eval_collective(ctx):
     raise EvalError("device collectives require distributed evaluation")
 
 
-for _op in (AllReduce, AllGather, ReduceScatter):
+for _op in (AllReduce, AllGather, ReduceScatter, AllToAll):
     register_typeinfer(_op)(_collective_type)
     register_eval(_op)(_eval_collective)
     register_access_relation(_op)(identity_relations(1))

@@ -1721,6 +1721,13 @@ class ReduceScatter(Op):
     x: Tensor
     mesh_axis: int
     tensor_axis: int
+
+class AllToAll(Op):
+    """Exchange equal peer blocks to move Split ownership to another tensor axis."""
+
+    x: Tensor
+    mesh_axis: int
+    tensor_axis: int
 ```
 
 - constraints:
@@ -1741,7 +1748,12 @@ class ReduceScatter(Op):
   - `ReduceScatter.tensor_axis` MUST index the logical tensor shape and MUST
     NOT already be split by another mesh axis. The result replaces the selected
     `Partial` with a `Split` of that logical axis.
-  - All three preserve global logical shape, dtype, storage and ownership on
+  - `AllToAll` MUST consume `Split` on `mesh_axis`. Its `tensor_axis` MUST be
+    a different, unsplit logical axis divisible by the group size. Each sender
+    splits its local tensor along `tensor_axis`; each receiver concatenates
+    those peer blocks along the original split axis in source-coordinate order.
+    The result changes the selected ownership attribute to `Split(tensor_axis)`.
+  - All four preserve global logical shape, dtype, storage and ownership on
     other mesh axes. Output layouts use canonical factorization; attributes
     referring to unaffected logical axes are remapped accordingly.
   - Every participant in a group participates in each collective occurrence,
@@ -1762,3 +1774,89 @@ class ReduceScatter(Op):
     cost evaluator. An analysis needing that evaluator MUST report them as
     unsupported, never as zero-cost layout views. The existing `Reshard` cost
     classification is unchanged.
+
+### 3.1 Bounded MoE dispatch and combine
+
+`ir/hir/sharding/alltoall.py` defines routed all-to-all with explicit, ordinary
+tensor metadata. Expert computation is a composition of HIR operations between
+dispatch and combine. The expanded representation gives each expert a bounded
+row buffer; actual counts describe the variable-size payload within that bound.
+
+```python
+class AllToAllDispatch(Op):
+    """Return expert-major tokens, route weights, source indices and live counts."""
+
+    x: Tensor
+    expert_indices: Tensor
+    expert_weights: Tensor
+    num_experts: int
+    capacity: int
+    mesh_axis: int
+
+class AllToAllCombine(Op):
+    """Accumulate already-weighted expert outputs at their original token owners."""
+
+    x: Tensor
+    source_indices: Tensor
+    counts: Tensor
+    like: Tensor
+    mesh_axis: int
+```
+
+Let `B` be the tuple of leading batch dimensions, `N` the global token extent
+within one batch, `H` the hidden extent, `K` the top-k extent, `E` the number of
+experts and `C` the capacity of each expert buffer. `P` is the extent of the
+selected mesh axis. Dispatch takes shapes `(*B, N, H)`, `(*B, N, K)` and
+`(*B, N, K)` and returns these fields in order:
+
+| Field | Global shape | Meaning |
+| --- | --- | --- |
+| Tokens | `(*B, E, C, H)` | One copy per active expert choice. |
+| Route weights | `(*B, E, C, 1)` | The corresponding unmodified router weight. |
+| Source indices | `(*B, E, C)` | Token index along the original global `N` axis. |
+| Counts | `(*B, E)` | Actual active rows per expert. |
+
+- constraints:
+  - All inputs MUST share the same concrete device mesh bound by the current
+    scope. The selected mesh axis MUST split the source token dimension.
+    Other mesh axes MAY split only leading batch dimensions or broadcast them.
+    Source tokens, expert indices and weights MUST have matching ownership.
+  - `N` MUST be divisible by `P`; symbolic extents are checked after binding.
+    `E` MUST be a positive integer divisible by `P`. Expert `e` belongs to mesh
+    coordinate `e // (E // P)`. Other coordinates identify independent groups.
+    Output ownership replaces the token split with an expert split and preserves
+    the leading batch splits. Partial and Dynamic ownership MUST be refused.
+  - Expert indices MUST be `i32` or `i64`. Each index MUST be `-1` or in
+    `[0, E)`. `-1` disables that choice, including its weight; a token with all
+    choices disabled produces no routes. Weights MUST be floating point, with
+    the same shape as the indices. Weights are neither normalized nor applied
+    during dispatch.
+  - Every active top-k slot creates one expert row. Multiple choices on the same
+    rank retain all their contributions; repeated expert IDs retain multiplicity.
+    Within each batch and expert, rows are ordered by source mesh coordinate,
+    source-local token index, then top-k position.
+  - `C` MUST be a nonnegative integer. A required row beyond `C` MUST fail with
+    a capacity diagnostic, never drop or truncate tokens. Unequal active token
+    counts are represented by disabled routes in the equal source allocations.
+  - Inactive token and weight rows MUST be zero, and inactive source indices
+    MUST be `-1`. Source indices and counts have dtype `i64`. Counts exclude
+    padding. The buffers are fixed capacity; the live payload is data-dependent.
+  - Combine takes expert outputs `(*B, E, C, H_out)`, source indices
+    `(*B, E, C)`, counts `(*B, E)`, and `like` of shape `(*B, N, H)` with the
+    original source ownership. Expert output and metadata MUST have matching
+    expert ownership. Metadata MAY use `i32` or `i64`.
+  - Combine returns `(*B, N, H_out)` in source ownership and the expert output
+    dtype. It MUST sum every active expert row at its source index without
+    applying another router weight. `like` supplies shape and ownership only;
+    none of its data values are read or added.
+  - Each count MUST be in `[0, C]`, and each active source index in `[0, N)`.
+    Combine MUST ignore all padding rows, including nonfinite data or invalid
+    indices beyond the live count. Tokens receiving no contributions are zero.
+  - Metadata is explicit value data, not hidden evaluator state. Reordering
+    expert rows requires corresponding source-index and weight reordering.
+    Group participation and occurrence ordering follow the device collective
+    contract above, including ranks with no active routes.
+  - Access relations describe bounded, index-dependent envelopes; counts exist
+    even for zero-capacity or empty payloads. They do not assume balanced routing
+    or equate allocated capacity with network traffic. Cost evaluators are
+    unregistered, so cost analysis MUST report these operations as unsupported.
