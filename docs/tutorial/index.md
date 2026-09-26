@@ -9,6 +9,8 @@ how to compare explicit collectives and state outputs against a reference using
 `check --reference ... --distributed`.
 For routed expert parallelism, [MoE all-to-all](./moe-alltoall.md) adds bounded
 dispatch, ordinary expert MLPs, and weighted output combination.
+Then [engine analysis](./engine-analysis.md) compares placements using explicit
+deployment/workload profiles, HBM budgets, communication and predicted throughput.
 
 ```text
   step one — describe it, until it agrees

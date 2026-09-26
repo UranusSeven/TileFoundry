@@ -1406,6 +1406,7 @@ def analyze_engine(function: Function, context: AnalyzeContext) -> None:
     that is not a non-constant function parameter MUST be rejected.
     Tensor partitions MUST use leading nonunit layout factors, with at most
     one mesh split per logical axis. Placement cannot exceed the deployment.
+    A selected analysis topology other than `gpu` MUST be refused.
   - Work for ordinary operations MUST come from the existing `CostEvaluator`
     applied to each rank's local logical tensor shapes. Function composition is
     inlined by the shared analysis gate. There is no cost registration per

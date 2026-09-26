@@ -1,8 +1,10 @@
 # RFC: Engine-scope optimization with distributed HIR
 
-Status: Accepted for implementation. The first implementation slice covers
-device collectives and explicit reference-HIR correctness checking;
-distributed cost analysis and broader strategy coverage remain on the roadmap.
+Status: Accepted for implementation. Device collectives, bounded MoE routing,
+explicit reference-HIR checking, and the initial distributed resource model
+are implemented. The executable engine tutorial demonstrates candidate
+comparison under a supplied workload and deployment profile. Broader strategy
+coverage and physical backend handoff remain on the roadmap.
 
 ## 1. Summary
 
@@ -383,6 +385,21 @@ the engine-stage search.
 The following phases are an implementation roadmap. Exact APIs and source diffs
 belong in subsequent implementation plans. Each phase should update its owning
 specifications together with the corresponding implementation.
+
+Implemented checkpoints cover distributed correctness and the first engine
+cost model: `analyze --engine --engine-profile PATH` reports rank ownership,
+resident/peak HBM, communication, a declared resource schedule and estimated
+throughput under an invocation budget. The model preserves local-analysis
+semantics and reports missing facts and routing assumptions explicitly.
+The [engine tutorial](../tutorial/engine-analysis.md) executes a small
+check–analyze–select comparison; it does not complete the physical runtime
+handoff required below.
+
+Remaining work includes richer placement/communication algorithms, attention
+and recurrent context-parallel examples, quantization/cache-update examples at
+engine scope, local-resource integration, and an executable physical backend
+realization of a selected strategy. The initial engine model uses conservative
+out-of-place buffers and does not infer in-place state reuse.
 
 ### Phase 1: Settle distributed semantic contracts
 

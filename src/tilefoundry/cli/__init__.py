@@ -156,6 +156,9 @@ def build_parser() -> argparse.ArgumentParser:
     for analysis in _ANALYSES:
         analyze.add_argument(f"--{analysis}", action="store_true", help=EVIDENCE[analysis])
     analyze.add_argument(
+        "--engine-profile", metavar="PATH", help="JSON deployment, workload and routing assumptions for --engine"
+    )
+    analyze.add_argument(
         "--topology",
         metavar="LEVEL",
         help=(
@@ -226,6 +229,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         analyses = tuple(
             name for name in _ANALYSES if getattr(args, name.replace("-", "_"))
         )
+        if args.engine_profile and "engine" not in analyses:
+            args._command_parser.error("--engine-profile requires --engine")
         if args.json and not analyses:
             args._command_parser.error(
                 "--json requires at least one analysis flag: "
@@ -285,6 +290,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             as_json=args.json,
             operands=args.operands,
             dims=one_extent_per_dim(parse_dims(args.dim)),
+            engine_profile=args.engine_profile,
         )
     except (AnalysisError, VerifyError, OSError, TypeError, ValueError) as error:
         print(f"tilefoundry: error: {error}", file=sys.stderr)

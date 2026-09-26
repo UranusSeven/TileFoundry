@@ -7,7 +7,7 @@ from pathlib import Path
 from tilefoundry.cli import data
 from tilefoundry.cli.models import render_source_directory, source_summary
 
-PAGES: tuple[str, ...] = ("index", "migrate", "optimize", "showcase", "distributed-check", "moe-alltoall")
+PAGES: tuple[str, ...] = ("index", "migrate", "optimize", "showcase", "distributed-check", "moe-alltoall", "engine-analysis")
 
 
 def page_path(page: str) -> Path:

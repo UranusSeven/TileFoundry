@@ -15,6 +15,7 @@ from tilefoundry.analysis.check import (
     _program_dim_vars,
     resolve_program_geometry,
 )
+from tilefoundry.analysis.engine_profile import load_engine_options
 from tilefoundry.cli.source import load_authored_ir, suggested_extents
 from tilefoundry.inspection import PythonPrintOptions, as_script
 from tilefoundry.inspection.analysis_report import (
@@ -30,6 +31,7 @@ EVIDENCE: dict[str, str] = {
     "memory": "where traffic lands and what storage remains live against capacity",
     "roofline": "which of compute or memory limits each value, and the limit in time",
     "performance": "when each value runs, where its buffers fit, and the time that takes",
+    "engine": "per-rank HBM, communication, execution time and useful workload throughput",
 }
 
 
@@ -90,6 +92,12 @@ def guidance() -> str:
                        and is unchanged by program splits
         performance    which level's parallel capacity the     the program shards
                        plan is issued against
+        engine         always the device-level gpu model       use --engine-profile
+
+        Engine profiles supply directed links, per-rank memory reserves, useful
+        work and an optional invocation latency budget. The engine result is a
+        model estimate under those assumptions. Missing facts remain unknown;
+        queueing and backend overheads outside the model are not included.
 
         Two assumptions the reported numbers rest on:
           logical traffic omits loop replication that does not change an access;
@@ -104,6 +112,7 @@ def guidance() -> str:
           tilefoundry spec analysis 1.2.2    memory
           tilefoundry spec analysis 1.2.3    roofline
           tilefoundry spec analysis 1.2.4    performance
+          tilefoundry spec analysis 5        engine
         """
     )
 
@@ -117,6 +126,7 @@ def run_authored_analysis(
     as_json: bool = False,
     operands: bool = False,
     dims: Mapping[str, int] | None = None,
+    engine_profile: str | None = None,
 ) -> int:
     """Analyse one authored HIR selection and print what was found.
 
@@ -125,6 +135,9 @@ def run_authored_analysis(
     another's records.
     """
     _watch(_ANALYSIS_TIMEOUT_SECONDS)
+    if engine_profile is not None and "engine" not in analyses:
+        raise ValueError("--engine-profile requires --engine")
+    options = load_engine_options(engine_profile) if engine_profile is not None else None
     module = load_authored_ir(source)
     function = module.entry_function()
     stated = {} if dims is None else dims
@@ -155,7 +168,7 @@ def run_authored_analysis(
         Path(out_path).write_text(annotated, encoding="utf-8")
         return 0
 
-    result = analyze(module, function, analysis=analyses, topology_level=topology, dims=dims)
+    result = analyze(module, function, analysis=analyses, topology_level=topology, dims=dims, options=options)
     rendered = render_analysis(result, operands=operands and not as_json)
     if as_json:
         Path(out_path).write_text(

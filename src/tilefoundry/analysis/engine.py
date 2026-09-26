@@ -530,6 +530,8 @@ def analyze_engine(function, context):
     options = context.options if context.options is not None else EngineOptions()
     if not isinstance(options, EngineOptions):
         raise AnalysisError("engine: options must be EngineOptions")
+    if context.topology_level not in (None, "gpu"):
+        raise AnalysisError("engine: the selected topology must be gpu")
     topology = next(
         (item for item in context.module.effective_topologies() if item.name == "gpu"), None
     )

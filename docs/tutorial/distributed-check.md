@@ -102,9 +102,10 @@ it does not infer a state feedback loop.
 
 The [evaluator contract](../spec/evaluator.md#7-distributed-evaluation) lists
 supported local operations and partition shapes. This checks collective value
-semantics, not a communication backend or performance. `analyze` currently
-reports device collectives as unsupported because their communication cost
-models are not registered.
+semantics, not a communication backend or performance. `analyze --engine`
+models their device-level resources and communication; see the
+[engine-analysis tutorial](./engine-analysis.md). Existing local analysis
+families retain their separate operation-support boundaries.
 
 
 Use `tilefoundry check --help` for comparison predicates and

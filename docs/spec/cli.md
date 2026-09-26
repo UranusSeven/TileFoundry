@@ -250,13 +250,15 @@ granularity.
     unknown family MUST name the available families. Checkout and installed
     lookups MUST report the same shipped families and files.
   - Its pages are `index`, `migrate`, `optimize`, `showcase`,
-    `distributed-check`, and `moe-alltoall`; the first three
+    `distributed-check`, `moe-alltoall`, and `engine-analysis`; the first three
     are the workflow and `showcase` is one kernel taken through six analyze-driven
     stages, exercising the authoring surface the other pages touch in part.
     `distributed-check` compares a device-parallel HIR with its reference using
     simulated ranks and explicit collectives.
     `moe-alltoall` executes bounded expert dispatch, a composed expert MLP,
     and combine against an explicit reference with file-backed routes.
+    `engine-analysis` checks alternative placements and compares their modeled
+    throughput under the same device budget, supplied memory reserves and SLO.
     Causal-LM decode sources are listed through `tutorial orchestrator`. A bare
     `tutorial` MUST print the `index` page followed by its own help, which names
     the pages a reader may ask for and `orchestrator`. `index` is that overview's
@@ -374,12 +376,26 @@ family: it type-checks the selection and writes its complete inferred HIR. The
 selected Module's resolved Target determines the hardware specification for an
 explicit analysis; there is no ordinary `--target` option.
 
+`--engine` selects the device-level resource and execution model. Its optional
+`--engine-profile PATH` reads the portable deployment, workload and routing
+assumptions from [analysis](./analysis.md#3-portable-engine-profiles).
+
 - constraints:
   - The whole `analyze` command MUST have a 300-second wall-clock budget. On
     expiry it MUST write `tilefoundry: error: analysis too complex, timed out
     after 300s` to standard error, flush that message, and exit nonzero. This
     budget is currently fixed and MUST NOT be exposed as a CLI flag or public
     analysis option.
+  - `--engine-profile` MUST be refused unless `--engine` is also selected.
+    Unknown profile fields and malformed values MUST fail before a report is
+    written. With no profile, missing deployment facts remain unknown.
+  - Engine analysis MUST use `gpu` topology; an explicit different `--topology`
+    MUST be refused. Its JSON retains per-rank findings, operations, transfers,
+    consumed target rates and supplied profile under the `engine` family.
+    Human reports summarize the same model and findings with diagnostics.
+  - A modeled capacity or SLO failure is a reported finding, not a command
+    execution error. Candidate selection MUST inspect feasibility; a successful
+    analysis command alone does not mean the candidate meets its constraints.
   - `analyze` MUST invoke the public operation once with every requested root,
     so their union dependency closure runs on one inlined Function view
     ([analysis §2](./analysis.md#2-composed-analysis)). Each closure member MUST

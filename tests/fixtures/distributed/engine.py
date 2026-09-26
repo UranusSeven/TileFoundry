@@ -11,7 +11,7 @@ from tilefoundry.analysis.facts import (
     MemoryHierarchyFacts,
     PerformanceServiceFacts,
 )
-from tilefoundry.dsl import ConstTensor, Mesh, Tensor, Topology, tf
+from tilefoundry.dsl import ConstTensor, DimVar, Mesh, Tensor, Topology, tf
 from tilefoundry.ir.types import DType
 from tilefoundry.target import Target
 from tilefoundry.target.facts import TopologyFacts, TopologyLimitFacts
@@ -67,3 +67,43 @@ class RepeatedState:
         for i in range(1000000):
             current = tf.add(current, x)
         return current
+
+
+TOKENS = DimVar("tokens", 1, 65536)
+
+
+@module(entry="run")
+class StrategyReference:
+    @func
+    def run(x: Tensor[(TOKENS, 64), "f32"], w: ConstTensor[(64, 64), "f32"]):
+        return tf.matmul(x, w)
+
+
+@module(entry="run", target=SyntheticTarget(capacity=64000), topologies=(Topology("gpu", 4),))
+class DP4:
+    @func(mesh=Mesh(("gpu",), (4,), names=("dp",)))
+    def run(
+        x: Tensor[(TOKENS @ mesh.dp, 64), "f32"],  # noqa: F821
+        w: ConstTensor[(64, 64), "f32"],
+    ):
+        return tf.matmul(x, w)
+
+
+@module(entry="run", target=SyntheticTarget(capacity=64000), topologies=(Topology("gpu", 4),))
+class TP2:
+    @func(mesh=Mesh(("gpu",), (2, 2), names=("dp", "tp")))
+    def run(
+        x: Tensor[(TOKENS @ mesh.dp, 64 @ mesh.tp), "f32"],  # noqa: F821
+        w: ConstTensor[(64 @ mesh.tp, 64), "f32"],  # noqa: F821
+    ):
+        return tf.allreduce(tf.matmul(x, w), mesh_axis=1)
+
+
+@module(entry="run", target=SyntheticTarget(capacity=64000), topologies=(Topology("gpu", 4),))
+class TP4:
+    @func(mesh=Mesh(("gpu",), (4,), names=("tp",)))
+    def run(
+        x: Tensor[(TOKENS, 64 @ mesh.tp), "f32"],  # noqa: F821
+        w: ConstTensor[(64 @ mesh.tp, 64), "f32"],  # noqa: F821
+    ):
+        return tf.allreduce(tf.matmul(x, w), mesh_axis=0)

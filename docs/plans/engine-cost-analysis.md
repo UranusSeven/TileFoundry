@@ -205,10 +205,17 @@ Public CLI checks and an executed notebook compare feasible candidates under
 fixed workload/hardware inputs. Profile/schema failures are exercised through
 the command, and source/metadata provenance remains reviewable.
 
-- [ ] analyze --engine accepts a portable deployment/workload profile.
-- [ ] Text and JSON expose the same capacity, timing and throughput assumptions.
-- [ ] A reusable example checks candidates and selects throughput under a supplied SLO.
-- [ ] The roadmap records remaining backend/handoff and strategy-coverage work accurately.
+Validation: the complete targeted CPU regression run passed 528 tests, with
+one existing cross-device skip and one existing CUDA-default CLI test excluded.
+The executable tutorial checks DP4, TP2 and TP4 at a bound token dimension,
+then selects TP2 with the supplied reserve and DP4 after removing that reserve.
+All source, specification, reference, comment, annotation, language and path
+checks pass. The published page is readable through the tutorial command.
+
+- [x] analyze --engine accepts a portable deployment/workload profile.
+- [x] Text and JSON expose the same capacity, timing and throughput assumptions.
+- [x] A reusable example checks candidates and selects throughput under a supplied SLO.
+- [x] The roadmap records remaining backend/handoff and strategy-coverage work accurately.
 
 <!-- policy_ac:start -->
 - [ ] Touched tests MUST be reviewed for redundancy: remove ones superseded by the retained workflow, and do not add source-shape or hypothetical-refactor guards unless that form is a public contract. <!-- policy_ac: milestone_review-0 -->

@@ -199,6 +199,7 @@ ownership, ordering, metadata validation and overflow behavior. Use
 `tilefoundry check --help` for predicates and `tilefoundry spec hir` for the
 operation definitions.
 
-This example validates HIR value semantics in the rank simulator. GPU lowering
-and distributed cost models remain separate work; `analyze` explicitly refuses
-these uncosted communication operations.
+This example validates HIR value semantics in the rank simulator. The [engine-analysis tutorial](./engine-analysis.md)
+shows device-level resource estimates through `analyze --engine`. Routing
+profiles refine its traffic bounds. Physical GPU lowering remains separate
+work, and local analysis families keep their existing support boundaries.
