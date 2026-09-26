@@ -35,6 +35,7 @@ unchanged; the new `engine` analysis reads the same checked, inlined HIR.
 - D9 Scope -- start with concrete single-level device meshes and uniform structured loops. Unsupported geometry fails with provenance. Loop work is aggregated rather than unrolled per token; local storage constraints remain the downstream local workflow's responsibility.
 - D10 Examples -- parameter-sharded examples expose resident ownership at the function boundary. An unplaced input is replicated; selecting a view with Reshard cannot free its backing allocation.
 - D11 Partial updates -- the out-of-place allocation policy charges initialization of preserved backing bytes for partially written results; otherwise cache-update traffic would implicitly assume in-place reuse while capacity models a separate result.
+- D12 Uneven collectives -- count each rank's received reduction elements from the actual ring chunks, rather than rounding the average rank share upward. A three-element two-rank reduction performs one and two additions respectively.
 
 ## Milestones
 
@@ -146,10 +147,42 @@ profiles and consumed target rates for reproduction.
 - `docs/spec/inspection.md`
 - `docs/spec/hir.md`
 
-### Milestone M4: CLI profiles and strategy comparison example
+### Milestone M3a: Uneven ring reduction accounting
 
 #### Depends
 - M3
+
+#### Target State Design
+
+##### Delivered
+```diff
+# src/tilefoundry/analysis/engine_communication.py
+-reductions = ceil(elements * (degree - 1) / degree)
++reductions = elements - size_of_this_ranks_initial_chunk
+```
+
+##### Accepted by
+
+A public analysis case reduces three output elements over two ranks. It
+independently expects one and two additions, with twelve sent bytes per rank.
+The profile and engine suites pass all 26 cases.
+
+- [x] Uneven ring chunks preserve the exact total reduction work and rank assignment.
+
+<!-- policy_ac:start -->
+- [ ] Touched tests MUST be reviewed for redundancy: remove ones superseded by the retained workflow, and do not add source-shape or hypothetical-refactor guards unless that form is a public contract. <!-- policy_ac: milestone_review-0 -->
+- [ ] A milestone that changes a public contract MUST list the owning `docs/spec/*.md` path in its `#### Related Files`; one that changes none lists no spec path. <!-- policy_ac: spec_impact-0 -->
+<!-- policy_ac:end -->
+
+#### Related Files
+- `src/tilefoundry/analysis/engine_communication.py`
+- `tests/analysis/test_engine_analysis.py`
+- `docs/spec/analysis.md`
+
+### Milestone M4: CLI profiles and strategy comparison example
+
+#### Depends
+- M3a
 
 #### Target State Design
 
@@ -186,13 +219,19 @@ the command, and source/metadata provenance remains reviewable.
 - `src/tilefoundry/cli/analyze.py`
 - `src/tilefoundry/cli/__init__.py`
 - `src/tilefoundry/cli/tutorial.py`
+- `src/tilefoundry/analysis/engine.py`
 - `tests/cli/test_cli_engine.py`
 - `tests/fixtures/distributed/engine.py`
 - `docs/tutorial/engine-analysis.ipynb`
 - `docs/tutorial/engine-analysis.md`
 - `docs/tutorial/index.md`
+- `docs/tutorial/distributed-check.ipynb`
+- `docs/tutorial/distributed-check.md`
+- `docs/tutorial/moe-alltoall.ipynb`
+- `docs/tutorial/moe-alltoall.md`
 - `docs/rfcs/engine-scope-optimization.md`
 - `docs/spec/cli.md`
+- `docs/spec/analysis.md`
 
 ## Final Gate
 

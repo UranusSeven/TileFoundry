@@ -213,3 +213,26 @@ class Update:
     assert found.ranks[0].read_bytes == 1648
     assert found.ranks[0].write_bytes == 1600
     assert found.predicted_ns == 3248
+
+
+def test_uneven_ring_chunks_charge_only_the_reductions_received_by_each_rank():
+    module = import_dsl(
+        """
+from tilefoundry import module, func
+from tilefoundry.dsl import Tensor, Mesh, Topology, tf
+from tests.fixtures.distributed.engine import SyntheticTarget
+@module(entry="run", target=SyntheticTarget(), topologies=(Topology("gpu", 2),))
+class OddPayload:
+    @func
+    def run(x: Tensor[(1, 2), "f32"], w: Tensor[(2, 3), "f32"]):
+        with Mesh(("gpu",), (2,), names=("tp",)) as mesh:
+            lhs = tf.reshard(x, (1, 2 @ mesh.tp), "gmem")
+            rhs = tf.reshard(w, (2 @ mesh.tp, 3), "gmem")
+            return tf.allreduce(tf.matmul(lhs, rhs), mesh_axis=0)
+""",
+        "OddPayload",
+    )
+    found, _ = record(module, replace(options(), workload=EngineWorkload()))
+    reduction = next(op for op in found.operations if op.operation == "AllReduce:0")
+    assert [dict(work.flops)["f32"] for work in reduction.work] == [1, 2]
+    assert [rank.sent_bytes for rank in found.ranks] == [12, 12]

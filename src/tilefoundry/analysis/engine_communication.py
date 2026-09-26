@@ -49,7 +49,8 @@ def communication_plan(call, ranks, rank_count, profile=None):
             read, written = tensor_bytes(held), tensor_bytes(output)
             reductions = 0
             if isinstance(call.target, (AllReduce, ReduceScatter)):
-                reductions = ceil(numel(held) * (degree - 1) / degree)
+                base, extra = divmod(numel(held), degree)
+                reductions = numel(held) - base - (position < extra)
             flops, operations = _reduction_work(held, reductions)
             work.append(EngineWork(rank, flops, operations, read, written))
             scratch.append((rank, max(read, written)))
