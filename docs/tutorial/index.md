@@ -7,6 +7,8 @@ implementation is source code, and either can be pointed at any command.
 For device-parallel HIR, [distributed checking](./distributed-check.md) shows
 how to compare explicit collectives and state outputs against a reference using
 `check --reference ... --distributed`.
+For routed expert parallelism, [MoE all-to-all](./moe-alltoall.md) adds bounded
+dispatch, ordinary expert MLPs, and weighted output combination.
 
 ```text
   step one — describe it, until it agrees

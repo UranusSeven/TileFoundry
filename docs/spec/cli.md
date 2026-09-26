@@ -249,12 +249,14 @@ granularity.
     every source file's leading docstring without importing or executing it. An
     unknown family MUST name the available families. Checkout and installed
     lookups MUST report the same shipped families and files.
-  - Its pages are `index`, `migrate`, `optimize`, `showcase`, and
-    `distributed-check`; the first three
+  - Its pages are `index`, `migrate`, `optimize`, `showcase`,
+    `distributed-check`, and `moe-alltoall`; the first three
     are the workflow and `showcase` is one kernel taken through six analyze-driven
     stages, exercising the authoring surface the other pages touch in part.
     `distributed-check` compares a device-parallel HIR with its reference using
     simulated ranks and explicit collectives.
+    `moe-alltoall` executes bounded expert dispatch, a composed expert MLP,
+    and combine against an explicit reference with file-backed routes.
     Causal-LM decode sources are listed through `tutorial orchestrator`. A bare
     `tutorial` MUST print the `index` page followed by its own help, which names
     the pages a reader may ask for and `orchestrator`. `index` is that overview's

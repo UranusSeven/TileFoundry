@@ -14,7 +14,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from tests.fixtures.distributed import projection
+from tests.fixtures.distributed import moe, projection
 from tests.fixtures.placed import gqa_decode, leaf_weights
 from tests.fixtures.shapes.composed_leaf_source import composed_leaf_source
 from tests.models.corpus import MODELS_ROOT
@@ -756,3 +756,29 @@ def test_explicit_reference_refuses_different_weight_bindings(tmp_path, capsys):
         "--out", "output[0]", "--fn", "equal", "--out", "output[1]", "--fn", "equal",
     ]) == 1
     assert "matching weight paths" in capsys.readouterr().err
+
+
+def test_routed_moe_reference_with_file_inputs(tmp_path, capsys):
+    generator = torch.Generator().manual_seed(31)
+    tokens = torch.randn(moe.D, moe.N, moe.H, generator=generator)
+    routes = torch.randint(0, moe.E, (moe.D, moe.N, moe.K), generator=generator)
+    gates = torch.rand(moe.D, moe.N, moe.K, generator=generator)
+    routes[0, 1] = -1
+    gates[0, 1] = float("nan")
+    paths = [tmp_path / name for name in ("tokens.pt", "routes.pt", "gates.pt")]
+    for path, value in zip(paths, (tokens, routes, gates)):
+        torch.save(value, path)
+    report_path = tmp_path / "moe.json"
+    reference = f"{moe.__file__}:Reference"
+    assert cli.main([
+        "check", f"{moe.__file__}:ExpertParallel", "--reference", reference,
+        "--distributed", "--inputs", "files:" + ",".join(map(str, paths)),
+        "--weights", "random", "--device", "cpu", "--out", "output",
+        "--fn", "allclose", "--atol", "2e-5", "--rtol", "2e-5",
+        "--json", str(report_path),
+    ]) == 0
+    assert capsys.readouterr().out == ""
+    report = json.loads(report_path.read_text())
+    assert report["passed"]
+    assert report["runs"][0]["evaluation"] == "distributed"
+    assert report["runs"][0]["reference"] == reference
