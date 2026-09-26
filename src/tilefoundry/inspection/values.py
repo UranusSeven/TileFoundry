@@ -181,6 +181,23 @@ class CommentPrinter:
         predicted = record.timeline.end_ns - record.timeline.start_ns
         return self._record("performance", (("predicted_ns", predicted), ("waves", record.waves)))
 
+    def print_EngineMetadata(self, record, **_):
+        return self._record("engine", (
+            ("model", record.model), ("predicted_ns", record.predicted_ns),
+            ("throughput_per_second", record.throughput_per_second), ("work_unit", record.work_unit),
+            ("capacity_fits", record.capacity_fits), ("routing_safe", record.routing_safe),
+            ("slo_met", record.slo_met), ("feasible", record.feasible),
+            ("ranks", record.ranks),
+        ))
+
+    def print_EngineRank(self, record):
+        return "(" + self._record("rank", (
+            ("rank", record.rank), ("weights_bytes", record.weights_bytes),
+            ("state_bytes", record.state_bytes), ("peak_hbm_bytes", record.peak_hbm_bytes),
+            ("capacity_bytes", record.capacity_bytes), ("reserve_bytes", record.reserve_bytes),
+            ("fits", record.fits),
+        )) + ")"
+
     def print_SourceSpanMetadata(self, record, **_):
         return self._single("source", f"{record.file}:{record.line}:{record.column}")
 

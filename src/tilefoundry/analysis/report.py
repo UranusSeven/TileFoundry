@@ -9,6 +9,7 @@ from dataclasses import fields, is_dataclass
 from types import UnionType
 from typing import Union, get_args, get_origin, get_type_hints
 
+from tilefoundry.analysis.engine_metadata import EngineMetadata
 from tilefoundry.analysis.metadata import (
     Breakdown,
     ComputeCostMetadata,
@@ -141,6 +142,7 @@ declare_record(MemoryMetadata, family="memory")
 declare_record(RegionMemoryMetadata, family="memory")
 declare_record(PerformanceMetadata, family="performance")
 declare_record(PerformanceSummaryMetadata, family="performance")
+declare_record(EngineMetadata, family="engine")
 
 
 def _type_text(type_: object) -> str:

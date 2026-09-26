@@ -1369,6 +1369,8 @@ class EngineMetadata(IRMetadata):
     feasible: bool | None
     assumptions: tuple[str, ...]
     diagnostics: tuple[str, ...]
+    options: EngineOptions | None = None
+    rates: EngineRates | None = None
 ```
 
 - constraints:
@@ -1379,3 +1381,97 @@ class EngineMetadata(IRMetadata):
     materializing an event per token or loop iteration.
   - Allocation capacity, bytes read, network payload and useful workload items
     are distinct quantities and MUST remain separately named in records.
+  - `options` retains the supplied profile. `EngineRates` retains the consumed
+    floating-point rates by dtype name, other service rates by name and HBM
+    bytes per second. Reports MUST preserve these inputs alongside provenance
+    so a changed profile or target rate cannot be mistaken for the same model.
+
+## 5. Device-level engine analysis
+
+The `engine` selector consumes `EngineOptions` through `analyze(..., options=...)`
+and attaches `EngineMetadata` to the checked, inlined function. Its model identity
+is `device-serial-ring`. It describes one device-level invocation, independently
+of the existing local `performance` family.
+
+```python
+def analyze_engine(function: Function, context: AnalyzeContext) -> None:
+    """Attach per-rank resource, communication and workload findings."""
+    ...
+```
+
+- constraints:
+  - The module MUST declare a positive concrete `gpu` topology. Execution meshes
+    MUST be supported contiguous single-level device meshes. A profile naming a
+    rank outside that topology, an unused routing operation, or a state input
+    that is not a non-constant function parameter MUST be rejected.
+    Tensor partitions MUST use leading nonunit layout factors, with at most
+    one mesh split per logical axis. Placement cannot exceed the deployment.
+  - Work for ordinary operations MUST come from the existing `CostEvaluator`
+    applied to each rank's local logical tensor shapes. Function composition is
+    inlined by the shared analysis gate. There is no cost registration per
+    composed kernel or parallel strategy. Unsupported primitive or geometric
+    cases MUST fail with operation provenance.
+  - Target `PerformanceServiceFacts` MUST be stated per `gpu`. HBM capacity
+    comes from a `gmem` level scoped per device or GPU, with explicit per-rank
+    profile overrides and reserves. Missing rates, paths or capacities MUST
+    remain unknown in dependent findings. Invalid stated rates MUST fail.
+  - Inputs are already in their declared placement. Unplaced parameters are
+    replicated on every deployment rank; declared sharding gives each owner its
+    local share. A later view MUST NOT reduce its backing allocation's capacity.
+    All reached weights remain resident regardless of how few elements are read.
+  - Every parameter remains live through the invocation. Named state inputs
+    and constant weights are reported separately. Returned views retain their
+    backing buffers; `output_bytes` MAY therefore overlap resident categories.
+    `Slice`, `Reshape`, `Local` and same-storage `Reshard` alias storage; other material
+    results are modeled out of place and freed after their last structural use.
+    A partially written material result matching its first operand's shape,
+    dtype and HBM residency MUST include reading that backing value and writing
+    the remaining result bytes; a partial-update traffic count alone does not
+    initialize an out-of-place result.
+  - HBM peaks include simultaneously live backing allocations, the rank's
+    runtime reserve, and one maximum input/output-payload-sized scratch buffer
+    for each executing collective. Loops with carried allocated results reserve
+    an additional carry generation. The report MUST identify the live buffers
+    at the limiting modeled peak. In-place reuse is not inferred.
+  - Ordinary operations serialize on each participating rank, taking the larger
+    of their summed compute-service time and HBM read/write time. Independent
+    ranks MAY overlap. Collective local services precede network phases, and
+    the operation completes as a blocking group operation. Send and receive
+    endpoints are separate resources, so opposite directions MAY overlap.
+  - All-reduce uses reduce-scatter plus all-gather ring phases; gather and
+    reduce-scatter use a ring, and regular all-to-all uses pairwise phases.
+    Every directed payload takes path startup latency plus bytes divided by
+    effective path bandwidth. Transfers sharing a declared network resource,
+    sender, or receiver serialize. Payload bytes exclude self transfers.
+  - Routed dispatch transports distinct token payloads plus source indices and
+    per-choice expert IDs/weights. Combine models local reduction of repeated
+    contributions before sending distinct source-token results and indices
+    back. Expanded expert rows and padded allocation MUST NOT be substituted
+    for distinct token traffic.
+  - A routing profile MUST match the operation's groups, source-token bounds,
+    top-k bounds and local batch/expert count shape. Counts exceeding capacity
+    make routing infeasible. Combine MAY reuse a profile carried by unchanged
+    dispatch metadata. Operation IDs are `OpClass:ordinal`, counted per class
+    in deterministic operand-first order in the inlined function.
+  - With no routing profile, independent peer upper bounds MUST be labeled
+    `upper-bound`; they need not be jointly attainable. Dispatch capacity is
+    proved safe for arbitrary routes only when it covers `N * K` per expert.
+    Otherwise routing feasibility is unknown. An originating dispatch's
+    capacity conclusion carries to combine with its unchanged metadata.
+  - Uniform integer-bounded loops MUST be aggregated without per-iteration
+    graph expansion. They repeat under resource barriers and reserve bounded
+    carry storage. Each operation records its first interval, work per
+    occurrence and total repetitions. Rank totals include repetitions.
+    Rank-dependent bounds MUST be refused.
+  - `predicted_ns` is the final resource envelope. Useful throughput is supplied
+    `work_items` divided by that duration; it is unknown when useful work or a
+    positive duration is unavailable. The count MUST NOT be multiplied by
+    replicas. The latency budget applies to modeled invocation execution only.
+  - Capacity, routing and SLO findings describe this declared model. Overall
+    feasibility MUST be false when a modeled constraint fails and unknown when
+    a required fact is missing. Assumptions and diagnostics MUST be retained.
+    Local storage limits, extra backend workspace beyond reserve, host loading,
+    launch/queueing overhead and network control packets are excluded.
+  - Existing local analyses keep their contracts. Combining `engine` with an
+    analysis lacking a cost evaluator for a reached primitive MUST retain that
+    analysis's unsupported-operation diagnostic.

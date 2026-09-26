@@ -1774,6 +1774,8 @@ class AllToAll(Op):
     cost evaluator. An analysis needing that evaluator MUST report them as
     unsupported, never as zero-cost layout views. The existing `Reshard` cost
     classification is unchanged.
+    The [engine analysis](./analysis.md#5-device-level-engine-analysis) supplies
+    separate device-level communication models for these operations.
 
 ### 3.1 Bounded MoE dispatch and combine
 
@@ -1858,5 +1860,7 @@ selected mesh axis. Dispatch takes shapes `(*B, N, H)`, `(*B, N, K)` and
     contract above, including ranks with no active routes.
   - Access relations describe bounded, index-dependent envelopes; counts exist
     even for zero-capacity or empty payloads. They do not assume balanced routing
-    or equate allocated capacity with network traffic. Cost evaluators are
-    unregistered, so cost analysis MUST report these operations as unsupported.
+    or equate allocated capacity with network traffic. Local cost evaluators
+    remain unregistered. Device-level work and transport are modeled by the
+    [engine analysis](./analysis.md#5-device-level-engine-analysis), which reports
+    routing assumptions and capacity uncertainty explicitly.

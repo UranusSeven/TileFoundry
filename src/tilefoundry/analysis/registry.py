@@ -17,6 +17,11 @@ class _PerformanceAnalyzer(Analyzer):
 
 def builtin_analyzer(selector: str) -> Analyzer | None:
     """Construct the one standard analysis service named by *selector*."""
+    if selector == "engine":
+        from tilefoundry.analysis.engine import analyze_engine  # noqa: PLC0415
+        from tilefoundry.analysis.engine_metadata import EngineMetadata  # noqa: PLC0415
+
+        return Analyzer("engine", analyze_engine, produces=(EngineMetadata,))
     if selector == "compute-cost":
         from tilefoundry.analysis.compute_cost import analyze_compute_cost  # noqa: PLC0415
         from tilefoundry.analysis.metadata import ComputeCostMetadata  # noqa: PLC0415

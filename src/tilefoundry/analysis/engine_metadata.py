@@ -6,6 +6,17 @@ from dataclasses import dataclass
 
 from tilefoundry.ir.core.metadata import IRMetadata
 
+from .engine_profile import EngineOptions
+
+
+@dataclass(frozen=True)
+class EngineRates:
+    """Retain the exact target service rates consumed by the engine model."""
+
+    flops_per_second: tuple[tuple[str, int], ...]
+    operations_per_second: tuple[tuple[str, int], ...]
+    hbm_bytes_per_second: int | None
+
 
 @dataclass(frozen=True)
 class EngineWork:
@@ -95,3 +106,5 @@ class EngineMetadata(IRMetadata):
     feasible: bool | None
     assumptions: tuple[str, ...]
     diagnostics: tuple[str, ...]
+    options: EngineOptions | None = None
+    rates: EngineRates | None = None

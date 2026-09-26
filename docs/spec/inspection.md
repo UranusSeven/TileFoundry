@@ -554,3 +554,9 @@ class DumpScope:
     `analysis.json` when `DumpFlags.ANALYSIS` is enabled. Every conclusion in
     that dump MUST come from the selected typed records; the report layer MUST
     NOT reconstruct target-aware findings that no record carries.
+
+Engine reports render the selected `EngineMetadata` as a concise `engine`
+summary plus its diagnostic advisories. Machine-readable reports retain all
+rank, operation, transfer and peak-buffer records under the `engine` family.
+Both forms use the same typed result; the semantic fields and model are owned
+by [analysis](./analysis.md#5-device-level-engine-analysis).

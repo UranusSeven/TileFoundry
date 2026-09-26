@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from tilefoundry.analysis.api import AnalysisResult
+from tilefoundry.analysis.engine_metadata import EngineMetadata
 from tilefoundry.analysis.metadata import (
     ComputeCostMetadata,
     PerformanceSummaryMetadata,
@@ -116,6 +117,10 @@ def _summary(
                 waves=summary.waves,
             )
         )
+    if "engine" in function_records:
+        engine = get_metadata(function, EngineMetadata)
+        views.append(engine)
+        views.extend(AdvisorySummary(Prose(note)) for note in engine.diagnostics)
     return tuple(views)
 
 

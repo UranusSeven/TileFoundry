@@ -51,6 +51,7 @@ from tilefoundry.target import UnsupportedCapabilityError
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 from tilefoundry.visitor_registry.typeinfer import inference_type
 
+from .engine_metadata import EngineMetadata
 from .errors import AnalysisError
 from .facts import ParallelCapacityFacts, PerformanceServiceFacts
 from .metadata import (
@@ -64,6 +65,7 @@ from .metadata import (
 
 _INLINE_NODES = 10_000
 _DERIVED_METADATA = {
+    EngineMetadata,
     ComputeCostMetadata,
     MemoryMetadata,
     PerformanceMetadata,
