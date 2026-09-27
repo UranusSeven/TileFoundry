@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import torch
+
+from tilefoundry.evaluator.registry import register_schedule_eval
+from tilefoundry.evaluator.value import TensorValue
 from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
+from tilefoundry.ir.hir.nn.matmul import matmul_relations
 from tilefoundry.ir.pattern import (
     ComposedLayoutPattern,
     LayoutPattern,
@@ -16,6 +21,10 @@ from tilefoundry.ir.pattern import (
 )
 from tilefoundry.ir.types import DType, Mesh, UnitType
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
+from tilefoundry.visitor_registry.access_relation import (
+    AccessRelations,
+    register_access_relation,
+)
 
 from .mma_atom import AtomPattern, FromAtom, MmaAtom, physical_frames_match
 from .sm80_mma import Mma as _Sm80Mma
@@ -54,6 +63,10 @@ class TiledMma(Op):
     def capability(self):
         return self.atom.capability
 
+    @property
+    def resource(self):
+        return self.atom.resource
+
     acc = ParamDef(
         kind="input",
         effect=MemoryEffect.READ | MemoryEffect.WRITE,
@@ -80,13 +93,29 @@ def _(call: "Call", ctx: "TypeInferContext") -> UnitType:
     return UnitType()
 
 
+@register_access_relation(TiledMma)
+def _tiled_mma_access_relation(call: "Call", ctx) -> AccessRelations:
+    acc, lhs, rhs = (ctx.type_of(arg) for arg in call.args)
+    contraction = matmul_relations(lhs.shape, rhs.shape, (-2, -1, -1, -2))
+    return AccessRelations(
+        inputs=(contraction.outputs[0], *contraction.inputs),
+        outputs=(contraction.outputs[0],),
+    )
+
+
+@register_schedule_eval(TiledMma)
+def _eval_scheduled_mma(ctx):
+    acc, lhs, rhs = (arg.data for arg in ctx.args)
+    return TensorValue(data=acc + torch.matmul(lhs, rhs), type=ctx.result_type)
+
+
 @register_verify_stmt(TiledMma)
 def verify_mma(call: "Call", ctx: "VerifyContext") -> None:
     """Check each operand against its atom and the active physical frame."""
     op = call.target
     atom = op.atom
     if ctx.scope is not None and ctx.scope.module is not None:
-        capabilities = ctx.scope.module.target.architecture.instruction_capabilities
+        capabilities = ctx.scope.module.target.architecture.capabilities
         if op.capability not in capabilities:
             ctx.error(call, f"target does not support {op.capability}")
     if not ctx.mesh_scope:

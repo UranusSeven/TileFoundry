@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tilefoundry.evaluator.registry import register_schedule_eval, schedule_eval_registry
 from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
@@ -11,6 +12,10 @@ from tilefoundry.ir.tir.memory.copy import Copy
 from tilefoundry.ir.types import Mesh
 from tilefoundry.ir.types.storage import StorageKind as S
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
+from tilefoundry.visitor_registry.access_relation import (
+    identity_relations,
+    register_access_relation,
+)
 from tilefoundry.visitor_registry.registries import typeinfer_registry, verify_stmt_registry
 
 
@@ -18,11 +23,10 @@ from tilefoundry.visitor_registry.registries import typeinfer_registry, verify_s
 class LdMatrix(Op):
     """Load one warp's shared-memory tile into the SM80 MMA A fragment."""
 
-    capability = "tensor_core"
+    capability = "ldmatrix"
+    resource = "tensor_core_engine"
 
-    src = ParamDef(
-        kind="input", effect=MemoryEffect.READ, pattern=utils.operand_tile(0, S.SMEM)
-    )
+    src = ParamDef(kind="input", effect=MemoryEffect.READ, pattern=utils.operand_tile(0, S.SMEM))
     dst = ParamDef(kind="input", effect=MemoryEffect.WRITE, pattern=Mma.A)
     scope = ParamDef(
         kind="attribute",
@@ -35,6 +39,8 @@ class LdMatrix(Op):
 
 register_typeinfer(LdMatrix)(typeinfer_registry.lookup(Copy))
 register_verify_stmt(LdMatrix)(verify_stmt_registry.lookup(Copy))
+register_access_relation(LdMatrix)(identity_relations(2))
+register_schedule_eval(LdMatrix)(schedule_eval_registry.lookup(Copy))
 
 
 __all__ = ["LdMatrix"]

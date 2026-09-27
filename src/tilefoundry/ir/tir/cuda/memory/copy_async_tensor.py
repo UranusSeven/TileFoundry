@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from enum import Enum
 
+from tilefoundry.evaluator.registry import register_schedule_eval
+from tilefoundry.evaluator.value import TensorValue
 from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
@@ -24,6 +26,10 @@ from tilefoundry.ir.pattern import (
 from tilefoundry.ir.types import Layout, Mesh, Swizzle, UnitType
 from tilefoundry.ir.types.storage import StorageKind as S
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
+from tilefoundry.visitor_registry.access_relation import (
+    identity_relations,
+    register_access_relation,
+)
 
 TMA_RANK = 5
 BOX_EXTENT = 256
@@ -145,7 +151,8 @@ def _warp_scope() -> MeshPattern:
 class CopyAsyncTensor(Op):
     """Move one tensor-map box between global and shared memory."""
 
-    capability = "tma"
+    capability = "cp.async.bulk.tensor"
+    resource = "tma_engine"
 
     src = ParamDef(
         kind="input",
@@ -187,6 +194,14 @@ class CopyAsyncTensor(Op):
 @register_typeinfer(CopyAsyncTensor)
 def _(call: "Call", ctx: "TypeInferContext") -> UnitType:
     return UnitType()
+
+
+register_access_relation(CopyAsyncTensor)(identity_relations(2))
+
+
+@register_schedule_eval(CopyAsyncTensor)
+def _eval_scheduled_copy_async_tensor(ctx):
+    return TensorValue(data=ctx.args[0].data, type=ctx.result_type)
 
 
 @register_verify_stmt(CopyAsyncTensor)
