@@ -24,8 +24,9 @@ results together ([cli §Analyze](./cli.md#analyze)).
 
 Typed records use the immutable `IRMetadata` and optional comment interface
 defined by [core-ir §2](./core-ir.md#2-expr). Their attachment point says what
-they describe: a record on a `Call` describes that call, while a record on a
-`Function` describes the whole function.
+they describe: a record on a `Call` describes that call, a record on a
+`MeshRegion` describes that execution stage, and a record on a `Function`
+describes the whole function.
 
 - constraints:
   - One record type MUST mean the same quantity at every attachment point.
@@ -41,7 +42,7 @@ Each owns its record types and declares its dependencies and output additions.
 | Selector | Requires | Owns | Attaches to | Rests on | Text summary adds | Annotates equations |
 |---|---|---|---|---|---|---|
 | `compute-cost` | - | `ComputeCostMetadata` | every measured Call and the Function | the authored program | `compute-cost` | every measured Call |
-| `memory` | - | `MemoryMetadata`, `RegionMemoryMetadata` | `MemoryMetadata` on every measured Call; `RegionMemoryMetadata` on the Function | the authored program, `MemoryHierarchyFacts`, `TopologyFacts` | `memory`, `advisory` | every measured Call |
+| `memory` | - | `MemoryMetadata`, `RegionMemoryMetadata` | `MemoryMetadata` on every measured Call; `RegionMemoryMetadata` on the Function and each occupied `MeshRegion` | the authored program, `MemoryHierarchyFacts`, `TopologyFacts` | `memory`, `advisory` | every measured Call |
 | `roofline` | `compute-cost`, `memory` | `RooflineMetadata` | every measured Call and the Function | `ThroughputFacts` | `roofline` | every measured Call |
 | `performance` | `compute-cost`, `memory` | `PerformanceMetadata`, `PerformanceSummaryMetadata` | `PerformanceMetadata` on every Call with a modeled duration; `PerformanceSummaryMetadata` on the Function | `ThroughputFacts`, `TopologyFacts`, `MemoryHierarchyFacts` | `performance` | every Call with a modeled duration |
 
@@ -224,8 +225,9 @@ is read off the Op's own registered evaluator and the amounts its access
 relations reach.
 
 Every measured `Call` carries `MemoryMetadata`; every reachable `Function`
-carries `RegionMemoryMetadata`. A `LoopRegion` carries neither an empty record
-nor a footprint merely to reserve an attachment point.
+carries `RegionMemoryMetadata`, as does each `MeshRegion` whose execution window
+contains a live value. A `LoopRegion` and an empty `MeshRegion` carry no record
+merely to reserve an attachment point.
 
 ```python
 class MemoryMetadata(IRMetadata):
@@ -235,6 +237,8 @@ class MemoryMetadata(IRMetadata):
     traffic: Traffic = Traffic()
     operands: tuple[TrafficBytes, ...] = ()
     footprint: Footprint | None = None
+    buffer_bytes: int | None = None
+    offsets: tuple[int, ...] = ()
 
 
 class ReuseWindow:
@@ -250,7 +254,7 @@ class ReuseWindow:
 
 
 class RegionMemoryMetadata(IRMetadata):
-    """One Function's aggregate memory conclusions."""
+    """One Function's or MeshRegion stage's memory conclusions."""
 
     solver_status: str
     topologies: tuple[str, ...] = ()
@@ -302,6 +306,8 @@ anything; it does not say how much, and an Op with no relation fails closed.
 | `MemoryMetadata.topologies` | The effective Module topology levels, coarsest first. | No |
 | `MemoryMetadata.traffic` | One occurrence's per-boundary movement, grouped by storage and communication boundary. | No; projection reads resolved Mesh and topology extents. |
 | `MemoryMetadata.operands` | One occurrence's movement in order `(*call.args, call)`. | No |
+| `MemoryMetadata.buffer_bytes` | The bytes in one physical copy of an address-placed `gmem` or `smem` Call result, or `None` when the result is not address-placed. | No |
+| `MemoryMetadata.offsets` | The byte offset of each physical result copy, in copy order. An `rmem` result has no reported offsets. | No |
 | `RegionMemoryMetadata.topologies` | The same effective Module topology levels. | No |
 | `RegionMemoryMetadata.traffic` | Every reachable occurrence. `logical` multiplies only loops the value varies in; `total` and `per_unit` multiply every enclosing loop. | No |
 
@@ -431,29 +437,35 @@ are monotonic across the whole Function, including nested and sibling regions.
 | `ValueLifetime.binding` | Use the parameter or binding name, suffixed with `:` and the line of the value's source span when it has one. Repeated names differ by the printer's numeric suffix in definition order. A value with neither name nor span is `<value N>` in definition order. | No |
 | `ValueLifetime.memory_level` | Emit one lifetime per storage level occupied by the value's Type. | No |
 | `ValueLifetime.bytes` | Project the Type through every authored split at or coarser than the explicit level's `owner`, then take its logical bytes; a target-owned or undeclared level remains global. A `ScheduleOp` whose selected instruction has a write-only result occupies `buffers` copies of those bytes; a `READ \| WRITE` result occupies one. | `MemoryHierarchyFacts.explicit_levels[].owner` |
-| `ValueLifetime.defined_at` | Definition event on the Function-wide structured SSA timeline. | No |
+| `ValueLifetime.defined_at` | Definition event on the Function-wide structured SSA timeline. A staged (`buffers > 1`) result starts at its containing loop's phi event rather than its own definition event. | No |
 | `ValueLifetime.last_used_at` | Greatest ordinary-consumer, region-entry, loop-backedge, or region-exit use event; the final timeline event for a parameter. | No |
 | `ValueLifetime.persistent` | True for parameters and false for body allocations. | No |
 | `RegionMemoryMetadata.lifetimes` | Every value residency except a non-material view. | As above |
 
 - constraints:
   - `Reshape` and `Transpose` describe bytes their operand already holds and
-    MUST NOT receive independent lifetimes. Every other result, including a
-    window, tuple field, or result that overwrites a destination, MUST allocate
-    its own. Analysis MUST use operation semantics for this distinction rather
-    than infer aliasing from layouts.
+    MUST NOT receive independent lifetimes. A result reached only through a
+    `MeshRegion` result binding edge and tuple projections likewise describes
+    bytes already held by the region body and MUST NOT receive an independent
+    lifetime. Every other result, including a window or a result that overwrites
+    a destination, MUST allocate its own. Analysis MUST use operation semantics
+    for this distinction rather than infer aliasing from layouts.
   - A caller-owned parameter MUST NOT be reused. Donation is a contract with
     the caller, not a conclusion this family may draw.
 
 ##### `MemoryLevelPeak`
 
 Capacity is settled against authored definition order, which fixes every
-buffer's lifetime before any is measured. For `gmem` and `smem`, exact
-polyhedral access relations may let the solver overlap a dead pointwise operand
-with its result or embed an `insert_slice` update in its result. Every logical
-SSA box remains in the model. The concrete arrangement is not reported. `rmem`
-is not address-solved and reports only the largest single projected logical
-value.
+buffer's lifetime before any is measured. Whole-Function `gmem` and `smem`
+peaks use exact polyhedral access relations to place addressable values; the
+Call results report their concrete offsets. A `MeshRegion` peak instead scans
+the live-byte total over its entry-to-exit window. Its `rmem` rows are
+additionally restricted to values whose authored `ShardLayout.mesh`, at every
+topology level named by the region, selects units within that region's mesh.
+Levels omitted by the region do not reject a value. `rmem` is not
+address-solved: required-alias groups count as one physical buffer, and the
+Function reports the maximum of all stage peaks and a whole-Function live-byte
+scan of values that no `MeshRegion` claims.
 
 ```python
 class MemoryLevelPeak:
@@ -468,7 +480,7 @@ class MemoryLevelPeak:
 | Field | How it is computed | Reads the target |
 |---|---|---|
 | `MemoryLevelPeak.memory_level` | Each storage level with at least one lifetime or traffic entry, sorted by name. | No |
-| `MemoryLevelPeak.peak_bytes` | For `gmem` and `smem`, the address high-water mark of the first feasible whole-Function placement. Exact pointwise relations and exact `insert_slice` partitions may permit overlap; widened or unknown relations do not. For `rmem`, the largest single projected logical value. | No |
+| `MemoryLevelPeak.peak_bytes` | On a Function, the address high-water mark of the first feasible `gmem` or `smem` placement; its `rmem` peak is the maximum of every `MeshRegion` stage peak and the whole-Function live-byte peak of values no mesh region claims. On a `MeshRegion`, the greatest live-byte total in its inclusive entry-to-exit event window; `rmem` compares only topology levels named by the region and includes a value when its selection at each such level is within the region's mesh. | No |
 | `MemoryLevelPeak.persistent_bytes` | Sum of persistent lifetimes at that level. | No |
 | `MemoryLevelPeak.capacity_bytes` | Capacity of the matching explicit level, or `None` when unknown. | `MemoryHierarchyFacts.explicit_levels[].capacity_bytes` |
 | `RegionMemoryMetadata.peaks` | One peak per occupied or moved storage level. | As above |
@@ -477,8 +489,11 @@ class MemoryLevelPeak:
 | `RegionMemoryMetadata.advisories` | Lower-severity target-aware memory findings recorded by this family. | `MemoryHierarchyFacts` |
 
 - constraints:
-  - `RegionMemoryMetadata` MUST be attached per reachable `Function`; a peak
-    spans its live ranges and belongs to no single expression.
+  - `RegionMemoryMetadata` MUST be attached per reachable `Function` and per
+    `MeshRegion` with a live value at any storage level. A mesh-region record
+    carries only its topology names and per-level peaks; whole-Function traffic,
+    footprints, reuse windows, lifetimes, errors, and advisories stay on the
+    Function.
   - An access relation that keeps a parameter with a stated finite range is
     exact and MAY prove overlap. A widened relation, and one with an unbounded
     parameter, MUST NOT.
@@ -489,6 +504,18 @@ class MemoryLevelPeak:
     MUST NOT make a program unplaceable, and a level owned per unit of a topology
     other than the one being analysed MUST fail rather than be assumed. Domains
     holding the same buffers are one question, decided once.
+  - A loop carry's initial value, parameter, yielded value, and result MUST use
+    one physical buffer when their sizes agree. An exact zero-offset operand
+    relation MUST likewise use one buffer when the result is no larger than the
+    operand, including a narrowing pointwise operation; an exact contained
+    relation MUST keep the operand range inside the result range. These alias
+    requirements are mandatory rather than optional placement choices.
+  - Every placed offset MUST be aligned to the greater of 16 bytes and the
+    result element width. A staged result's copies MUST be contiguous: copy
+    `k` starts at the solved block offset plus `k * buffer_bytes`.
+  - Mandatory aliases, alignment, and lifetime interference that have no
+    feasible joint placement MUST raise `AnalysisError`; analysis MUST NOT
+    silently discard a required alias.
   - A domain that cannot be expressed or does not settle in time MUST raise
     `AnalysisError` and leave no record. The solver MUST stop at its first
     feasible assignment rather than prove a minimum. Capacity MUST NOT restrict

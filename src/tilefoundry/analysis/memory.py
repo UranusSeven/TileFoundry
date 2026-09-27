@@ -8,6 +8,7 @@ from tilefoundry.ir.core import (
     Call,
     Constant,
     Expr,
+    Tuple,
     VerifyError,
     describe_expr,
     get_metadata,
@@ -15,12 +16,13 @@ from tilefoundry.ir.core import (
 )
 from tilefoundry.ir.core import attach_metadata as attach
 from tilefoundry.ir.core.module import Module
-from tilefoundry.ir.core.param_def import MemoryEffect
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.hir.schedule import ScheduleOp
+from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.types import TensorType, TupleType, Type
+from tilefoundry.ir.types.mesh import Mesh, separate, within_scope
+from tilefoundry.ir.types.shard_layout import shard_layout_of
 from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.ir.types.utils import bytes_by_storage
 from tilefoundry.ir.visitor import ExprVisitor
@@ -38,7 +40,7 @@ from tilefoundry.visitor_registry.access_relation import (
 from tilefoundry.visitor_registry.contexts import Cost, CostContext, FunctionScope
 from tilefoundry.visitor_registry.visitors import CostEvaluator
 
-from .allocation import AllocationValue, solve_allocation
+from .allocation import AllocationValue, alias_components, find_aliases, solve_allocation
 from .errors import AnalysisError
 from .facts import MemoryHierarchyFacts
 from .footprint import (
@@ -51,7 +53,7 @@ from .footprint import (
     wave_of,
 )
 from .iteration_scope import IterationScope, walk_scopes
-from .liveness import Liveness, analyze_liveness
+from .liveness import Liveness, analyze_liveness, result_copies
 from .metadata import (
     Breakdown,
     MemoryLevelPeak,
@@ -376,39 +378,36 @@ def add_traffic(
                 _accumulate(into.per_unit.setdefault(name, {}), unit, moved, total_trips)
 
 
+def view_root(value: Expr) -> Expr:
+    """Follow region results and tuple projections to their material value."""
+    while True:
+        if isinstance(value, MeshRegion):
+            value = value.body
+            continue
+        if isinstance(value, Call) and isinstance(value.target, TupleGetItem):
+            source = view_root(value.args[0])
+            index = value.args[1]
+            if (
+                isinstance(source, Tuple)
+                and isinstance(index, Constant)
+                and type(index.value) is int
+                and 0 <= index.value < len(source.elements)
+            ):
+                value = source.elements[index.value]
+                continue
+        return value
+
+
 def _resident_value_ids(function: Function, liveness: Liveness) -> frozenset[int]:
     """Values whose SSA interval represents independently resident bytes."""
     result = {id(parameter) for parameter in function.params}
     for interval in liveness.intervals:
         value = interval.value
-        if isinstance(value, (Call, Constant, LoopRegion)):
+        if isinstance(value, (Call, Constant, LoopRegion)) and view_root(value) is value:
             result.add(id(value))
         if isinstance(value, LoopRegion):
             result.update(id(phi) for phi in value.carried_args)
     return frozenset(result)
-
-
-def _result_copies(expr: Expr) -> int:
-    """Physical result slots represented by one scheduled SSA value."""
-    if not isinstance(expr, Call) or not isinstance(expr.target, ScheduleOp):
-        return 1
-    op = expr.target.op
-    schema = getattr(type(op), "_op_schema", None)
-    if schema is None:
-        return 1
-    result = next(
-        (
-            param
-            for param in schema.signature
-            if param.kind == "input"
-            and param.effect is not None
-            and param.effect & MemoryEffect.WRITE
-        ),
-        None,
-    )
-    if result is None or result.effect & MemoryEffect.READ:
-        return 1
-    return expr.target.buffers
 
 
 def _project_allocation_values(
@@ -427,7 +426,7 @@ def _project_allocation_values(
     for label, interval in zip(labels, intervals, strict=True):
         expr = interval.value
         persistent = id(expr) in parameter_ids
-        copies = _result_copies(expr)
+        copies = result_copies(expr)
         for memory_level, amount in bytes_by_storage(local.local_type_of(expr)).items():
             if facts.explicit(memory_level) is None:
                 continue
@@ -446,6 +445,75 @@ def _project_allocation_values(
                     ),
                 )
             )
+    return tuple(result)
+
+
+def peak_in_window(rows: list[ValueLifetime], entered_at: int, exited_at: int) -> int:
+    """Sum the live bytes at each event in one inclusive timeline window."""
+    peak = 0
+    for point in range(entered_at, exited_at + 1):
+        peak = max(
+            peak,
+            sum(item.bytes for item in rows if item.defined_at <= point <= item.last_used_at),
+        )
+    return peak
+
+
+def coalesced_peak_in_window(
+    values: tuple[AllocationValue, ...],
+    components: dict[int, int],
+    entered_at: int,
+    exited_at: int,
+) -> int:
+    """Sum one physical buffer per required-alias group at each event."""
+    peak = 0
+    for point in range(entered_at, exited_at + 1):
+        live: dict[int, int] = {}
+        for item in values:
+            lifetime = item.lifetime
+            if lifetime.defined_at <= point <= lifetime.last_used_at:
+                group = components[id(item.value)]
+                live[group] = max(live.get(group, 0), lifetime.bytes)
+        peak = max(peak, sum(live.values()))
+    return peak
+
+
+def held_in_region(value_mesh: Mesh, region_mesh: Mesh) -> bool:
+    """Whether the region selects holders of *value_mesh* at every level it names.
+
+    A value mesh may also name enclosing levels. Those do not reject a region
+    that states only an inner level; each region level is compared independently
+    so sliced offsets remain in that topology's own numbering.
+    """
+    value_levels = {
+        getattr(level.topologies[0], "name", level.topologies[0]): level
+        for level in separate(value_mesh)
+    }
+    for region_level in separate(region_mesh):
+        name = getattr(region_level.topologies[0], "name", region_level.topologies[0])
+        value_level = value_levels.get(name)
+        if value_level is None or not within_scope(value_level, region_level):
+            return False
+    return True
+
+
+def values_in_region(
+    values: tuple[AllocationValue, ...],
+    region: MeshRegion,
+    entered_at: int,
+    exited_at: int,
+) -> tuple[AllocationValue, ...]:
+    """Resident values whose lifetimes and ownership intersect one mesh region."""
+    result = []
+    for item in values:
+        lifetime = item.lifetime
+        if lifetime.last_used_at < entered_at or lifetime.defined_at > exited_at:
+            continue
+        if lifetime.memory_level == str(StorageKind.RMEM):
+            layout = shard_layout_of(getattr(item.value.type, "layout", None))
+            if layout is None or not held_in_region(layout.mesh, region.mesh):
+                continue
+        result.append(item)
     return tuple(result)
 
 
@@ -692,9 +760,65 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
         placement,
     )
     lifetimes = tuple(item.lifetime for item in allocation_values)
+    rmem_values = tuple(
+        item for item in allocation_values if item.lifetime.memory_level == str(StorageKind.RMEM)
+    )
+    rmem_groups = alias_components(
+        len(rmem_values),
+        find_aliases(rmem_values, liveness, context.root),
+    )
+    rmem_components = {
+        id(item.value): group for item, group in zip(rmem_values, rmem_groups, strict=True)
+    }
     solver_options = (
         context.options if isinstance(context.options, MemoryOptions) else MemoryOptions()
     )
+    region_rmem_peaks: list[int] = []
+    claimed_rmem: set[int] = set()
+    for window in liveness.regions:
+        region_values = values_in_region(
+            allocation_values,
+            window.region,
+            window.entered_at,
+            window.exited_at,
+        )
+        region_levels = []
+        for name in sorted({item.lifetime.memory_level for item in region_values}):
+            rows = [item.lifetime for item in region_values if item.lifetime.memory_level == name]
+            declared = facts.explicit(name)
+            peak = (
+                coalesced_peak_in_window(
+                    tuple(item for item in region_values if item.lifetime.memory_level == name),
+                    rmem_components,
+                    window.entered_at,
+                    window.exited_at,
+                )
+                if name == str(StorageKind.RMEM)
+                else peak_in_window(rows, window.entered_at, window.exited_at)
+            )
+            region_levels.append(
+                MemoryLevelPeak(
+                    memory_level=name,
+                    peak_bytes=peak,
+                    persistent_bytes=sum(item.bytes for item in rows if item.persistent),
+                    capacity_bytes=(declared.capacity_bytes if declared is not None else None),
+                )
+            )
+            if name == str(StorageKind.RMEM):
+                region_rmem_peaks.append(peak)
+                claimed_rmem.update(
+                    id(item.value) for item in region_values if item.lifetime.memory_level == name
+                )
+        if region_levels:
+            attach(
+                window.region,
+                RegionMemoryMetadata(
+                    solver_status="feasible",
+                    topologies=tuple(locals_by_unit),
+                    peaks=tuple(region_levels),
+                ),
+            )
+
     levels_list: list[MemoryLevelPeak] = []
     for name in sorted(
         {item.memory_level for item in lifetimes} | set(memory_context.storage.total)
@@ -712,18 +836,34 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
                 options=solver_options,
             )
             peak = solved.peak_bytes
-        elif name == str(StorageKind.RMEM):
-            peak = max((item.bytes for item in rows), default=0)
-        else:
-            peak = 0
-            end = max((item.last_used_at for item in rows), default=-1)
-            for point in range(end + 1):
-                peak = max(
-                    peak,
-                    sum(
-                        item.bytes for item in rows if item.defined_at <= point <= item.last_used_at
+            offsets = dict(solved.offsets)
+            for item in values:
+                if not isinstance(item.value, Call):
+                    continue
+                copies = result_copies(item.value)
+                buffer_bytes = item.lifetime.bytes // copies
+                moved = get_metadata(item.value, MemoryMetadata)
+                if moved is None:
+                    raise AnalysisError("memory: placed Call has no movement record")
+                attach(
+                    item.value,
+                    replace(
+                        moved,
+                        buffer_bytes=buffer_bytes,
+                        offsets=tuple(
+                            offsets[id(item.value)] + copy * buffer_bytes for copy in range(copies)
+                        ),
                     ),
                 )
+        elif name == str(StorageKind.RMEM):
+            unclaimed = tuple(item for item in values if id(item.value) not in claimed_rmem)
+            peak = max(
+                max(region_rmem_peaks, default=0),
+                coalesced_peak_in_window(unclaimed, rmem_components, 0, liveness.timeline_end),
+            )
+        else:
+            end = max((item.last_used_at for item in rows), default=-1)
+            peak = peak_in_window(rows, 0, end)
         levels_list.append(
             MemoryLevelPeak(
                 memory_level=name,
