@@ -8,7 +8,7 @@ the work, structural Stmts carry control flow.
   `body` is a `Sequential`; the function returns no value.
 - **Stmt tree**: function bodies are nested Stmts only. Exprs appear
   inside Stmt fields (e.g. `LetStmt.value`, `For.start`).
-- **Effect Ops** (`Copy`, `Fill`, `Cast`, `Mma`, `ReLU`, `RMSNorm`, `Reduce`)
+- **Effect Ops** (`Copy`, `Fill`, `Cast`, `Mma`, `ReLU`, `Reduce`)
   are value-class Ops registered with `@register_op`; in Stmt
   position they are invoked as `Evaluate(op, args)`
   ([§1.4](#14-evaluate)).
@@ -637,26 +637,9 @@ class ReLU(Op):
     src: Tensor
     dst: Tensor
 ```
-- constraints: []
-
-##### RMSNorm
-```python
-class RMSNorm(Op):
-    """Effect form; fused RMS normalisation written into ``dst``.
-
-    Attributes:
-        src: input; input tensor, reduced over its last axis.
-        dst: input; normalised-output tensor.
-        weight: input; 1-D scale multiplied onto the normalised output.
-        eps: attribute; epsilon applied with rsqrt.
-    """
-
-    src: Tensor
-    dst: Tensor
-    weight: Tensor
-    eps: float
-```
-- constraints: []
+- constraints:
+  - `src` declares `READ`; `dst` declares `WRITE`; both are rmem tensors. A tile held elsewhere
+    is moved in and out by `Copy`, which schedule inserts from this declaration.
 
 #### Tensor Ops (`tir.tensor.*`)
 
@@ -681,11 +664,18 @@ class Reduce(Op):
     kind: ReduceKind
 ```
 - constraints:
+  - `src` declares `READ`, `dst` `WRITE`, and `workspace` `READ | WRITE`. `src` and `dst` may
+    live in any storage; `workspace` is smem, because every warp posts a partial there and reads
+    the others back.
+  - both dtypes are f32, f16, or bf16.
+  - `src` and `dst` carry a `ShardLayout` over one thread mesh; `src`'s layout carries no swizzle
+    and no offset.
   - `Reduce` carries no dispatch parameter; runtime selects the strategy.
   - `workspace` is present only when lowering sizes cross-warp staging.
   - All forms lower to the single public runtime entry
     `tilefoundry::ops::reduce<Op, Axes>(src, dst[, workspace])`.
-  - Plain and sharded runtime extents/tiers are derived inside the runtime.
+  - Sharded extents and tiers are derived inside the runtime; this TIR declaration does not expose
+    the runtime's Plain tier.
 
 ##### Dot
 
@@ -711,6 +701,8 @@ class Dot(Op):
     workspace: Tensor | None = None
 ```
 - constraints:
+  - `lhs` and `rhs` declare `READ`; `dst` declares `WRITE`; `workspace` declares `READ | WRITE`.
+    `lhs`, `rhs`, and `dst` may live in any storage; `workspace` is smem.
   - **No axes attribute.** `Reduce` names its axes because
     `ops::reduce<Op, Axes>` takes them as a template argument; the axes `Dot`
     contracts are the ones the operands' meshes already contract, so restating
@@ -763,6 +755,8 @@ class Clamp(Op):
 ```
 
 - constraints:
+  - `src` declares `READ`; `dst` declares `WRITE`; both are rmem tensors. A tile held elsewhere
+    is moved in and out by `Copy`, which schedule inserts from this declaration.
   - `src` and `dst` MUST carry the same dtype; the effect writes
     `min(max(src, min_val), max_val)` elementwise into `dst`.
 
@@ -784,6 +778,8 @@ class Binary(Op):
     kind: BinaryKind
 ```
 - constraints:
+  - `lhs` and `rhs` declare `READ`; `dst` declares `WRITE`; all three are rmem tensors. A tile held
+    elsewhere is moved in and out by `Copy`, which schedule inserts from this declaration.
   - Lowers to the binary runtime family without per-kind TIR classes.
 
 ##### Unary
@@ -802,6 +798,8 @@ class Unary(Op):
     kind: UnaryKind
 ```
 - constraints:
+  - `src` declares `READ`; `dst` declares `WRITE`; both are rmem tensors. A tile held elsewhere
+    is moved in and out by `Copy`, which schedule inserts from this declaration.
   - Lowers to the unary runtime family without per-kind TIR classes.
 
 #### `Launch`

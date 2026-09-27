@@ -7,7 +7,7 @@ from enum import Enum
 from tilefoundry.ir.clause.layout import is_layout_wildcard
 from tilefoundry.ir.core.param_def import collect_param_defs
 from tilefoundry.ir.pattern.pattern import Pattern
-from tilefoundry.ir.types import Broadcast, Split
+from tilefoundry.ir.types import Broadcast, DType, Split
 from tilefoundry.ir.types.dim import DimFloorDiv, DimMul, DimVar, is_dim_op_call
 
 _UNNAMED = "_"
@@ -187,6 +187,8 @@ class PatternPrinter:
     def _written_value(self, value) -> str:
         if isinstance(value, Broadcast):
             return "B()"
+        if isinstance(value, DType):
+            return value.name
         if isinstance(value, Split):
             return f"S({value.axis})"
         if isinstance(value, Enum):
@@ -439,7 +441,11 @@ class PatternPrinter:
         )
 
     def visit_ShardLayoutPattern(self, pattern, name) -> str:
-        attrs = self._written_tuple(tuple(self._written_value(attr) for attr in pattern.attrs))
+        attrs = (
+            self._written_tuple(tuple(self._written_value(attr) for attr in pattern.attrs))
+            if isinstance(pattern.attrs, tuple)
+            else self.written(pattern.attrs)
+        )
         return (
             f"ShardLayout({self.written(pattern.layout)}, {attrs}, "
             f"{self.written(pattern.mesh)})"
@@ -503,7 +509,10 @@ class PatternPrinter:
         return name
 
     def rules_PlainArrangement(self, pattern, name) -> tuple[str, ...]:
-        return ("every plain arrangement has no transform or nonzero offset",)
+        return (
+            "every plain arrangement is a static strided layout with no swizzle and zero "
+            "offset, and, where it is sharded, one every participant holds whole",
+        )
 
     def visit_BoxDims(self, pattern, name) -> str:
         return name
