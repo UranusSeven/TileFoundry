@@ -6,12 +6,10 @@ from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import (
-    CapturePattern,
     ComposedLayoutPattern,
     LayoutPattern,
     MeshPattern,
-    MultipleOfPattern,
-    OrPattern,
+    WildcardPattern,
 )
 from tilefoundry.ir.pattern import (
     predicates as P,
@@ -32,20 +30,19 @@ _FP_ACC_WIDEN = {
 }
 
 
-def _warp_layout_pattern() -> LayoutPattern:
-    return LayoutPattern(
-        ((CapturePattern("n", MultipleOfPattern(32)),),),
+_WARP_ALIGNED = ComposedLayoutPattern(
+    inner=None,
+    offset=WildcardPattern("p0"),
+    outer=LayoutPattern(
+        ((WildcardPattern("n"),),),
         ((1,),),
-        predicates=(P.Forward(per_mode=True), P.Injective(per_mode=True)),
-    )
-
-
-_WARP_ALIGNED = OrPattern(
-    ComposedLayoutPattern(
-        offset=CapturePattern("p0", MultipleOfPattern(32)),
-        outer=_warp_layout_pattern(),
+        predicates=(
+            WildcardPattern("n") % 32 == 0,
+            P.Forward(per_mode=True),
+            P.Injective(per_mode=True),
+        ),
     ),
-    _warp_layout_pattern(),
+    predicates=(WildcardPattern("p0") % 32 == 0,),
 )
 
 
@@ -100,7 +97,7 @@ def verify_mma(call: "Call", ctx: "VerifyContext") -> None:
         ctx.error(
             call,
             "MMA enclosing mesh violates declared instruction participation, "
-            f"which is {participation.describe()}",
+            f"which is {participation!r}",
         )
     if atom.mesh is not None and not physical_frames_match(atom.mesh, current):
         ctx.error(call, "MMA atom frame differs from active mesh scope")

@@ -8,25 +8,20 @@ from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import (
-    AndPattern,
-    BitsPattern,
-    CapturePattern,
     ComposedLayoutPattern,
     DistinctConstraint,
     LayoutPattern,
     MeshPattern,
-    MultipleOfPattern,
-    OrPattern,
-    RangePattern,
     SameModesConstraint,
     SwitchPattern,
     SwizzlePattern,
+    WildcardPattern,
     utils,
 )
 from tilefoundry.ir.pattern import (
     predicates as P,
 )
-from tilefoundry.ir.types import ComposedLayout, Layout, Mesh, Swizzle, UnitType
+from tilefoundry.ir.types import Layout, Mesh, Swizzle, UnitType
 from tilefoundry.ir.types.storage import StorageKind as S
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
 
@@ -50,47 +45,36 @@ class TmaSwizzle(Enum):
         return None if self is TmaSwizzle.NONE else Swizzle(self.value.bit_length() - 5, 4, 3)
 
 
-class BoxFamily(SwitchPattern):
-    """Every unswizzled or swizzled shared-memory box."""
-
-    def refusal(self, subject, captures=None) -> str | None:
-        layout = subject
-        transform = layout.inner if isinstance(layout, ComposedLayout) else None
-        if transform is not None and layout.offset != 0:
-            return f"it is reached through {transform!r} at offset {layout.offset}, not 0"
-        for mode, pattern in self.branches:
-            if mode.swizzle == transform:
-                inner = pattern if transform is None else pattern.outer
-                return inner.refusal(
-                    layout if transform is None else layout.outer,
-                    captures,
-                )
-        written = ", ".join(
-            repr(mode.swizzle) for mode, _ in self.branches if mode.swizzle is not None
-        )
-        return f"it is reached through {transform!r}, and a tensormap swizzles by {written} or not at all"
+def _dim(name: str) -> WildcardPattern:
+    return WildcardPattern(name)
 
 
-def _dim(name: str, dtype: str, *, span: int | None = None) -> CapturePattern:
-    parts = [
-        RangePattern(lo=1, hi=BOX_EXTENT),
-        BitsPattern(dtype, MultipleOfPattern(TMA_UNIT_BITS)),
-    ]
+def _dim_formulas(name: str, dtype: str, *, span: int | None = None) -> tuple:
+    dim = WildcardPattern(name)
+    parts = [*_dim_range(name), P.Bits(dtype) * dim % TMA_UNIT_BITS == 0]
     if span is not None:
-        parts.append(BitsPattern(dtype, RangePattern(hi=span * 8)))
-    return CapturePattern(name, AndPattern(tuple(parts)))
+        parts.append(P.Bits(dtype) * dim <= span * 8)
+    return tuple(parts)
 
 
-def TmaBoxPattern(dtype: str) -> BoxFamily:
-    rest = tuple(
-        CapturePattern(f"dim{index}", RangePattern(lo=1, hi=BOX_EXTENT))
-        for index in range(1, TMA_RANK)
+def _dim_range(name: str) -> tuple:
+    dim = WildcardPattern(name)
+    return dim >= 1, dim <= BOX_EXTENT
+
+
+def TmaBoxPattern(dtype: str) -> SwitchPattern:
+    rest = tuple(_dim(f"dim{index}") for index in range(1, TMA_RANK))
+    rest_formulas = tuple(
+        formula for index in range(1, TMA_RANK) for formula in _dim_range(f"dim{index}")
     )
+    plain_dims = (_dim("dim0"), *rest)
     boxes = {
         TmaSwizzle.NONE: LayoutPattern(
             predicates=(
                 P.PlainArrangement(),
-                P.BoxDims((_dim("dim0", dtype), *rest), dtype, BOX_EXTENT),
+                P.BoxDims(plain_dims, dtype, BOX_EXTENT),
+                *_dim_formulas("dim0", dtype),
+                *rest_formulas,
             )
         )
     }
@@ -99,6 +83,8 @@ def TmaBoxPattern(dtype: str) -> BoxFamily:
         TMA_RANK,
     ):
         swizzle = mode.swizzle
+        leading = f"dim{index}"
+        dims = (_dim(leading), *rest)
         boxes[mode] = ComposedLayoutPattern(
             SwizzlePattern(swizzle.bits, swizzle.base, swizzle.shift),
             0,
@@ -106,26 +92,28 @@ def TmaBoxPattern(dtype: str) -> BoxFamily:
                 predicates=(
                     P.PlainArrangement(),
                     P.BoxDims(
-                        (_dim(f"dim{index}", dtype, span=mode.value), *rest),
+                        dims,
                         dtype,
                         BOX_EXTENT,
                         span=mode.value,
                     ),
+                    *_dim_formulas(leading, dtype, span=mode.value),
+                    *rest_formulas,
                 )
             ),
         )
-    return BoxFamily(SWIZZLE_PLACE, boxes)
+    return SwitchPattern(SWIZZLE_PLACE, boxes)
 
 
 def TmaGlobalPattern(dtype: str) -> LayoutPattern:
-    steps = tuple(
-        CapturePattern(
-            f"step{index}",
-            BitsPattern(dtype, MultipleOfPattern(TMA_UNIT_BITS)),
+    steps = tuple(WildcardPattern(f"step{index}") for index in range(1, TMA_RANK))
+    return LayoutPattern(
+        predicates=(
+            P.PlainArrangement(),
+            P.TensorMap(steps, dtype),
+            *(P.Bits(dtype) * step % TMA_UNIT_BITS == 0 for step in steps),
         )
-        for index in range(1, TMA_RANK)
     )
-    return LayoutPattern(predicates=(P.PlainArrangement(), P.TensorMap(steps, dtype)))
 
 
 def TmaOperandPattern(storage: str, dtype: str) -> SwitchPattern:
@@ -145,10 +133,12 @@ def _warp_scope() -> MeshPattern:
         predicates=(P.Forward(per_mode=True), P.Injective(per_mode=True)),
     )
     sliced = ComposedLayoutPattern(
-        offset=CapturePattern("p0", MultipleOfPattern(32)),
+        inner=None,
+        offset=WildcardPattern("p0"),
         outer=layout,
+        predicates=(WildcardPattern("p0") % 32 == 0,),
     )
-    return MeshPattern(("thread",), OrPattern(sliced, layout))
+    return MeshPattern(("thread",), sliced)
 
 
 @register_op(dialect="T", category="async", name="copy_async_tensor")
@@ -212,7 +202,6 @@ def verify_copy_async_tensor(call: "Call", ctx: "VerifyContext") -> None:
 
 __all__ = [
     "BOX_EXTENT",
-    "BoxFamily",
     "CopyAsyncTensor",
     "SWIZZLE_PLACE",
     "TMA_RANK",

@@ -613,39 +613,84 @@ class Pattern:
 
 The implementation is split by responsibility under `ir/pattern/`:
 
-- `pattern.py` defines `Pattern`, the computed-condition base `Predicate`, and
-  the composable classes
-  `OrPattern`, `AndPattern`, `SequencePattern`, `CapturePattern`,
-  `ConstraintPattern`, `GuardPattern`, `SwitchPattern`, `RangePattern`,
-  `MultipleOfPattern`, `OneOfPattern`, `AttrPattern`, `BitsPattern`,
+- `pattern.py` defines `Pattern` and the composable classes
+  `OrPattern`, `AndPattern`, `SequencePattern`,
+  `SwitchPattern`, `RangePattern`,
   `LayoutPattern`, `SwizzlePattern`, `ComposedLayoutPattern`, `MeshPattern`,
-  `ShardLayoutPattern`, `ScalarPattern`, `TensorPattern`, and
-  `WildcardPattern`. It also owns the `Scalar` and `Tensor` singletons.
-- `predicates.py` defines named arrangement predicates: `Forward`,
-  `Injective`, `WholeVectors`, `PlainArrangement`, `BoxDims`, and `TensorMap`.
-- `match.py` owns matches, captures, symbolic resolution, and the shared
-  description helpers. An unstated (`None`) pattern field admits any value.
+  `ShardLayoutPattern`, `ScalarPattern`, `TensorPattern`, `WildcardPattern`, and
+  `StarPattern`. It also owns the `Scalar` and `Tensor` singletons.
+- `predicates.py` defines the computed-condition base `Predicate`; integer
+  `Term` expressions and Boolean `Formula` predicates; and the named
+  arrangement predicates `Forward`, `Injective`, `WholeVectors`,
+  `PlainArrangement`, `BoxDims`, and `TensorMap`.
+- `match.py` owns the public `PatternMatcher` and structural `Refusal` evidence.
+  An unstated (`None`) pattern field admits any value. Pattern nodes carry data
+  only; declaration text and refusal text belong to inspection
+  ([inspection §2.9](./inspection.md#29-pattern-declaration-reports)).
 - `constraint.py` owns cross-operand `Constraint`, `DistinctConstraint`,
   `SameConstraint`, and `SameModesConstraint` values.
 - `utils.py` owns specialization naming and dimension lookup.
 
+`Pattern.match(subject, captures=None)` is the public facade: it creates one
+`PatternMatcher`, which dispatches along the pattern class's MRO and owns the
+bindings, matched-node memo, deferred predicates, and branch rollback for that
+match. Nested patterns stay in that matcher instead of creating their own
+capture dictionaries. Effect-Op verification reuses one matcher across all
+operands of a call, so later operands see bindings established by earlier ones.
+
+An unnamed `WildcardPattern()` admits any value. A named
+`WildcardPattern(name)` also binds that value; every occurrence of the same
+name must match the same value. Named wildcards form integer `Term`
+expressions with `+`, `-`, `*`, `//`, and `%`; comparisons form a `Formula`,
+and `&`, `|`, and `~` combine formulas. `In`, `Table`, `Bits`, `ForAll`,
+`Sum`, and `Count` cover membership, lookup, dtype width, and tuple captures.
+Python truth testing and chained comparisons are rejected; callers must use
+the formula operators rather than `and`, `or`, or Python `in`.
+
+`Predicate.holds(subject, bindings)` returns true, false, or `None` when names
+needed by the predicate remain unbound. Ground formulas are evaluated at the
+pattern node that owns them, so a failed formula can reject an alternative.
+Only unresolved formulas are deferred; after structural matching they are
+compiled into one OR-Tools CP-SAT model. An infeasible model is a mismatch,
+while an `UNKNOWN` solver result remains explicitly unknown rather than being
+reported as false. A refusal records the first failed pattern, its subject,
+and a snapshot of the bindings; inspection decides how to render that
+evidence. The hand-written predicates in
+`predicates.py` read the layout itself, including its coalesced runs and
+algebraic properties; `Formula` predicates instead read names bound by
+structural patterns.
+
 `LayoutPattern` optionally matches a bare `Layout`'s nested `shape` and
-`strides`, then applies its table of named predicates. Omitting both structural
+`strides`, then applies its tuple of predicates. `ComposedLayoutPattern`,
+`ShardLayoutPattern`, and `TensorPattern` likewise apply their own predicate
+tuples after their structural fields match. Omitting both layout structural
 fields leaves the structure unconstrained and lets predicates read through
 supported composed or sharded forms. `Forward()` and `Injective()` express the
 corresponding computed properties; they are not implicit.
+When both structural fields are present, they are matched as paired CuTe modes
+while preserving their authored nesting. A `StarPattern(p)` in the same
+position of both fields consumes zero or more modes and applies `p` to every
+consumed mode; each tuple may contain at most one star. Bindings below a star
+are tuples, and a name may not occur both below and outside a star.
 `LayoutPattern.from_layout(layout, ...)` constructs the exact bare or composed
 pattern for an authored arrangement, preserving its nested structure and the
 explicitly supplied predicate table. `Forward(per_mode=True)` and
 `Injective(per_mode=True)` check each top-level mode independently.
+`ComposedLayout(None, 0, L)` and `L` are equivalent for both `LayoutPattern`
+and `ComposedLayoutPattern`: a bare layout supplies an identity inner and zero
+offset to a composed pattern. An omitted `ComposedLayoutPattern.inner` remains
+unconstrained and therefore admits any inner, including a swizzle. To require
+no swizzle, state `SwizzlePattern(0, 4, 3)`; its zero-bit variant also matches
+an identity (`None`) inner. The three swizzle fields may themselves be
+patterns.
 `MeshPattern` rejects any supplied arrangement predicate that exposes
 `per_mode=False`, because each mesh level uses its own numbering space; an
 empty predicate table is allowed. It never changes the supplied pattern
 implicitly.
 `ShardLayoutPattern` names the same `layout`, `attrs`, and `mesh` fields as
 `ShardLayout`: `layout` and `mesh` are nested patterns, while `attrs` remains
-an exact structural value. Its mesh pattern may state bare and sliced forms
-explicitly; the matcher does not normalize one into the other.
+an exact structural value. Its mesh pattern may use the bare/composed identity
+equivalence above when stating sliced forms.
 
 Two consumer surfaces:
 
