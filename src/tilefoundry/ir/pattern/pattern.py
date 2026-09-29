@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from tilefoundry.ir.types import ComposedLayout, Layout, Swizzle
 from tilefoundry.ir.types.layout import flatten
@@ -14,6 +14,8 @@ from .match import Match, PatternMatcher
 @dataclass(frozen=True)
 class Pattern:
     """Base class for a predicate that returns bindings or ``None``."""
+
+    predicates: tuple["Predicate", ...] = field(default_factory=tuple, kw_only=True)
 
     def match(self, subject, captures=None) -> Match | None:
         held = PatternMatcher(dict(captures or {}))
@@ -96,7 +98,8 @@ class StarPattern(Pattern):
 class OrPattern(Pattern):
     patterns: tuple
 
-    def __init__(self, *patterns):
+    def __init__(self, *patterns, predicates=()):
+        object.__setattr__(self, "predicates", tuple(predicates))
         object.__setattr__(self, "patterns", tuple(patterns))
 
 @dataclass(frozen=True)
@@ -108,7 +111,8 @@ class AndPattern(Pattern):
 class SequencePattern(Pattern):
     patterns: tuple
 
-    def __init__(self, *patterns):
+    def __init__(self, *patterns, predicates=()):
+        object.__setattr__(self, "predicates", tuple(predicates))
         object.__setattr__(self, "patterns", tuple(patterns))
 
 @dataclass(frozen=True)
@@ -140,7 +144,8 @@ class SwitchPattern(Pattern):
     param: str
     branches: tuple
 
-    def __init__(self, param, branches):
+    def __init__(self, param, branches, *, predicates=()):
+        object.__setattr__(self, "predicates", tuple(predicates))
         object.__setattr__(self, "param", param)
         object.__setattr__(self, "branches", tuple(dict(branches).items()))
 
@@ -235,7 +240,6 @@ class LayoutPattern(Pattern):
 
     shape: tuple | None = None
     strides: tuple | None = None
-    predicates: tuple[Predicate, ...] = field(default_factory=tuple)
 
     def __post_init__(self):
         if self.shape is None or self.strides is None:
@@ -257,7 +261,7 @@ class LayoutPattern(Pattern):
         cls,
         layout,
         *,
-        predicates: tuple[Predicate, ...] = (),
+        predicates=(),
     ):
         """Build the exact pattern for one authored arrangement."""
         held = tuple(predicates)
@@ -312,7 +316,11 @@ class ComposedLayoutPattern(Pattern):
     inner: object = None
     offset: object = None
     outer: object = None
-    predicates: tuple[Predicate, ...] = field(default_factory=tuple)
+    issues_per_row: Callable[[dict], tuple[int, int] | None] | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
 
     def fixed(self):
         held = []
@@ -372,7 +380,6 @@ class TensorPattern(Pattern):
     shape: tuple | None = None
     storage: Any = None
     layout: Pattern | None = None
-    predicates: tuple[Predicate, ...] = field(default_factory=tuple)
 
 @dataclass(frozen=True)
 class ShardLayoutPattern(Pattern):
@@ -381,7 +388,6 @@ class ShardLayoutPattern(Pattern):
     layout: object
     attrs: tuple
     mesh: MeshPattern
-    predicates: tuple[Predicate, ...] = field(default_factory=tuple)
 
 Scalar: ScalarPattern = ScalarPattern()
 Tensor: TensorPattern = TensorPattern()

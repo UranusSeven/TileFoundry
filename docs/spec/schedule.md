@@ -60,26 +60,51 @@ matrix multiplication these are `(m, n, k)`; an elementwise transfer uses the
 tile axes in order.
 
 `repeat[i]` is the number of single instruction extents that cover iteration
-dimension `i`. If omitted, it is inferred as:
+dimension `i`. Its derivation depends on whether the selected instruction
+patterns fix a single-issue shape.
+
+If any selected operand pattern declares a shape, that shape is the fixed
+single-issue contract. Repeat is inferred as:
 
 ```text
 whole scheduled extent[i] / single-issue extent[i]
 ```
 
 Every division MUST be exact. An authored `repeat` MUST equal the inferred
-tuple. `order` is a permutation of these dimension positions and defaults to
+tuple. This is the hardware-fixed path used by tiled MMA instructions.
+
+If no selected operand pattern declares a shape, authored `repeat` is the
+source of the single-issue shape and defaults to all ones. Each operand
+coordinate projected from iteration dimension `i` has single-issue extent
+`whole extent / repeat[i]`; every division MUST again be exact. Tiling on this
+open-shape path is not implemented yet, so every repeat count MUST currently be
+one and a larger count is rejected as `transfer tiling is not yet supported`.
+
+`order` is a permutation of the iteration dimension positions and defaults to
 the identity permutation. `order` controls lowering loop nesting; it does not
-change operand or result types.
+change operand or result types. For an atom instruction, lowering emits one
+`For(o_<axis>)` per iteration dimension inside each physical issue group, in
+`order` from outermost to innermost. It emits the loop even when its trip count
+is one. A swizzled row may issue adjacent atoms as straight-line statements in
+one loop iteration, but it does not remove that axis's loop. Transfer
+instructions emit no such atom loops. Supporting non-identity `order` here is
+an intentional extension beyond the AtomSched reference, which rejects it.
+
+Straight-line row issue is a property of the matched operand layout
+alternative. An alternative that packs adjacent issues MUST declare their
+tensor axis and count; an alternative without that property contributes one
+issue. Lowering MUST consume this declaration and MUST NOT infer the count from
+layout strides.
+
+For each operand layout, non-unit repeat counts name leading CuTe tile modes;
+the remaining inner modes are the instruction fragment matched against its
+operand declaration. A sharded operand's mesh layout follows the same rule:
+leading modes are issue groups and the inner modes are the participant frame.
 
 ## 4. Access relation
 
-The schedule relation is the selected instruction's single-issue relation with
-one outer tiling band. Each instruction dimension is split into an outer repeat
-coordinate and its inner single-issue coordinate; outer coordinates are placed
-in `order`. A schedule whose repeat is all ones reaches the same coordinates as
-one instruction issue.
-
-The input/output convention for TIR instruction relations is defined in
+Schedule access relations follow the registered construction and input/output
+convention defined by
 [semantic-analysis §2](./semantic-analysis.md#2-access-relation-analysis).
 
 ## 5. Buffers and cost
@@ -102,9 +127,8 @@ target states a bandwidth, and the longest such time is the memory time. These
 levels may overlap, so their times are not summed. A level with no stated rate
 contributes no bound; it is neither treated as zero bandwidth nor rejected.
 
-The concrete mapping of issues to participants, and the lowering loop nest
-selected by `order`, are lowering contracts rather than authored ScheduleOp
-state.
+The concrete mapping of issues to participants is a lowering contract rather
+than authored ScheduleOp state.
 
 ## 6. Reference value semantics
 

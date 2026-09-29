@@ -6,7 +6,7 @@ import torch
 
 from tilefoundry.evaluator.registry import register_schedule_eval
 from tilefoundry.evaluator.value import TensorValue
-from tilefoundry.ir.core import Op
+from tilefoundry.ir.core import Call, Op, OpCapability, Var
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import (
@@ -18,13 +18,15 @@ from tilefoundry.ir.pattern import (
 from tilefoundry.ir.pattern import (
     predicates as P,
 )
-from tilefoundry.ir.types import DType, Mesh, UnitType
+from tilefoundry.ir.types import DType, Mesh, TensorType, UnitType
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
 from tilefoundry.visitor_registry.access_relation import (
     AccessRelations,
     matmul_relations,
     register_access_relation,
+    relations_of,
 )
+from tilefoundry.visitor_registry.contexts import TypeInferContext
 
 from .mma_atom import AtomPattern, FromAtom, MmaAtom, physical_frames_match
 from .sm80_mma import Mma as _Sm80Mma
@@ -59,9 +61,18 @@ _WARP_ALIGNED = ComposedLayoutPattern(
 class TiledMma(Op):
     """Execute one tiled MMA; the atom declares its operand contracts."""
 
-    @property
-    def capability(self):
-        return self.atom.capability
+    capability = (
+        OpCapability(
+            Wgmma.capability,
+            declaration=Wgmma,
+            attribute="atom",
+        ),
+        OpCapability(
+            _Sm80Mma.capability,
+            declaration=_Sm80Mma,
+            attribute="atom",
+        ),
+    )
 
     @property
     def resource(self):
@@ -79,7 +90,7 @@ class TiledMma(Op):
         annotation=MmaAtom,
         pattern=AtomPattern(Wgmma, _Sm80Mma),
     )
-    scope = ParamDef(
+    execution_mesh = ParamDef(
         kind="attribute",
         annotation=Mesh,
         pattern=MeshPattern(("thread",), _WARP_ALIGNED),
@@ -103,6 +114,24 @@ def _tiled_mma_access_relation(call: "Call", ctx) -> AccessRelations:
     )
 
 
+def operand_relations(
+    op: TiledMma, operand_types: tuple[TensorType, ...]
+) -> AccessRelations:
+    """Return the registered operand relations for these concrete types."""
+    args = tuple(
+        Var(name=f"operand{index}", type=type_)
+        for index, type_ in enumerate(operand_types)
+    )
+    call = Call(target=op, args=args, type=UnitType())
+    try:
+        relations = relations_of(call, TypeInferContext())
+    except ValueError as error:
+        raise ValueError(
+            f"{op.atom.reference_name} has no registered operand access relation: {error}"
+        ) from error
+    return relations
+
+
 @register_schedule_eval(TiledMma)
 def _eval_scheduled_mma(ctx):
     acc, lhs, rhs = (arg.data for arg in ctx.args)
@@ -116,12 +145,12 @@ def verify_mma(call: "Call", ctx: "VerifyContext") -> None:
     atom = op.atom
     if ctx.scope is not None and ctx.scope.module is not None:
         capabilities = ctx.scope.module.target.architecture.capabilities
-        if op.capability not in capabilities:
-            ctx.error(call, f"target does not support {op.capability}")
+        if atom.capability not in capabilities:
+            ctx.error(call, f"target does not support {atom.capability}")
     if not ctx.mesh_scope:
         ctx.error(call, "MMA requires an active physical mesh scope")
     current = ctx.mesh_scope[-1]
-    participation = atom.scope_pattern()
+    participation = atom.execution_mesh_pattern()
     if participation.match(current) is None:
         ctx.error(
             call,
@@ -156,4 +185,4 @@ def verify_operand_shapes(call: "Call", ctx: "VerifyContext") -> None:
         )
 
 
-__all__ = ["TiledMma", "verify_mma", "verify_operand_shapes"]
+__all__ = ["TiledMma", "operand_relations", "verify_mma", "verify_operand_shapes"]

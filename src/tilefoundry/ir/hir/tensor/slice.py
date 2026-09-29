@@ -29,6 +29,8 @@ from tilefoundry.visitor_registry.access_relation import (
     view_relations,
 )
 
+from ._view_layout import derive_view_layout
+
 
 @register_op
 class Slice(Op):
@@ -39,7 +41,6 @@ class Slice(Op):
 
     def __init__(self, **attrs):
         super().__init__(**attrs)
-
 
 class _Unbounded(ValueError):
     """A relation would have a parameter nothing can bound."""
@@ -490,6 +491,21 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
                     offset=inherited_offset + moved,
                     outer=window,
                 )
+    if new_layout is None:
+        def sliced(layout: Layout) -> Layout:
+            strides = None
+            if layout.strides is not None and len(layout.strides) == rank:
+                strides = tuple(
+                    source_stride * slice_stride
+                    for source_stride, slice_stride in zip(
+                        layout.strides, op.strides, strict=True
+                    )
+                )
+            return Layout(shape, strides)
+
+        new_layout = derive_view_layout(x_ty, shape, sliced)
+    if new_layout is None:
+        ctx.error(call, f"Slice cannot preserve {type(x_ty.layout).__name__} layout")
     return TensorType(shape=shape, dtype=x_ty.dtype, layout=new_layout, storage=x_ty.storage)
 
 

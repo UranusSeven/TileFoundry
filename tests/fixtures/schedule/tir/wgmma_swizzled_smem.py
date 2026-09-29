@@ -25,16 +25,6 @@ def gemm(
         with Mesh(
             (Topology("thread", 256),), Layout((2, 128), (128, 1)), names=("d0", "d1")
         ) as scope_3:
-            lhs_stages = (T.tensor_view(1024, dtype='bf16', storage=StorageKind.SMEM, layout=Layout(((8, 8), (2, 8)), ((128, 8), (64, 1))), shape=(64, 16)), T.tensor_view(2048, dtype='bf16', storage=StorageKind.SMEM, layout=Layout(((8, 8), (2, 8)), ((128, 8), (64, 1))), shape=(64, 16)))
-            rhs_stages = (T.tensor_view(0, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                    inner=Swizzle(2, 4, 3),
-                    offset=0,
-                    outer=Layout(((2, 8), (1, 32)), ((256, 32), (512, 1))),
-                ), shape=(16, 32)), T.tensor_view(512, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                    inner=Swizzle(2, 4, 3),
-                    offset=0,
-                    outer=Layout(((2, 8), (1, 32)), ((256, 32), (512, 1))),
-                ), shape=(16, 32)))
             with Mesh(
                 (Topology("thread", 256),), ComposedLayout(
     inner=None,
@@ -43,6 +33,16 @@ def gemm(
 ), names=("d0", "d1", "d2")
             ) as threads:
                 T.fill(acc, 0.0)
+            lhs_stages = (T.tensor_view(2048, dtype='bf16', storage=StorageKind.SMEM, layout=Layout(((8, 8), (2, 8)), ((128, 8), (64, 1))), shape=(64, 16)), T.tensor_view(4096, dtype='bf16', storage=StorageKind.SMEM, layout=Layout(((8, 8), (2, 8)), ((128, 8), (64, 1))), shape=(64, 16)))
+            rhs_stages = (T.tensor_view(0, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                    inner=Swizzle(2, 4, 3),
+                    offset=0,
+                    outer=Layout(((2, 8), (1, 32)), ((256, 32), (512, 1))),
+                ), shape=(16, 32)), T.tensor_view(1024, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                    inner=Swizzle(2, 4, 3),
+                    offset=0,
+                    outer=Layout(((2, 8), (1, 32)), ((256, 32), (512, 1))),
+                ), shape=(16, 32)))
             for k in range(0, 32, 16):
                 with scope_3[:1, :32] as scope:
                     tile = T.tensor_view(

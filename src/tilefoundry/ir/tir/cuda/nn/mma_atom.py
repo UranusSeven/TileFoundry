@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.pattern import (
@@ -10,28 +10,33 @@ from tilefoundry.ir.pattern import (
     LayoutPattern,
     MeshPattern,
     Pattern,
+    PatternMatcher,
+    ShardLayoutPattern,
     SwitchPattern,
+    TensorPattern,
     WildcardPattern,
     matched,
 )
 from tilefoundry.ir.pattern import (
     predicates as P,
 )
-from tilefoundry.ir.types import ComposedLayout, Layout, Mesh
+from tilefoundry.ir.pattern.utils import declared_shape, matched_row_issues, selected_pattern
+from tilefoundry.ir.types import ComposedLayout, Layout, Mesh, ShardLayout, TensorType
 from tilefoundry.ir.types.layout_algebra import coalesce
 from tilefoundry.ir.types.mesh import levels, starts
+from tilefoundry.ir.types.utils import tile_view_layout
 
 _MISS = object()
 
 
-def scope_pattern(scope: Mesh) -> MeshPattern:
-    """Any run of *scope*'s threads that starts on a whole multiple of its size."""
-    (topology,) = scope.topologies
+def execution_mesh_pattern(execution_mesh: Mesh) -> MeshPattern:
+    """Any aligned run matching an instruction's execution mesh."""
+    (topology,) = execution_mesh.topologies
     per_mode = (P.Forward(per_mode=True), P.Injective(per_mode=True))
     layout = ComposedLayoutPattern(
         inner=None,
         offset=WildcardPattern("p0"),
-        outer=LayoutPattern.from_layout(scope.layout, predicates=per_mode),
+        outer=LayoutPattern.from_layout(execution_mesh.layout, predicates=per_mode),
         predicates=(WildcardPattern("p0") % topology.size == 0,),
     )
     return MeshPattern((topology.name,), layout)
@@ -41,7 +46,7 @@ class MmaAtom:
     """One instruction declaration; an instance binds its authored parameters."""
 
     namespace: str
-    scope: Mesh
+    execution_mesh: Mesh
     capability: str
     resource: str
     C: object
@@ -95,13 +100,60 @@ class MmaAtom:
     def role(self, role: str):
         return getattr(type(self), role)
 
+    def operand_shapes(self) -> tuple[tuple[int, ...], ...]:
+        """Return the declared C, A, and B shapes for one atom issue."""
+        shapes = tuple(
+            declared_shape(selected_pattern(self.role(role), self.bindings), self.bindings)
+            for role in ("C", "A", "B")
+        )
+        if any(shape is None for shape in shapes):
+            raise ValueError(f"{self.reference_name} does not declare fixed operand shapes")
+        return shapes
+
+    def operand_tiles(
+        self,
+        whole_types: tuple[TensorType, ...],
+        frame: Mesh,
+        axes: tuple[tuple[int, ...], ...],
+    ) -> tuple[tuple[TensorType, ...], tuple[tuple[int, int] | None, ...]]:
+        """Return the operand tiles and declared adjacent-issue properties."""
+        shapes = self.operand_shapes()
+        patterns = tuple(
+            selected_pattern(self.role(role), self.bindings) for role in ("C", "A", "B")
+        )
+        tiles = []
+        for whole, shape, pattern in zip(whole_types, shapes, patterns, strict=True):
+            layout = tile_view_layout(whole, shape, participant=frame)
+            if (
+                isinstance(pattern, TensorPattern)
+                and isinstance(pattern.layout, ShardLayoutPattern)
+                and not isinstance(layout, ShardLayout)
+            ):
+                layout = ShardLayout(layout, pattern.layout.attrs, frame)
+            if isinstance(layout, ShardLayout):
+                layout = replace(layout, mesh=frame)
+            tiles.append(TensorType(shape, whole.dtype, layout, whole.storage))
+        matcher = PatternMatcher(self.bindings)
+        if not all(
+            matcher.match(pattern, tile)
+            for pattern, tile in zip(patterns, tiles, strict=True)
+        ) or not matcher.solve():
+            raise ValueError(f"{self.reference_name} tile violates its operand declaration")
+        rows = tuple(
+            None
+            if (row := matched_row_issues(pattern, matcher)) is None
+            else (mapped[row[0]], row[1])
+            for pattern, mapped in zip(patterns, axes, strict=True)
+        )
+        return tuple(tiles), rows
+
     @property
-    def required_scope(self) -> Mesh:
-        return self.scope
+    def required_execution_mesh(self) -> Mesh:
+        return self.execution_mesh
 
     @classmethod
-    def scope_pattern(cls) -> MeshPattern:
-        return scope_pattern(cls.scope)
+    def execution_mesh_pattern(cls) -> MeshPattern:
+        return execution_mesh_pattern(cls.execution_mesh)
 
     def on(self, mesh: Mesh) -> MmaAtom:
         return type(self)(mesh=mesh, **self.bindings)
@@ -207,5 +259,5 @@ __all__ = [
     "FromAtom",
     "MmaAtom",
     "physical_frames_match",
-    "scope_pattern",
+    "execution_mesh_pattern",
 ]

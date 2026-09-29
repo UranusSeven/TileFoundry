@@ -1,9 +1,7 @@
-"""A 256-wide authored schedule: one WGMMA repeats over N as well as M.
+"""A 256-wide schedule whose authored order makes N the outer atom loop.
 
-The 64x64x16 atom covers a quarter of the authored N, so the two warpgroups
-that hold the accumulator each issue four atoms along N per K step. B's
-descriptor is tiled four times over N while A and the accumulator tile twice
-over M, yielding repeat ``(2, 4, 1)``.
+The N repeat is a true loop. Its authored order makes each warpgroup walk N
+outside M, with K innermost.
 """
 
 from tilefoundry import func, module
@@ -35,7 +33,7 @@ ACC = ShardLayout(Layout((2, 4, 8, 2, 4, 2, 4, 8),
     target=CudaTarget("nvidia.h200_sxm"),
     topologies=(Topology("cta", 1), Topology("thread", 384)),
 )
-class WGMMA_REPEAT_ALONG_N:
+class WGMMA_REPEAT_ALONG_N_ORDER:
     @func
     def gemm(
         a: Tensor[(M, K), "bf16"],
@@ -70,6 +68,7 @@ class WGMMA_REPEAT_ALONG_N:
                             (acc, lhs, rhs),
                             op=T.tiled_mma(atom=wgmma),
                             repeat=(2, 4, 1),
+                            order=(1, 0, 2),
                         )
 
                 with threads[1:3, :] as _compute:

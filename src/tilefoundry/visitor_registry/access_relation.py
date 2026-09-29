@@ -708,6 +708,25 @@ def relation_of(pattern: "AffineAccess") -> "isl.map":
     return pattern.relation
 
 
+def projected_axes(pattern: "AffineAccess") -> tuple[int | None, ...]:
+    """Which one input axis, if any, each output axis projects from."""
+    relation = relation_of(pattern)
+    source_rank = relation.dim(isl.dim_type.IN)
+    axes = []
+    for target_axis in range(relation.dim(isl.dim_type.OUT)):
+        sources = []
+        for source_axis in range(source_rank):
+            local = isl.local_space.from_space(relation.get_space())
+            equal = isl.constraint.alloc_equality(local)
+            equal = equal.set_coefficient_si(isl.dim_type.IN, source_axis, 1)
+            equal = equal.set_coefficient_si(isl.dim_type.OUT, target_axis, -1)
+            projected = isl.map.universe(relation.get_space()).add_constraint(equal)
+            if relation.is_subset(projected):
+                sources.append(source_axis)
+        axes.append(sources[0] if len(sources) == 1 else None)
+    return tuple(axes)
+
+
 def _as_number(value) -> int | None:
     """The number a bound parameter's value is, when it is one."""
     number = static_dim_value(value)
@@ -1089,6 +1108,7 @@ def broadcast_access(result_shape: tuple, operand_shape: tuple) -> "AffineAccess
 def _operand_reads(
     shape: tuple,
     out_shape: tuple,
+    out_axes: tuple[str, ...],
     inner: str,
     *,
     kept_axis: int,
@@ -1111,11 +1131,11 @@ def _operand_reads(
         if axis == contraction_axis:
             reads.append(inner)
         elif axis == kept_axis:
-            reads.append(f"d{len(out_shape) + output_axis}")
+            reads.append(out_axes[output_axis])
         elif is_one(shape[axis]) and not is_one(out_shape[axis + shift]):
             reads.append("0")
         else:
-            reads.append(f"d{axis + shift}")
+            reads.append(out_axes[axis + shift])
     return reads
 
 
@@ -1142,8 +1162,8 @@ def matmul_relations(
         )
     out_shape = (*batch, lhs_shape[a_m], rhs_shape[b_n])
     summed = lhs_shape[a_k]
-    rank = len(out_shape)
-    dims = ", ".join((*(f"d{index}" for index in range(rank)), "k"))
+    out_axes = (*(f"d{index}" for index in range(len(batch))), "m", "n")
+    dims = ", ".join((*out_axes, "k"))
     inner = "0" if is_one(summed) else "k"
     inputs = []
     for shape, kept_axis, output_axis, contraction_axis in (
@@ -1153,6 +1173,7 @@ def matmul_relations(
         reads = _operand_reads(
             shape,
             out_shape,
+            out_axes,
             inner,
             kept_axis=kept_axis,
             output_axis=output_axis,
@@ -1161,7 +1182,7 @@ def matmul_relations(
         inputs.append(
             BoundaryRelation(AffineAccess(isl.map(f"{{ [{dims}] -> [{', '.join(reads)}] }}")))
         )
-    accumulates = ", ".join(f"d{index}" for index in range(rank))
+    accumulates = ", ".join(out_axes)
     return iterating(
         (*out_shape, summed),
         AccessRelations(
@@ -1353,6 +1374,7 @@ __all__ = [
     "placed_window",
     "boundary_maps",
     "projected",
+    "projected_axes",
     "leaves_of",
     "reached_elements",
     "reached_leaves",

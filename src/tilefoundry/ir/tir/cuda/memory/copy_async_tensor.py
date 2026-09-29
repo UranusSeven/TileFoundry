@@ -6,7 +6,7 @@ from enum import Enum
 
 from tilefoundry.evaluator.registry import register_schedule_eval
 from tilefoundry.evaluator.value import TensorValue
-from tilefoundry.ir.core import Op
+from tilefoundry.ir.core import Op, OpCapability
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import (
@@ -151,7 +151,7 @@ def _warp_scope() -> MeshPattern:
 class CopyAsyncTensor(Op):
     """Move one tensor-map box between global and shared memory."""
 
-    capability = "cp.async.bulk.tensor"
+    capability = OpCapability("cp.async.bulk.tensor")
     resource = "tma_engine"
 
     src = ParamDef(
@@ -182,7 +182,7 @@ class CopyAsyncTensor(Op):
         optional=True,
         default=None,
     )
-    scope = ParamDef(
+    execution_mesh = ParamDef(
         kind="attribute",
         annotation=Mesh,
         pattern=_warp_scope(),

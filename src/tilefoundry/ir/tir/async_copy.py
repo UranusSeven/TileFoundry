@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from tilefoundry.evaluator.registry import register_schedule_eval
 from tilefoundry.evaluator.value import TensorValue
-from tilefoundry.ir.core import Op
+from tilefoundry.ir.core import Op, OpCapability
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import DistinctConstraint, SameModesConstraint, utils
@@ -23,15 +23,28 @@ ASYNC_WIDTHS = (4, 8, 16)
 class CopyAsync(Op):
     """Async gmem→smem copy (``cp.async.cg.shared.global``); non-blocking."""
 
+    capability = OpCapability("cp.async")
+    execution_mesh = utils.thread_execution_mesh()
+
     src = ParamDef(
         kind="input",
         effect=MemoryEffect.READ,
-        pattern=utils.operand_tile(0, S.GMEM, utils.whole_vectors(0, ASYNC_WIDTHS)),
+        pattern=utils.operand_tile(
+            0,
+            S.GMEM,
+            utils.whole_vectors(0, ASYNC_WIDTHS),
+            execution_mesh,
+        ),
     )
     dst = ParamDef(
         kind="input",
         effect=MemoryEffect.WRITE,
-        pattern=utils.operand_tile(1, S.SMEM, utils.whole_vectors(1, ASYNC_WIDTHS)),
+        pattern=utils.operand_tile(
+            1,
+            S.SMEM,
+            utils.whole_vectors(1, ASYNC_WIDTHS),
+            execution_mesh,
+        ),
     )
     between = (
         DistinctConstraint("storage", "src", "dst"),
@@ -43,7 +56,6 @@ class CopyAsync(Op):
         optional=True,
         default=None,
     )
-    scope = utils.any_threads()
 
 
 @register_typeinfer(CopyAsync)

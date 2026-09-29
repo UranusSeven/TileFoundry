@@ -20,6 +20,7 @@ def gemm(
                 "rmem",
             ]
         )
+        T.fill(out, 0.0)
         value = T.alloc_tensor(
             tensor_type=Tensor[
                 (128, 256),
@@ -33,40 +34,6 @@ def gemm(
         ) as scope_3:
             for m in range(0, 8192, 128):
                 for n in range(0, 17408, 256):
-                    lhs_stages = (T.tensor_view(65536, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                            inner=Swizzle(3, 4, 3),
-                            offset=0,
-                            outer=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))),
-                        ), shape=(128, 64)), T.tensor_view(73728, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                            inner=Swizzle(3, 4, 3),
-                            offset=0,
-                            outer=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))),
-                        ), shape=(128, 64)), T.tensor_view(81920, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                            inner=Swizzle(3, 4, 3),
-                            offset=0,
-                            outer=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))),
-                        ), shape=(128, 64)), T.tensor_view(90112, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                            inner=Swizzle(3, 4, 3),
-                            offset=0,
-                            outer=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))),
-                        ), shape=(128, 64)))
-                    rhs_stages = (T.tensor_view(0, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                            inner=Swizzle(3, 4, 3),
-                            offset=0,
-                            outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
-                        ), shape=(64, 256)), T.tensor_view(16384, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                            inner=Swizzle(3, 4, 3),
-                            offset=0,
-                            outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
-                        ), shape=(64, 256)), T.tensor_view(32768, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                            inner=Swizzle(3, 4, 3),
-                            offset=0,
-                            outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
-                        ), shape=(64, 256)), T.tensor_view(49152, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
-                            inner=Swizzle(3, 4, 3),
-                            offset=0,
-                            outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
-                        ), shape=(64, 256)))
                     with Mesh(
                         (Topology("thread", 384),), ComposedLayout(
     inner=None,
@@ -75,6 +42,40 @@ def gemm(
 ), names=("d0", "d1", "d2", "d3")
                     ) as threads:
                         T.fill(acc, 0.0)
+                    lhs_stages = (T.tensor_view(131072, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                            inner=Swizzle(3, 4, 3),
+                            offset=0,
+                            outer=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))),
+                        ), shape=(128, 64)), T.tensor_view(147456, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                            inner=Swizzle(3, 4, 3),
+                            offset=0,
+                            outer=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))),
+                        ), shape=(128, 64)), T.tensor_view(163840, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                            inner=Swizzle(3, 4, 3),
+                            offset=0,
+                            outer=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))),
+                        ), shape=(128, 64)), T.tensor_view(180224, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                            inner=Swizzle(3, 4, 3),
+                            offset=0,
+                            outer=Layout(((2, 8, 8), (4, 16)), ((4096, 512, 64), (16, 1))),
+                        ), shape=(128, 64)))
+                    rhs_stages = (T.tensor_view(0, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                            inner=Swizzle(3, 4, 3),
+                            offset=0,
+                            outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
+                        ), shape=(64, 256)), T.tensor_view(32768, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                            inner=Swizzle(3, 4, 3),
+                            offset=0,
+                            outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
+                        ), shape=(64, 256)), T.tensor_view(65536, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                            inner=Swizzle(3, 4, 3),
+                            offset=0,
+                            outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
+                        ), shape=(64, 256)), T.tensor_view(98304, dtype='bf16', storage=StorageKind.SMEM, layout=ComposedLayout(
+                            inner=Swizzle(3, 4, 3),
+                            offset=0,
+                            outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
+                        ), shape=(64, 256)))
                     for k in range(0, 5120, 64):
                         with scope_3[:1, :32] as scope:
                             tile = T.tensor_view(

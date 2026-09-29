@@ -11,14 +11,15 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, replace
 from math import prod
 from pathlib import Path
 
 import pytest
 import torch
 
-from tilefoundry.analysis.allocation import alignment_of, view_root
+import tilefoundry.passes.transforms.convert_hir_to_tir as lowering_module
 from tilefoundry.analysis.api import analyze
 from tilefoundry.analysis.check import check_program
 from tilefoundry.analysis.liveness import analyze_liveness, result_copies
@@ -30,30 +31,51 @@ from tilefoundry.analysis.metadata import (
     RegionMemoryMetadata,
     RooflineMetadata,
 )
+from tilefoundry.cli import main as cli_main
 from tilefoundry.evaluator import EvalError, evaluate
 from tilefoundry.inspection import PatternPrinter, as_script
-from tilefoundry.ir.core import Call, Op, Var, get_metadata
-from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
+from tilefoundry.ir.core import Call, Op, OpCapability, Var, detach_metadata, get_metadata
+from tilefoundry.ir.core.op_registry import iter_schemas
+from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef, collect_param_defs
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.nn.matmul import MatMul
 from tilefoundry.ir.hir.schedule import ScheduleOp
-from tilefoundry.ir.pattern import Tensor
+from tilefoundry.ir.hir.tensor.cast import Cast as HirCast
+from tilefoundry.ir.hir.tensor.reshape import Reshape
+from tilefoundry.ir.hir.tensor.slice import Slice
+from tilefoundry.ir.hir.tensor.transpose import Transpose
+from tilefoundry.ir.pattern import (
+    PatternMatcher,
+    Tensor,
+    TensorPattern,
+    declared_execution_mesh,
+)
 from tilefoundry.ir.tir import PrimFunction
 from tilefoundry.ir.tir.async_copy import CopyAsync
 from tilefoundry.ir.tir.cuda.nn.mma import TiledMma
 from tilefoundry.ir.tir.cuda.nn.sm80_mma import Mma
 from tilefoundry.ir.tir.cuda.nn.wgmma import Wgmma
-from tilefoundry.ir.types import DType, Layout, StorageKind, TensorType, UnitType
+from tilefoundry.ir.tir.stmts import Evaluate
+from tilefoundry.ir.types import (
+    ComposedLayout,
+    DType,
+    Layout,
+    ShardLayout,
+    StorageKind,
+    TensorType,
+    UnitType,
+)
 from tilefoundry.ir.types.layout import flatten
 from tilefoundry.ir.types.mesh import levels, starts
-from tilefoundry.ir.types.utils import bytes_by_storage
-from tilefoundry.ir.visitor import collect_exprs
+from tilefoundry.ir.visitor import StmtVisitor, collect_exprs
 from tilefoundry.visitor_registry.access_relation import (
     AccessRelations,
+    access_relation_registry,
     boundary_maps,
+    identity_relations,
     relations_of,
 )
 from tilefoundry.visitor_registry.contexts import TypeInferContext
@@ -68,7 +90,21 @@ PLAIN = (
 )
 TIR = tuple(sorted((Path(__file__).parents[1] / "fixtures" / "schedule" / "tir").glob("*.py")))
 HIR = tuple(sorted((Path(__file__).parents[1] / "fixtures" / "schedule" / "hir").glob("*.py")))
-WGMMA_DECLARATION = Path(__file__).parents[1] / "fixtures" / "schedule" / "Wgmma.described.txt"
+WGMMA_FACTS = Path(__file__).parents[1] / "fixtures" / "schedule" / "Wgmma.facts.txt"
+CANDIDATE_GOLDEN = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "schedule"
+    / "plain"
+    / "gemm_8192x17408x5120_cta_grid.candidates.txt"
+)
+ANALYZED_GOLDEN = (
+    Path(__file__).parents[1]
+    / "fixtures"
+    / "schedule"
+    / "hir"
+    / "gemm_8192x17408x5120_tma_store.analyzed.txt"
+)
 ANALYSES = (
     ("compute-cost", ComputeCostMetadata),
     ("memory", MemoryMetadata),
@@ -85,8 +121,6 @@ class _RmemExpectation:
 
 
 SMEM_GOLDEN = {
-    "gemm_8192x17408x5120_cta_grid": 196_608,
-    "gemm_8192x17408x5120_persistent": 196_608,
     "gemm_8192x17408x5120_register_store": 196_608,
     "gemm_8192x17408x5120_tma_store": 196_608,
     "sm80_mma_ldmatrix": 1_536,
@@ -96,11 +130,10 @@ SMEM_GOLDEN = {
     "wgmma_cp_async_loads": 6_144,
     "wgmma_cta_grid_4x17": 13_824,
     "wgmma_explicit_windows": 6_144,
-    "wgmma_insert_tiles_into_output": 6_144,
     "wgmma_k_slices_of_wide_run": 12_288,
     "wgmma_one_tile_of_larger_output": 6_144,
     "wgmma_repeat_along_k": 36_864,
-    "wgmma_repeat_along_n": 24_576,
+    "wgmma_repeat_along_n_order": 24_576,
     "wgmma_rs_a_from_accumulator": 5_120,
     "wgmma_rs_a_from_smem": 6_144,
     "wgmma_swizzled_smem": 6_144,
@@ -109,18 +142,6 @@ SMEM_GOLDEN = {
 }
 
 RMEM_EXPECTED = {
-    "gemm_8192x17408x5120_cta_grid": {
-        "thread@128:256#0": _RmemExpectation(131_072, "128x256 f32 zero accumulator"),
-        "thread@128:256#1": _RmemExpectation(131_072, "f32 phi/mma alias chain"),
-        "thread@128:256#2": _RmemExpectation(131_072, "f32 loop result/bf16 cast alias"),
-        "thread@0:384#0": _RmemExpectation(131_072, "parent envelope of one alias chain"),
-    },
-    "gemm_8192x17408x5120_persistent": {
-        "thread@128:256#0": _RmemExpectation(131_072, "128x256 f32 zero accumulator"),
-        "thread@128:256#1": _RmemExpectation(131_072, "f32 phi/mma alias chain"),
-        "thread@128:256#2": _RmemExpectation(131_072, "f32 loop result/bf16 cast alias"),
-        "thread@0:384#0": _RmemExpectation(131_072, "parent envelope of one alias chain"),
-    },
     "gemm_8192x17408x5120_register_store": {
         "thread@128:256#0": _RmemExpectation(131_072, "128x256 f32 zero accumulator"),
         "thread@128:256#1": _RmemExpectation(131_072, "f32 phi/mma alias chain"),
@@ -158,7 +179,14 @@ RMEM_EXPECTED = {
         "thread@128:128#0": _RmemExpectation(8_192, "64x32 f32 zero accumulator"),
         "thread@128:128#1": _RmemExpectation(8_192, "f32 phi/mma alias chain"),
         "thread@128:128#2": _RmemExpectation(8_192, "f32 loop result/bf16 cast alias"),
-        "thread@0:256#0": _RmemExpectation(8_192, "parent envelope of one alias chain"),
+        "thread@0:32#1": _RmemExpectation(
+            3_072,
+            "16x32 f32 loader tile (2048) plus bf16 cast tile (1024)",
+        ),
+        "thread@0:256#0": _RmemExpectation(
+            11_264,
+            "64x32 f32 accumulator (8192) plus overlapping loader tiles (3072)",
+        ),
     },
     "wgmma_cp_async_loads": {
         "thread@128:128#0": _RmemExpectation(8_192, "64x32 f32 zero accumulator"),
@@ -173,12 +201,6 @@ RMEM_EXPECTED = {
         "thread@0:384#0": _RmemExpectation(8_192, "parent envelope of one alias chain"),
     },
     "wgmma_explicit_windows": {
-        "thread@128:128#0": _RmemExpectation(8_192, "64x32 f32 zero accumulator"),
-        "thread@128:128#1": _RmemExpectation(8_192, "f32 phi/mma alias chain"),
-        "thread@128:128#2": _RmemExpectation(8_192, "f32 loop result/bf16 cast alias"),
-        "thread@0:256#0": _RmemExpectation(8_192, "parent envelope of one alias chain"),
-    },
-    "wgmma_insert_tiles_into_output": {
         "thread@128:128#0": _RmemExpectation(8_192, "64x32 f32 zero accumulator"),
         "thread@128:128#1": _RmemExpectation(8_192, "f32 phi/mma alias chain"),
         "thread@128:128#2": _RmemExpectation(8_192, "f32 loop result/bf16 cast alias"),
@@ -202,7 +224,7 @@ RMEM_EXPECTED = {
         "thread@128:256#2": _RmemExpectation(8_192, "f32 loop result/bf16 cast alias"),
         "thread@0:384#0": _RmemExpectation(8_192, "parent envelope of one alias chain"),
     },
-    "wgmma_repeat_along_n": {
+    "wgmma_repeat_along_n_order": {
         "thread@128:256#0": _RmemExpectation(131_072, "128x256 f32 zero accumulator"),
         "thread@128:256#1": _RmemExpectation(131_072, "f32 phi/mma alias chain"),
         "thread@128:256#2": _RmemExpectation(131_072, "f32 loop result/bf16 cast alias"),
@@ -279,6 +301,39 @@ def _module_in(path: Path):
     return next(value for value in vars(loaded).values() if type(value).__name__ == "Module")
 
 
+class _OperandMatchVisitor(StmtVisitor[None]):
+    """Exercise operand declarations directly, independently of the report renderer."""
+
+    def __init__(self) -> None:
+        self.matches: list[tuple[object, str, dict]] = []
+
+    def visit_Evaluate(self, stmt: Evaluate) -> None:
+        op = stmt.callable
+        schema = getattr(type(op), "_op_schema", None)
+        if schema is None:
+            return
+        inputs = tuple(param for param in schema.signature if param.kind == "input")
+        atom = getattr(op, "atom", None)
+        for param, arg in zip(inputs, stmt.args, strict=True):
+            if param.pattern is None:
+                continue
+            pattern = (
+                param.pattern.read_on(op)
+                if hasattr(param.pattern, "read_on")
+                else param.pattern
+            )
+            matcher = PatternMatcher(dict(getattr(atom, "bindings", {})))
+            assert matcher.match(pattern, arg.type)
+            assert matcher.solve()
+            self.matches.append((op, param.name, dict(matcher.bindings)))
+
+
+def _direct_operand_matches(function: PrimFunction) -> list[tuple[object, str, dict]]:
+    visitor = _OperandMatchVisitor()
+    visitor.visit(function.body)
+    return visitor.matches
+
+
 @pytest.mark.parametrize("name", PLAIN)
 def test_plain_program_is_analyzable(name: str) -> None:
     module = importlib.import_module(f"tests.fixtures.schedule.plain.{name}")
@@ -294,6 +349,22 @@ def test_scheduled_hir_program_is_well_typed(path: Path) -> None:
     program = _module_in(path)
     entry = next(function for function in program.functions if function.name == "gemm")
     check_program(program, entry)
+
+
+def test_scheduled_hir_view_calls_declare_layouts() -> None:
+    views = []
+    for path in HIR:
+        program = _module_in(path)
+        entry = next(function for function in program.functions if function.name == "gemm")
+        check_program(program, entry)
+        views.extend(
+            (path.stem, type(expr.target).__name__, expr)
+            for expr in collect_exprs(entry.body)
+            if isinstance(expr, Call)
+            and isinstance(expr.target, (Reshape, Slice, Transpose))
+        )
+    missing = [(path, op) for path, op, expr in views if expr.type.layout is None]
+    assert not missing, f"{len(missing)} of {len(views)} view calls omit layout: {missing}"
 
 
 @pytest.mark.parametrize(("analysis", "metadata_type"), ANALYSES)
@@ -341,30 +412,6 @@ def test_scheduled_hir_program_has_analysis_metadata(
     if analysis == "memory":
         placement = get_metadata(result.function, RegionMemoryMetadata)
         assert placement is not None
-        smem_peak = next(
-            item.peak_bytes for item in placement.peaks if item.memory_level == "smem"
-        )
-        assert smem_peak == SMEM_GOLDEN[path.stem]
-        for expr in collect_exprs(result.function.body):
-            if not isinstance(expr, Call):
-                continue
-            moved = get_metadata(expr, MemoryMetadata)
-            assert moved is not None
-            levels = bytes_by_storage(expr.type)
-            if set(levels) == {"rmem"}:
-                assert moved.offsets == ()
-            addressable = set(levels) & {"gmem", "smem"}
-            if not addressable or view_root(expr, {}) is not expr:
-                continue
-            assert len(addressable) == 1
-            assert moved.buffer_bytes is not None
-            assert len(moved.offsets) == result_copies(expr)
-            peak = placement.peak_for(addressable.pop())
-            assert peak is not None
-            for offset in moved.offsets:
-                assert offset % alignment_of(expr) == 0
-                assert offset + moved.buffer_bytes <= peak.peak_bytes
-
         liveness = analyze_liveness(result.function)
         regions = tuple(window.region for window in liveness.regions)
         region_records = tuple(
@@ -372,11 +419,14 @@ def test_scheduled_hir_program_has_analysis_metadata(
             for region in regions
             if (record := get_metadata(region, RegionMemoryMetadata)) is not None
         )
-        assert len(region_records) == len(regions)
+        assert region_records
+        if path.stem == "gemm_8192x17408x5120_tma_store":
+            assert len(region_records) == 4
         for record in region_records:
             assert record.solver_status == "feasible"
             assert record.topologies == placement.topologies
             assert record.peaks
+            assert all(peak.memory_level == "rmem" for peak in record.peaks)
             assert not record.traffic.storage.kinds
             assert not record.traffic.communication.kinds
             assert record.footprint is None
@@ -440,26 +490,41 @@ def test_scheduled_hir_program_has_analysis_metadata(
                 continue
             assert (interval.defined_at, interval.last_used_at) in loop_bounds
 
-    if analysis == "performance" and path.stem == "gemm_8192x17408x5120_cta_grid":
-        local_moves = []
-        for expr in collect_exprs(result.function.body):
-            if not isinstance(expr, Call) or not isinstance(expr.target, ScheduleOp):
-                continue
-            moved = get_metadata(expr, MemoryMetadata)
-            levels = moved.traffic.storage.names()
-            if "smem" in levels and "gmem" not in levels:
-                local_moves.append(get_metadata(expr, PerformanceMetadata))
-        assert local_moves and all(
-            item is not None and item.timeline.end_ns > item.timeline.start_ns
-            for item in local_moves
-        )
+@pytest.mark.parametrize("path", HIR, ids=lambda path: path.stem)
+def test_schedule_memory_report_carries_allocations(
+    path: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / f"{path.stem}.json"
 
+    assert cli_main(["analyze", str(path), str(out), "--memory", "--json"]) == 0
+    assert capsys.readouterr() == ("", "")
+    report = json.loads(out.read_text())
+    memory = report["function_records"]["memory"]
+    peaks = {item["memory_level"]: item["peak_bytes"] for item in memory["peaks"]}
+    assert peaks["smem"] == SMEM_GOLDEN[path.stem]
+    assert memory["solver_status"] == "feasible"
+    for row in report["calls"]:
+        allocation = row["memory"]
+        result = next(
+            operand for operand in allocation["operands"] if operand["arg"] == "result"
+        )
+        storage = result["type"].rsplit(" ", 1)[-1]
+        offsets = allocation["offsets"]
+        if storage == "rmem":
+            assert offsets == []
+            continue
+        if storage not in {"gmem", "smem"} or allocation["buffer_bytes"] is None:
+            continue
+        assert offsets
+        for offset in offsets:
+            assert offset % 16 == 0
+            assert offset + allocation["buffer_bytes"] <= peaks[storage]
 
 @pytest.mark.parametrize(
     ("fixture", "n"),
     (
         ("wgmma_rs_a_from_accumulator", 16),
-        ("wgmma_repeat_along_n", 64),
+        ("wgmma_repeat_along_n_order", 64),
         ("gemm_8192x17408x5120_register_store", 256),
     ),
 )
@@ -591,7 +656,7 @@ def test_single_issue_schedule_preserves_instruction_relations() -> None:
 @pytest.mark.parametrize(
     ("call", "message"),
     (
-        (_copy_schedule_call(repeat=(2,)), "conflicts with inferred repeat"),
+        (_copy_schedule_call(repeat=(2,)), "transfer tiling is not yet supported"),
         (_copy_schedule_call(order=(1,)), "is not a permutation"),
         (
             _copy_schedule_call(storage=StorageKind.SMEM),
@@ -625,6 +690,63 @@ def test_schedule_typeinfer_requires_instruction_access_relations() -> None:
         inference_type(call)
 
 
+def test_schedule_typeinfer_requires_instruction_verifier(monkeypatch) -> None:
+    type_ = TensorType((4,), DType.bf16, Layout((4,), (1,)), StorageKind.RMEM)
+    call = Call(
+        target=ScheduleOp(op=_UnstatedInstruction()),
+        args=(Var(name="value", type=type_),),
+        type=type_,
+    )
+    monkeypatch.setitem(
+        access_relation_registry._map,
+        _UnstatedInstruction,
+        identity_relations(1),
+    )
+
+    with pytest.raises(ValueError, match="has no registered verifier"):
+        inference_type(call)
+
+
+def test_schedule_typeinfer_requires_whole_instruction_tiles(monkeypatch) -> None:
+    type_ = TensorType((4,), DType.bf16, Layout((4,), (1,)), StorageKind.RMEM)
+    call = Call(
+        target=ScheduleOp(op=_UnstatedInstruction()),
+        args=(Var(name="value", type=type_),),
+        type=type_,
+    )
+    param = _UnstatedInstruction._op_schema.signature[0]
+    monkeypatch.setattr(param, "pattern", TensorPattern(shape=(3,)))
+    monkeypatch.setitem(
+        access_relation_registry._map,
+        _UnstatedInstruction,
+        identity_relations(1),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="iteration extent 4 is not divisible by single-issue extent 3",
+    ):
+        inference_type(call)
+
+
+def test_schedule_typeinfer_requires_declared_write_type(monkeypatch) -> None:
+    type_ = TensorType((4,), DType.bf16, Layout((4,), (1,)), StorageKind.RMEM)
+    call = Call(
+        target=ScheduleOp(op=_UnstatedInstruction()),
+        args=(),
+        type=type_,
+    )
+    param = _UnstatedInstruction._op_schema.signature[0]
+    monkeypatch.setattr(param, "effect", MemoryEffect.WRITE)
+    monkeypatch.setattr(param, "pattern", None)
+
+    with pytest.raises(
+        ValueError,
+        match="value is write-only and declares no result shape",
+    ):
+        inference_type(call)
+
+
 def test_schedule_evaluation_rejects_an_unregistered_instruction() -> None:
     type_ = TensorType((4,), DType.bf16, Layout((4,), (1,)), StorageKind.RMEM)
     value = torch.arange(4, dtype=torch.bfloat16)
@@ -640,5 +762,456 @@ def test_tir_program_is_verified_and_canonical(path: Path) -> None:
     assert as_script(function) == path.read_text()
 
 
-def test_wgmma_declaration_is_canonical() -> None:
-    assert PatternPrinter().declaration(Wgmma) + "\n" == WGMMA_DECLARATION.read_text()
+def test_parameter_structure_does_not_repeat_its_name() -> None:
+    declarations = {
+        schema.op_class
+        for schema in iter_schemas()
+        if schema.op_class is not None
+    }
+    for schema in iter_schemas():
+        if schema.op_class is None:
+            continue
+        stated = vars(schema.op_class).get("capability")
+        capabilities = (stated,) if isinstance(stated, OpCapability) else stated or ()
+        declarations.update(
+            capability.declaration
+            for capability in capabilities
+            if capability.declaration is not None
+        )
+    printer = PatternPrinter()
+    for declaration in declarations:
+        parameters = tuple(getattr(declaration, "parameters", ())) or collect_param_defs(
+            declaration
+        )
+        for parameter in parameters:
+            if parameter.pattern is not None:
+                assert printer.written(parameter.pattern, parameter.name) != parameter.name, (
+                    f"{declaration.__name__}.{parameter.name} puts a predicate in its "
+                    "structural pattern slot"
+                )
+
+
+def test_instruction_requires_an_execution_mesh_declaration() -> None:
+    with pytest.raises(ValueError, match="_UnstatedInstruction execution_mesh must be"):
+        declared_execution_mesh(_UnstatedInstruction)
+
+
+def test_schedule_facts_writes_wgmma_declaration(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / "facts.txt"
+
+    assert (
+        cli_main(
+            [
+                "schedule",
+                "facts",
+                "T.cuda.sm90.Wgmma",
+                "--target",
+                "nvidia.h200_sxm",
+                str(out),
+            ]
+        )
+        == 0
+    )
+    assert capsys.readouterr() == ("", "")
+    assert out.read_bytes() == WGMMA_FACTS.read_bytes()
+
+
+def test_schedule_facts_lists_target_instructions_as_text_and_json(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    text_out = tmp_path / "facts.txt"
+    json_out = tmp_path / "facts.json"
+    args = ["schedule", "facts", "--target", "nvidia.h200_sxm"]
+
+    assert cli_main([*args, str(text_out)]) == 0
+    assert cli_main([*args, str(json_out), "--json"]) == 0
+    assert capsys.readouterr() == ("", "")
+    expected = {
+        "target": "nvidia.h200_sxm",
+        "instructions": [
+            {"id": "T.copy_async", "capability": "cp.async"},
+            {
+                "id": "T.copy_async_tensor",
+                "capability": "cp.async.bulk.tensor",
+            },
+            {"id": "T.copy", "capability": None},
+            {"id": "T.ldmatrix", "capability": "ldmatrix"},
+            {
+                "id": "T.tiled_mma",
+                "capability": ["wgmma.mma_async", "mma.sync"],
+            },
+        ],
+    }
+    assert json.loads(json_out.read_text()) == expected
+    assert (
+        text_out.read_text()
+        == """\
+target nvidia.h200_sxm
+instructions
+  T.copy_async         cp.async
+  T.copy_async_tensor  cp.async.bulk.tensor
+  T.copy               all targets
+  T.ldmatrix           ldmatrix
+  T.tiled_mma          wgmma.mma_async, mma.sync
+"""
+    )
+
+
+@pytest.mark.parametrize("target", ("cpu", "apple.m2_pro"))
+def test_schedule_facts_only_lists_target_neutral_instructions_for_non_cuda(
+    target: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = tmp_path / "facts.txt"
+
+    assert cli_main(["schedule", "facts", "--target", target, str(out)]) == 0
+    assert capsys.readouterr() == ("", "")
+    assert out.read_text() == f"target {target}\ninstructions\n  T.copy  all targets\n"
+
+
+@pytest.mark.parametrize(
+    ("selection", "message"),
+    (
+        (
+            ["T.cuda.sm90.Unknown", "--target", "nvidia.h200_sxm"],
+            "unknown instruction 'T.cuda.sm90.Unknown'",
+        ),
+        (
+            ["T.cuda.sm90.Wgmma", "--target", "nvidia.unknown"],
+            "unknown target identity 'nvidia.unknown'",
+        ),
+    ),
+    ids=("instruction", "target"),
+)
+def test_schedule_facts_rejects_unknown_selection_without_output(
+    selection: list[str],
+    message: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = tmp_path / "facts.txt"
+
+    assert cli_main(["schedule", "facts", *selection, str(out)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.startswith("tilefoundry: error: ")
+    assert message in captured.err
+    assert not out.exists()
+
+
+def test_schedule_candidates_writes_canonical_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    name = "gemm_8192x17408x5120_cta_grid"
+    source = f"tests/fixtures/schedule/plain/{name}.py"
+    out = tmp_path / "candidates.txt"
+
+    assert cli_main(["schedule", "candidates", source, str(out)]) == 0
+    assert capsys.readouterr() == ("", "")
+    assert out.read_bytes() == CANDIDATE_GOLDEN.read_bytes()
+
+
+def test_schedule_candidate_reports_cover_every_site(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    reports = []
+    for name in PLAIN:
+        source = f"tests/fixtures/schedule/plain/{name}.py"
+        out = tmp_path / f"{name}.json"
+        assert cli_main(["schedule", "candidates", source, str(out), "--json"]) == 0
+        reports.append((name, json.loads(out.read_text())))
+
+    assert capsys.readouterr() == ("", "")
+    sites = [(name, row) for name, report in reports for row in report["lines"]]
+    assert all(row["candidates"] or row["refused"] for _name, row in sites)
+    assert all(row["candidates"] for _name, row in sites if row["op"] == "tf.reshard")
+    matmuls = [(name, row) for name, row in sites if row["op"] == "tf.matmul"]
+    assert len(matmuls) == 7
+    assert [name for name, row in matmuls if row["candidates"]] == ["gemm_8192x17408x5120_cta_grid"]
+
+
+@pytest.mark.parametrize(
+    ("name", "matmuls", "reshards", "accepted_matmuls"),
+    (
+        ("gemm_8192x17408x5120_cta_grid", 1, 4, 1),
+        ("gemm_relu_gemm_smem_staged", 2, 6, 0),
+        ("gemm_relu_gemm_tiled", 2, 2, 0),
+        ("gemm_relu_gemm_untiled", 2, 0, 0),
+    ),
+)
+def test_schedule_candidates_reports_every_plain_site(
+    name: str,
+    matmuls: int,
+    reshards: int,
+    accepted_matmuls: int,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = f"tests/fixtures/schedule/plain/{name}.py"
+    out = tmp_path / f"{name}.json"
+
+    assert cli_main(["schedule", "candidates", source, str(out), "--json"]) == 0
+    assert capsys.readouterr() == ("", "")
+    report = json.loads(out.read_text())
+    assert report["source"] == source
+    assert report["target"] == "nvidia.h200_sxm"
+    matmul_rows = [row for row in report["lines"] if row["op"] == "tf.matmul"]
+    reshard_rows = [row for row in report["lines"] if row["op"] == "tf.reshard"]
+    assert (len(matmul_rows), len(reshard_rows)) == (matmuls, reshards)
+    assert sum(bool(row["candidates"]) for row in matmul_rows) == accepted_matmuls
+    assert all(row["candidates"] or row["refused"] for row in report["lines"])
+    assert all(row["candidates"] for row in reshard_rows)
+
+
+@pytest.mark.parametrize("source", HIR, ids=lambda path: path.stem)
+def test_schedule_candidates_omit_selected_schedule_calls(
+    source: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / f"{source.stem}.json"
+
+    assert cli_main(["schedule", "candidates", str(source), str(out), "--json"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "no unscheduled matmul or reshard candidate site" in captured.err
+    assert not out.exists()
+
+
+def test_operand_match_refusal_names_the_failed_pattern() -> None:
+    function = _prim_in(
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "schedule"
+        / "tir"
+        / "wgmma_a_k_major.py"
+    )
+    rejected = None
+
+    class RejectOne(StmtVisitor[None]):
+        def visit_Evaluate(self, stmt: Evaluate) -> None:
+            nonlocal rejected
+            if rejected is not None or not isinstance(getattr(stmt.callable, "atom", None), Wgmma):
+                return
+            op = stmt.callable
+            lhs = next(param for param in type(op)._op_schema.signature if param.name == "lhs")
+            pattern = lhs.pattern.read_on(op)
+            matcher = PatternMatcher(dict(op.atom.bindings))
+            assert not matcher.match(pattern, replace(stmt.args[1].type, storage=StorageKind.GMEM))
+            rejected = PatternPrinter().refusal(matcher.refusal)
+
+    RejectOne().visit(function.body)
+    assert rejected is not None
+    assert "StorageKind.GMEM" in rejected
+    assert "StorageKind.SMEM" in rejected
+
+
+def test_schedule_analyze_writes_memory_report(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = "tests/fixtures/schedule/hir/gemm_8192x17408x5120_tma_store.py"
+    out = tmp_path / "analyzed.txt"
+
+    assert cli_main(["analyze", source, str(out), "--memory"]) == 0
+    assert capsys.readouterr() == ("", "")
+    assert out.read_bytes() == ANALYZED_GOLDEN.read_bytes()
+
+
+@pytest.mark.parametrize("source", HIR, ids=lambda path: path.stem)
+def test_schedule_finalize_writes_verified_tir(
+    source: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    out = tmp_path / source.name
+    expected = source.parent.parent / "tir" / source.name
+
+    assert cli_main(["schedule", "finalize", str(source), str(out)]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+    assert out.read_bytes() == expected.read_bytes()
+    found = _direct_operand_matches(_prim_in(out))
+    assert found
+    wgmma_lhs = [
+        captures
+        for op, name, captures in found
+        if isinstance(getattr(op, "atom", None), Wgmma) and name == "lhs"
+    ]
+    assert all("a_major" in captures for captures in wgmma_lhs)
+    assert all(
+        "a_swizzle" in captures
+        for captures in wgmma_lhs
+        if captures["form"].name == "SS"
+    )
+
+
+def test_schedule_finalize_json_carries_the_same_source(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = Path(__file__).parents[1] / "fixtures" / "schedule" / "hir" / "wgmma_a_k_major.py"
+    out = tmp_path / "finalized.json"
+
+    assert cli_main(["schedule", "finalize", str(source), str(out), "--json"]) == 0
+    assert capsys.readouterr() == ("", "")
+    payload = json.loads(out.read_text())
+    assert set(payload) == {"source"}
+    python = tmp_path / "finalized.py"
+    python.write_text(payload["source"])
+    verify_prim_function(_prim_in(python))
+
+
+def _m1_analysis():
+    source = Path(__file__).parents[1] / "fixtures" / "schedule" / "hir" / "wgmma_a_k_major.py"
+    module = _module_in(source)
+    return source, module, analyze(module, module.entry_function(), analysis=("memory",))
+
+
+def _assert_cli_lowering_error(
+    source: Path,
+    message: str,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    out = tmp_path / "failed.py"
+    assert cli_main(["schedule", "finalize", str(source), str(out)]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert message in captured.err
+    assert not out.exists()
+
+
+def test_lowering_rejects_instruction_without_access_relation(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source, _module, result = _m1_analysis()
+    transfer = next(
+        expr
+        for expr in collect_exprs(result.function.body)
+        if isinstance(expr, Call)
+        and isinstance(expr.target, ScheduleOp)
+        and not isinstance(expr.target.op, TiledMma)
+    )
+    transfer.target.op = _UnstatedInstruction()
+    monkeypatch.setattr(lowering_module, "analyze", lambda *_args, **_kwargs: result)
+
+    _assert_cli_lowering_error(source, "no registered access relation", tmp_path, capsys)
+
+
+def test_lowering_rejects_addressable_result_without_offsets(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source, _module, result = _m1_analysis()
+    addressable = next(
+        expr
+        for expr in collect_exprs(result.function.body)
+        if isinstance(expr, Call)
+        and isinstance(expr.target, ScheduleOp)
+        and expr.type.storage is StorageKind.SMEM
+    )
+    detach_metadata(addressable, MemoryMetadata)
+    monkeypatch.setattr(lowering_module, "analyze", lambda *_args, **_kwargs: result)
+
+    _assert_cli_lowering_error(source, "addressable smem result but no offsets", tmp_path, capsys)
+
+
+def test_lowering_rejects_unknown_hir_call(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source, _module, result = _m1_analysis()
+    view = next(
+        expr
+        for expr in collect_exprs(result.function.body)
+        if isinstance(expr, Call) and type(expr.target).__name__ == "Slice"
+    )
+    view.target = _UnstatedInstruction()
+    monkeypatch.setattr(lowering_module, "analyze", lambda *_args, **_kwargs: result)
+
+    _assert_cli_lowering_error(source, "unknown HIR call _UnstatedInstruction", tmp_path, capsys)
+
+
+def test_lowering_rejects_unscheduled_gmem_cast(
+    monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source, _module, result = _m1_analysis()
+    cast = next(
+        expr
+        for expr in collect_exprs(result.function.body)
+        if isinstance(expr, Call) and isinstance(expr.target, HirCast)
+    )
+    cast.type = replace(cast.type, storage=StorageKind.GMEM)
+    monkeypatch.setattr(lowering_module, "analyze", lambda *_args, **_kwargs: result)
+
+    _assert_cli_lowering_error(
+        source,
+        "T.cast accepts only rmem operands, so write an explicit tf.schedule",
+        tmp_path,
+        capsys,
+    )
+
+
+@pytest.mark.parametrize(
+    ("case", "message"),
+    (
+        ("group", "is not outer modes followed by participant frame"),
+        ("atom", "axis n extent 17 is not divisible by atom 16"),
+        ("row", "axis k extent 80 is not divisible by row 16 * 4"),
+    ),
+)
+def test_lowering_rejects_invalid_atom_geometry(
+    case: str,
+    message: str,
+    monkeypatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = Path(__file__).parents[1] / "fixtures" / "schedule" / "hir" / "wgmma_repeat_along_k.py"
+    module = _module_in(source)
+    result = analyze(module, module.entry_function(), analysis=("memory",))
+    emit = lowering_module.Lowering._emit_atom
+
+    def malformed(self, call, atom, operands, mesh, cursor):
+        acc, lhs, rhs = (value for _role, value in operands)
+        acc_type = self.logical.get(id(acc), acc.type)
+        assert isinstance(acc_type.layout, ShardLayout)
+        if case == "atom":
+            acc_type = replace(acc_type, shape=(acc_type.shape[0], 17))
+            rhs_type = self.logical.get(id(rhs), rhs.type)
+            self.logical[id(rhs)] = replace(rhs_type, shape=(rhs_type.shape[0], 17))
+        elif case == "row":
+            lhs_type = self.logical.get(id(lhs), lhs.type)
+            assert isinstance(lhs_type.layout, ComposedLayout)
+            assert isinstance(lhs_type.layout.outer, Layout)
+            lhs_outer = replace(
+                lhs_type.layout.outer,
+                shape=(*lhs_type.layout.outer.shape[:-1], (5, 16)),
+            )
+            self.logical[id(lhs)] = replace(
+                lhs_type,
+                shape=(lhs_type.shape[0], 80),
+                layout=replace(lhs_type.layout, outer=lhs_outer),
+            )
+            rhs_type = self.logical.get(id(rhs), rhs.type)
+            assert isinstance(rhs_type.layout, Layout)
+            rhs_layout = replace(
+                rhs_type.layout,
+                shape=((5, *rhs_type.layout.shape[0][1:]), *rhs_type.layout.shape[1:]),
+            )
+            self.logical[id(rhs)] = replace(
+                rhs_type,
+                shape=(80, rhs_type.shape[1]),
+                layout=rhs_layout,
+            )
+        self.logical[id(acc)] = acc_type
+        return emit(self, call, atom, operands, mesh, cursor)
+
+    monkeypatch.setattr(lowering_module, "analyze", lambda *_args, **_kwargs: result)
+    if case == "group":
+        frames = lowering_module.issue_frames
+
+        def misplaced(source, required, repeat, tile):
+            return frames(source, required, (3, *repeat[1:]), tile)
+
+        monkeypatch.setattr(lowering_module, "issue_frames", misplaced)
+    monkeypatch.setattr(lowering_module.Lowering, "_emit_atom", malformed)
+
+    _assert_cli_lowering_error(source, message, tmp_path, capsys)

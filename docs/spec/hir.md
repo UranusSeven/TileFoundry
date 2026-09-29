@@ -662,10 +662,15 @@ Tensor structural operations; consensus ops (`Transpose` / `Slice` / `Concat`
 / `Stack` / `ShapeOf` / `Rank`) follow torch / numpy
 ([torch tensor manipulation ops](https://pytorch.org/docs/stable/torch.html#indexing-slicing-joining-mutating-ops)).
 
-`Transpose`, statically positioned `Slice`, and `Reshape` derive a view layout from
-their input when it states one. For `Slice` and `Reshape`, an input with
-`layout=None` produces a view with `layout=None`. Neither case says that the
-view materialized.
+`Transpose`, statically positioned `Slice`, and `Reshape` derive their result
+layout during type inference. Their result `TensorType.layout` MUST NOT be
+`None`; a `Layout` whose `strides` are `None` states that the view arrangement
+is known while its steps are not. A missing input layout is the compact
+arrangement that HIR readers assign to that value. This requirement applies to
+these view ops, not to every tensor-producing HIR op.
+
+Pattern matching and lowering MUST read this result type rather than derive a
+second presentation of the view.
 
 - `Transpose` MUST permute the layout shape and strides by the same permutation
   as the tensor shape. A `ShardLayout` MUST remap its split positions through
@@ -703,10 +708,12 @@ view materialized.
 - Narrowing a logical axis targeted by any `Split` MUST fail type inference:
   the window need not align with that mesh division. A narrowed axis represented
   by more than one factored layout position MUST also fail rather than guess.
-- Runtime starts MUST remain ordinary Call operands. A plain layout produces
-  `layout=None`; a safe sharded slice follows the preservation rule above.
-  The result type describes a full window; whether a loop iteration can contain
-  that window is an analysis-domain question, not a type-inference question.
+- Runtime starts MUST remain ordinary Call operands. They move the view's base
+  address, not its strides: a plain input therefore still produces a result
+  `Layout`, while the runtime offset is not carried by that layout. A safe
+  sharded slice follows the preservation rule above. The result type describes
+  a full window; whether a loop iteration can contain that window is an
+  analysis-domain question, not a type-inference question.
 
 ##### Concat
 

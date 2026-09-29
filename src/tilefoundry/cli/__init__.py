@@ -14,6 +14,9 @@ from tilefoundry.cli.check import add_arguments as add_check_arguments
 from tilefoundry.cli.check import guidance as check_guidance
 from tilefoundry.cli.check import run_check
 from tilefoundry.cli.models import run_models
+from tilefoundry.cli.schedule import run_candidates as run_schedule_candidates
+from tilefoundry.cli.schedule import run_facts as run_schedule_facts
+from tilefoundry.cli.schedule import run_finalize as run_schedule_finalize
 from tilefoundry.cli.source import load_authored_ir, one_extent_per_dim, parse_dims
 from tilefoundry.cli.spec import read_spec, run_spec, spec_path
 from tilefoundry.cli.target import load_registrations, registry_path
@@ -33,6 +36,7 @@ _COMMANDS = {
     "check": "compare an implementation against its reference, output by output",
     "analyze": "report what a program costs: flops, traffic, bounds, timing",
     "target": "list, show, add, or remove compilation targets",
+    "schedule": "finalize scheduled HIR and inspect instruction choices",
 }
 
 _TARGET_COMMANDS = {
@@ -40,6 +44,12 @@ _TARGET_COMMANDS = {
     "show": "show the documents retained by one target identity",
     "add": "add one Target provider or hardware document",
     "remove": "remove one entry shown by target list",
+}
+
+_SCHEDULE_COMMANDS = {
+    "finalize": "lower scheduled HIR to verified TIR",
+    "facts": "describe the instructions admitted by one target",
+    "candidates": "report instruction choices for unscheduled HIR sites",
 }
 
 
@@ -188,7 +198,9 @@ def build_parser() -> argparse.ArgumentParser:
         description=f"tilefoundry target — {_COMMANDS['target']}",
     )
     target.set_defaults(_command_parser=target)
-    target_commands = target.add_subparsers(dest="target_command", title="Commands", metavar="<command>")
+    target_commands = target.add_subparsers(
+        dest="target_command", title="Commands", metavar="<command>"
+    )
     target_commands.add_parser("list", help=_TARGET_COMMANDS["list"])
     target_show = target_commands.add_parser("show", help=_TARGET_COMMANDS["show"])
     target_show.add_argument("identity", metavar="IDENTITY")
@@ -202,6 +214,50 @@ def build_parser() -> argparse.ArgumentParser:
     target_remove = target_commands.add_parser("remove", help=_TARGET_COMMANDS["remove"])
     target_remove.add_argument("name", metavar="NAME")
 
+    schedule = commands.add_parser(
+        "schedule",
+        help=_COMMANDS["schedule"],
+        description=f"tilefoundry schedule — {_COMMANDS['schedule']}",
+    )
+    schedule.set_defaults(_command_parser=schedule)
+    schedule_commands = schedule.add_subparsers(
+        dest="schedule_command", title="Commands", metavar="<command>"
+    )
+    schedule_finalize = schedule_commands.add_parser(
+        "finalize", help=_SCHEDULE_COMMANDS["finalize"]
+    )
+    _add_source_argument(schedule_finalize)
+    schedule_finalize.add_argument(
+        "out", metavar="PATH", help="write the TIR here; stdout carries none of it"
+    )
+    schedule_finalize.add_argument(
+        "--json", action="store_true", help="write an object containing the TIR source"
+    )
+    schedule_facts = schedule_commands.add_parser("facts", help=_SCHEDULE_COMMANDS["facts"])
+    schedule_facts.set_defaults(_command_parser=schedule_facts)
+    schedule_facts.add_argument("--target", required=True, metavar="TARGET")
+    schedule_facts.add_argument(
+        "instruction_or_out",
+        metavar="INSTRUCTION|PATH",
+        help="one instruction to select, or PATH when listing every instruction",
+    )
+    schedule_facts.add_argument(
+        "out",
+        nargs="?",
+        metavar="PATH",
+        help="write one selected instruction here; stdout carries none of it",
+    )
+    schedule_facts.add_argument("--json", action="store_true", help="write the same facts as JSON")
+    schedule_candidates = schedule_commands.add_parser(
+        "candidates", help=_SCHEDULE_COMMANDS["candidates"]
+    )
+    _add_source_argument(schedule_candidates)
+    schedule_candidates.add_argument(
+        "out", metavar="PATH", help="write the candidate report here; stdout carries none of it"
+    )
+    schedule_candidates.add_argument(
+        "--json", action="store_true", help="write the same candidate report as JSON"
+    )
     return parser
 
 
@@ -214,6 +270,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "target" and args.target_command is None:
         args._command_parser.print_help()
         return 0
+    if args.command == "schedule" and args.schedule_command is None:
+        args._command_parser.print_help()
+        return 0
     if args.command == "tutorial" and args.page is None:
         try:
             print(render_page(PAGES[0]))
@@ -223,9 +282,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     analyses: tuple[str, ...] = ()
     if args.command == "analyze":
-        analyses = tuple(
-            name for name in _ANALYSES if getattr(args, name.replace("-", "_"))
-        )
+        analyses = tuple(name for name in _ANALYSES if getattr(args, name.replace("-", "_")))
         if args.json and not analyses:
             args._command_parser.error(
                 "--json requires at least one analysis flag: "
@@ -273,6 +330,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                     return run_target_add_document(args.source, registrations)
                 return run_target_add_module(args.source, registrations)
             return run_target_remove(args.name, registrations)
+        except Exception as error:
+            print(f"tilefoundry: error: {error}", file=sys.stderr)
+            return 1
+    if args.command == "schedule":
+        try:
+            if args.schedule_command == "candidates":
+                return run_schedule_candidates(args.source, args.out, as_json=args.json)
+            if args.schedule_command == "facts":
+                instruction, out = (
+                    (None, args.instruction_or_out)
+                    if args.out is None
+                    else (args.instruction_or_out, args.out)
+                )
+                return run_schedule_facts(
+                    instruction,
+                    args.target,
+                    out,
+                    as_json=args.json,
+                )
+            return run_schedule_finalize(args.source, args.out, as_json=args.json)
         except Exception as error:
             print(f"tilefoundry: error: {error}", file=sys.stderr)
             return 1

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from enum import Enum
 
 from tilefoundry.ir.clause.layout import is_layout_wildcard
 from tilefoundry.ir.core.param_def import collect_param_defs
 from tilefoundry.ir.pattern.pattern import Pattern
+from tilefoundry.ir.pattern.utils import declared_execution_mesh
 from tilefoundry.ir.types import Broadcast, DType, Split
 from tilefoundry.ir.types.dim import DimFloorDiv, DimMul, DimVar, is_dim_op_call
 
@@ -27,19 +29,15 @@ class PatternPrinter:
         """Write the ordered, de-duplicated conditions imposed by *pattern*."""
         if not isinstance(pattern, Pattern):
             return ()
-        lines = tuple(dict.fromkeys(self._dispatch("rules", pattern, name)))
-        formulas = frozenset(
-            self._written_expression(formula) for formula in self._formulas(pattern)
-        )
-        return tuple(
-            sorted(
-                lines,
-                key=lambda line: not any(
-                    line == formula or line.startswith(f"{formula} where ")
-                    for formula in formulas
-                ),
+        lines = tuple(
+            dict.fromkeys(
+                (
+                    *self._dispatch("rules", pattern, name),
+                    *self._rules_of(pattern.predicates, name),
+                )
             )
         )
+        return lines
 
     def described(self, pattern, name: str = _UNNAMED) -> str:
         """Write a value shape followed by its predicate lines, when present."""
@@ -72,11 +70,8 @@ class PatternPrinter:
         bindings = self._written_bindings(refusal.bindings.items())
         return reason if not bindings else f"{reason} ({bindings})"
 
-    def declaration(self, op_type) -> str:
-        """Render all parameter and operand patterns declared by *op_type*."""
-        title = getattr(op_type, "reference_name", "") or getattr(
-            getattr(op_type, "_op_schema", None), "name", op_type.__name__
-        )
+    def declaration(self, op_type) -> dict[str, tuple[str, ...]]:
+        """Render declaration sections without flattening them into report text."""
         sections = []
         parameters = tuple(getattr(op_type, "parameters", ())) or collect_param_defs(op_type)
         parameters_by_name = {param.name: param for param in parameters}
@@ -89,9 +84,12 @@ class PatternPrinter:
         )
         if roles:
             sections.append(("operands", roles))
-            scope_pattern = getattr(op_type, "scope_pattern", None)
-            if callable(scope_pattern):
-                sections.append(("attributes", (("scope", scope_pattern()),)))
+            sections.append(
+                (
+                    "attributes",
+                    (("execution mesh", declared_execution_mesh(op_type)),),
+                )
+            )
         if not roles and parameters:
             operands = tuple(
                 (param.name, param.pattern)
@@ -109,19 +107,22 @@ class PatternPrinter:
                 if items
             ]
 
-        lines = [title]
+        rendered = {}
         for heading, items in sections:
-            lines.append(f"  {heading}")
+            lines = []
             width = max((len(name) for name, _ in items), default=0)
             for name, pattern in items:
                 described = self._declared(pattern, name).splitlines()
                 parameter = parameters_by_name.get(name)
+                default = ""
                 if parameter is not None and parameter.has_default:
-                    described[0] += f" (default {self._written_value(parameter.default)})"
+                    default = f" (default {self._written_value(parameter.default)})"
                 prefix = f"    {name.ljust(width)}  "
-                lines.append(prefix + described[0])
-                lines.extend(" " * len(prefix) + line for line in described[1:])
-        return "\n".join(lines)
+                lines.append(prefix + described[0] + default)
+                continuation = " " * len(prefix)
+                lines.extend(continuation + line for line in described[1:])
+            rendered[heading] = tuple(lines)
+        return rendered
 
     def _declared(self, pattern, name: str) -> str:
         if not any(cls.__name__ == "SwitchPattern" for cls in type(pattern).__mro__):
@@ -275,29 +276,8 @@ class PatternPrinter:
             return rule
         return f"{rule}, {label}" if " where " in rule else f"{rule} where {label}"
 
-    @staticmethod
-    def _ordered_predicates(predicates) -> tuple:
-        formulas = tuple(p for p in predicates if type(p).__name__ == "Formula")
-        hand_written = tuple(p for p in predicates if type(p).__name__ != "Formula")
-        return formulas + hand_written
-
-    def _formulas(self, value) -> tuple:
-        if type(value).__name__ == "Formula":
-            return (value,)
-        if isinstance(value, Pattern):
-            return tuple(
-                formula
-                for field_value in vars(value).values()
-                for formula in self._formulas(field_value)
-            )
-        if isinstance(value, tuple):
-            return tuple(
-                formula for item in value for formula in self._formulas(item)
-            )
-        return ()
-
     def visit_WildcardPattern(self, pattern, name) -> str:
-        return pattern.name or name
+        return "any value" if pattern.name == name else pattern.name or name
 
     def rules_WildcardPattern(self, pattern, name) -> tuple[str, ...]:
         return ()
@@ -357,10 +337,7 @@ class PatternPrinter:
         return f"Layout({shape}, {strides})"
 
     def rules_LayoutPattern(self, pattern, name) -> tuple[str, ...]:
-        return (
-            *self._rules_of(pattern.positions()),
-            *self._rules_of(self._ordered_predicates(pattern.predicates)),
-        )
+        return self._rules_of(pattern.positions())
 
     def visit_SwizzlePattern(self, pattern, name) -> str:
         return (
@@ -378,10 +355,7 @@ class PatternPrinter:
         )
 
     def rules_ComposedLayoutPattern(self, pattern, name) -> tuple[str, ...]:
-        return (
-            *self._rules_of((pattern.inner, pattern.offset, pattern.outer)),
-            *self._rules_of(self._ordered_predicates(pattern.predicates)),
-        )
+        return self._rules_of((pattern.inner, pattern.offset, pattern.outer))
 
     def visit_MeshPattern(self, pattern, name) -> str:
         return f"Mesh({pattern.topologies!r}, {self.written(pattern.layout)})"
@@ -437,7 +411,6 @@ class PatternPrinter:
         return (
             *self._rules_of(values),
             *layout_rules,
-            *self._rules_of(self._ordered_predicates(pattern.predicates)),
         )
 
     def visit_ShardLayoutPattern(self, pattern, name) -> str:
@@ -452,10 +425,7 @@ class PatternPrinter:
         )
 
     def rules_ShardLayoutPattern(self, pattern, name) -> tuple[str, ...]:
-        return (
-            *self._alternative_rules(pattern),
-            *self._rules_of(self._ordered_predicates(pattern.predicates)),
-        )
+        return self._rules_of((pattern.layout, pattern.attrs, pattern.mesh))
 
     def visit_AtomPattern(self, pattern, name) -> str:
         return "one of " + ", ".join(item.reference_name for item in pattern.declarations)
@@ -609,7 +579,10 @@ class PatternPrinter:
         )
 
     def alternatives_ShardLayoutPattern(self, pattern, bindings) -> tuple:
-        return self.alternatives(pattern.layout, bindings)
+        return tuple(
+            (held, replace(pattern, layout=alternative))
+            for held, alternative in self.alternatives(pattern.layout, bindings)
+        )
 
 
 __all__ = ["PatternPrinter"]

@@ -387,7 +387,7 @@ printer.written(pattern)       # value shape, with named holes
 printer.rules(pattern)         # ordered, de-duplicated condition lines
 printer.described(pattern)     # value shape plus an indented predicates line
 printer.alternatives(pattern)  # flattened structural Or/Switch branches
-printer.declaration(op_type)   # one complete operation declaration
+printer.declaration(op_type)   # rendered declaration sections, still structured
 printer.refusal(refusal)       # consumer-facing match failure
 ```
 
@@ -395,15 +395,21 @@ Layout values use single-line positional forms such as `Layout((r, W), (l,
 1))`, `ComposedLayout(Swizzle(b, 4, 3), p, Layout(...))`, and
 `ShardLayout(Layout(...), (B(), B(), B()), Mesh(...))`. Named wildcards print
 their names, unnamed wildcards print `_`, and star captures print `*name`.
-Formula conditions precede hand-written layout predicates. Alternative
-bindings retain declaration order. An `OrPattern` containing only ordinary
+Predicate conditions retain structural traversal and authored declaration
+order; de-duplication keeps the first occurrence. Alternative bindings retain
+declaration order. An `OrPattern` containing only ordinary
 values is one set-valued alternative rather than several structural branches.
 For tensor arrangements, rules shared by every alternative appear in the
 common predicates block; rules unique to one alternative remain indented under
 that arrangement. Parameter defaults are stated on their parameter line.
-Instruction declarations report their participation mesh once as the `scope`
-attribute, with the mesh's predicates, instead of repeating those predicates
-under every operand.
+Every `Pattern` carries its own `predicates` slot. The structural line comes
+only from that pattern's structural fields, while its predicate block comes
+only from `pattern.predicates`; the printer MUST NOT infer one role from the
+text produced for the other. `ShardLayoutPattern` arrangements render all
+three declared fields through the same visitor/rules dispatch: local layout,
+shard attrs, and holder mesh. Instruction declarations call the reserved field
+`execution mesh` everywhere, including the standalone facts field and the
+declaration attributes section.
 
 This report printer is separate from `PythonPrinter`: it does not inherit the
 round-trip source printer, request import or mesh-name registration, or accept

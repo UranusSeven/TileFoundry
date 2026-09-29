@@ -437,6 +437,64 @@ explicit analysis; there is no ordinary `--target` option.
     On inference, verification, or analysis failure, stdout MUST be empty and
     stderr MUST report the source location, binding where available, and reason.
 
+## Schedule
+
+`schedule` owns the transition from checked scheduling HIR to executable TIR
+and the two reports used to choose an instruction. Its subcommands are:
+
+```text
+tilefoundry schedule finalize SOURCE PATH [--json]
+tilefoundry schedule facts [INSTRUCTION] --target TARGET PATH [--json]
+tilefoundry schedule candidates SOURCE PATH [--json]
+```
+
+`finalize` checks and inlines the selected entry, runs memory analysis, lowers
+every selected instruction, and writes the verified `PrimFunction` as canonical
+Python TIR. With `--json`, `PATH` instead contains an object whose `source`
+field is that same canonical TIR. `facts` describes the instructions admitted
+by the exact `TARGET` identity, optionally narrowed to one fully-qualified
+`INSTRUCTION` name. With no `INSTRUCTION`, it lists every registered TIR Op
+that owns a class-level instruction-capability declaration. A named capability
+must occur in the target architecture's capability set; a declaration with no
+required capability is admitted by every target. A carrier may associate more
+than one named declaration with itself. The inventory lists that carrier once,
+while each associated declaration remains addressable by its own exact name.
+With one name, `facts` reports that declaration's capability, execution mesh,
+parameters, operands, and cross-operand constraints; the parameter and operand
+sections are canonical `PatternPrinter.declaration` text.
+`candidates` reports the instructions whose access relation and operand
+patterns can implement each unscheduled registered HIR site. A target-neutral
+pairing registry decides which TIR carrier families are relevant to each HIR
+Op; a HIR Op with no pairing is not a candidate site. Target capabilities then
+silently remove paired carriers unsupported by the selected target. Relation
+rank and coordinate projections decide which remaining families enter the
+report; tile extents do not have to equal one instruction issue because
+repetition is a later scheduling choice. Operand dtype, storage, rank,
+divisibility, and cross-operand constraints then decide whether each declaration
+is a candidate or a refusal. A carrier family is reported by its associated
+declaration name, not by the carrier Op name. A site with no accepted
+instruction still reports its refusals.
+An inventory Op with no access relation is not comparable and is skipped by
+candidate discovery; explicitly selecting that Op in `tf.schedule` remains an
+error.
+
+- constraints:
+  - `PATH` is required, is the only report destination, and MUST NOT be partly
+    written when the operation fails. A successful command writes a trailing
+    newline and writes nothing to stdout.
+  - `finalize` MUST run lowering through `PassManager`, so every changed
+    `PrimFunction` receives the manager's automatic TIR verification.
+  - `--json` changes only representation. It MUST carry the same TIR source or
+    report facts as the text form.
+  - `facts --target` is required. `TARGET` and `INSTRUCTION`, when present,
+    match exact identities; neither accepts a short alias or a best-effort
+    fallback.
+  - A selected instruction with no access relation, an addressable result
+    without an analyzed offset, an unsupported HIR call, an unknown instruction,
+    an unknown target, or a source with no candidate site MUST print
+    `tilefoundry: error: REASON` to stderr and exit 1. No partial output is
+    permitted.
+
 ## Target
 
 `target list` prints every Target value constructible in the current

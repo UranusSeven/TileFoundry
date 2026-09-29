@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from tilefoundry.evaluator.registry import register_schedule_eval
 from tilefoundry.evaluator.value import TensorValue
-from tilefoundry.ir.core import Op
+from tilefoundry.ir.core import Op, OpCapability
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import utils
@@ -27,12 +27,22 @@ from tilefoundry.visitor_registry.access_relation import (
 class Copy(Op):
     """Copies ``src`` into ``dst`` (in-place memory write)."""
 
-    src = ParamDef(kind="input", effect=MemoryEffect.READ, pattern=utils.operand_tile(0))
-    dst = ParamDef(kind="input", effect=MemoryEffect.WRITE, pattern=utils.operand_tile(1))
+    capability = OpCapability(None)
+
+    execution_mesh = utils.thread_execution_mesh()
+
+    src = ParamDef(
+        kind="input",
+        effect=MemoryEffect.READ,
+        pattern=utils.operand_tile(0, execution_mesh=execution_mesh),
+    )
+    dst = ParamDef(
+        kind="input",
+        effect=MemoryEffect.WRITE,
+        pattern=utils.operand_tile(1, execution_mesh=execution_mesh),
+    )
     rmem_layout = ParamDef(kind="attribute", annotation=LayoutBase, optional=True, default=None)
     smem_layout = ParamDef(kind="attribute", annotation=LayoutBase, optional=True, default=None)
-
-    scope = utils.any_threads()
 
 
 @register_typeinfer(Copy)
