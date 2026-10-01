@@ -151,6 +151,7 @@ class PrimFunction(Stmt):
         body: attribute; Function body.
         output_count: attribute; Number of trailing output parameters.
         target: attribute; Compilation target for this function.
+        metadata: attribute; Non-semantic function-level analysis records.
     """
 
     name: str
@@ -590,15 +591,17 @@ class Fill(Op):
 ##### Cast
 ```python
 class Cast(Op):
-    """Effect form; convert a register tile to another dtype."""
+    """Effect form; convert a register tile to ``dtype``."""
 
     src: Tensor
     dst: Tensor
+    dtype: DType
     execution_mesh: MeshPattern
 ```
 - constraints:
   - `src` declares `READ`; `dst` declares `WRITE`; both are rmem tensors.
   - the operands have equal shapes and distinct dtypes.
+  - `dtype` is required and equals the destination dtype.
   - both operand shard layouts reference the same `execution_mesh` declaration.
 
 #### NN Ops (`tir.nn.*`)
@@ -658,6 +661,7 @@ class Reduce(Op):
         dst: input; reduction destination.
         workspace: input; optional staging buffer sized by lowering.
         axes: attribute; reduced-axis tuple.
+        keepdim: attribute; whether reduced axes remain with extent one.
         kind: attribute; ``ReduceKind`` tag.
     """
 
@@ -665,6 +669,7 @@ class Reduce(Op):
     dst: Tensor
     workspace: Tensor | None = None
     axes: tuple
+    keepdim: bool
     kind: ReduceKind
 ```
 - constraints:
@@ -672,6 +677,8 @@ class Reduce(Op):
     live in any storage; `workspace` is smem, because every warp posts a partial there and reads
     the others back.
   - both dtypes are f32, f16, or bf16.
+  - `axes` and `keepdim` determine the destination shape. Kept axes have extent one;
+    otherwise they are removed.
   - `src` and `dst` carry a `ShardLayout` over one thread mesh; `src`'s layout carries no swizzle
     and no offset.
   - `Reduce` carries no dispatch parameter; runtime selects the strategy.
@@ -738,6 +745,14 @@ per-op classes; they appear as `Evaluate(op, args)`. `BinaryKind` /
 `UnaryKind` / `ReduceKind` are compiler-wide tag enums shared across HIR and
 TIR; lowering preserves the kind value without re-mapping. Their owning
 definitions are [core-ir §4](./core-ir.md#4-shared-operation-kinds).
+
+`Binary`, `Unary`, `Clamp`, `Cast`, `ReLU`, and `Reduce` are target-neutral
+instruction declarations (`OpCapability(None)`) with registered access
+relations, so schedule discovery and an explicit `tf.schedule` consume the same
+contracts as TIR verification. The five elementwise declarations use the
+thread mesh named by their rmem operands. `Reduce` instead walks the source
+coordinates and collapses its declared axes into the destination; its optional
+workspace is an operand only when the call supplies it.
 
 ##### Clamp
 

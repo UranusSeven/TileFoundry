@@ -5,6 +5,9 @@ from __future__ import annotations
 import importlib
 import pkgutil
 
+from tilefoundry.ir.core.op import Op
+from tilefoundry.ir.core.param_def import collect_param_defs
+
 _CANDIDATES: dict[type, list[type]] = {}
 
 
@@ -21,6 +24,27 @@ def candidate_ops(hir_op: type) -> tuple[type, ...]:
     return tuple(_CANDIDATES.get(hir_op, ()))
 
 
+def instruction_from_hir(hir_op: Op, op_type: type[Op]) -> Op | None:
+    """Build an instruction from same-named HIR attributes, or None if incomplete."""
+    attributes = {}
+    for param in collect_param_defs(op_type):
+        if param.kind != "attribute":
+            continue
+        if hasattr(hir_op, param.name):
+            attributes[param.name] = getattr(hir_op, param.name)
+        elif not param.has_default:
+            return None
+    return op_type(**attributes)
+
+
+def sole_candidate(hir_op: Op) -> Op | None:
+    """Build the one registered instruction from same-named attributes, or None."""
+    candidates = candidate_ops(type(hir_op))
+    if len(candidates) != 1:
+        return None
+    return instruction_from_hir(hir_op, candidates[0])
+
+
 def _auto_import(pkg_name: str) -> None:
     package = importlib.import_module(pkg_name)
     for _, module_name, _ in pkgutil.walk_packages(package.__path__, f"{pkg_name}."):
@@ -29,4 +53,9 @@ def _auto_import(pkg_name: str) -> None:
 
 _auto_import(__name__)
 
-__all__ = ["candidate_ops", "register_candidates"]
+__all__ = [
+    "instruction_from_hir",
+    "sole_candidate",
+    "candidate_ops",
+    "register_candidates",
+]

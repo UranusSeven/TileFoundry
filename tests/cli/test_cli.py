@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import tilefoundry.cli.analyze as analyze_cli
 import tilefoundry.cli.target as target_cli
 from tests.fixtures.shapes.composed_leaf_source import composed_leaf_source
 from tilefoundry import cli
@@ -128,6 +129,32 @@ class Sound:
             placed = tf.reshard(x, (N @ m.block,), 'gmem')
             return tf.reshard(tf.square(placed), (N @ m.block,), 'gmem')
 """
+
+
+@pytest.mark.parametrize(
+    ("root", "flags", "expected"),
+    [
+        ("Sound", (), 0),
+        ("Sound", ("--compute-cost",), 0),
+        ("Sound", ("--compute-cost", "--json"), 0),
+        ("Unsound", ("--compute-cost",), 1),
+    ],
+)
+def test_analyze_disarms_its_watchdog_on_every_exit(
+    tmp_path, monkeypatch, root, flags, expected
+) -> None:
+    """Neither successful returns nor raised errors leave a timer armed in the caller."""
+    source = tmp_path / "neighbours.py"
+    source.write_text(_NEIGHBOURS, encoding="utf-8")
+    disarmed = analyze_cli._watch(analyze_cli._ANALYSIS_TIMEOUT_SECONDS)
+    monkeypatch.setattr(analyze_cli, "_watch", lambda limit: disarmed)
+    assert not disarmed.is_set()
+
+    assert (
+        cli.main(["analyze", f"{source}:{root}", str(tmp_path / "report.txt"), *flags])
+        == expected
+    )
+    assert disarmed.is_set()
 
 
 def test_naming_one_root_does_not_ask_about_the_rest_of_its_file(tmp_path, capsys) -> None:
@@ -755,16 +782,12 @@ def test_analyze_reports_the_inlined_mega_kernel_from_one_rendering(tmp_path) ->
         "# compute-cost "
         f"flops=f32:{cost['flops']['f32']['logical']}@logical,"
         f"{cost['flops']['f32']['total']}@total,"
-        f"{cost['flops']['f32']['per_unit'][0]}@{payload['topology']}",
+        f"{cost['flops']['f32']['per_unit'][0]}@{payload['topology']} precision=exact",
         "# memory traffic=gmem:r120.00KB/w90.00KB@logical,"
         "r120.00KB/w90.00KB@total,r62.75KB/w32.75KB@cta "
         "footprint=<value 4>:30.00KB;<value 5>:30.00KB;v0:29:256B;"
         "v1:30:256B;v3:37:2.50KB;v4:38:2.50KB;v6:44:30.00KB "
-        "peak=gmem:60.00KB persistent=gmem:30.00KB",
-        "#   buffer=<value 4> holds=95.50KB time=none space=cta.tile "
-        "reuse=3.84MB fits=yes",
-        "#   buffer=<value 5> holds=95.50KB time=none space=cta.tile "
-        "reuse=3.84MB fits=yes",
+        "footprint-precision=exact peak=gmem:62.75KB persistent=gmem:30.00KB",
         f"# roofline ideal-ns={bound['ideal_ns']} bound-by={bound['bound_by']}",
         "# performance root=MoEMegaKernel::experts "
         f"predicted-ns={summary['timeline']['end_ns']} "

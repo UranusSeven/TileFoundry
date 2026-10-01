@@ -1,10 +1,12 @@
 # TileFoundry Spec — Schedule
 
 This spec owns the authored HIR operation that selects a concrete TIR
-instruction for a tensor tile. Scheduling is explicit: `tf.schedule` names the
-instruction, the values it reads, and the repetition of one instruction issue.
-It does not copy the instruction's operand, scope, capability, or access
-declarations into a second schema.
+instruction for a tensor tile. `tf.schedule` explicitly names an instruction,
+the values it reads, and the repetition of one instruction issue. An
+unscheduled HIR call may omit that spelling only when its registry has exactly
+one candidate and every required candidate attribute comes from a same-named
+HIR attribute. The schedule does not copy the instruction's operand, scope,
+capability, or access declarations into a second schema.
 
 ## 1. Authored form
 
@@ -27,6 +29,14 @@ These five parameters are the complete authored contract. In particular, a
 schedule has no separate operand mapping, instruction scope, access map, or
 capability field.
 
+`tilefoundry schedule candidates` marks an accepted candidate as `default`
+when that instruction would be selected by the omission rule above. The rule
+uses the number of registered candidates, not the number accepted at one site:
+a `Reshard` with several registered candidates therefore never becomes a
+default merely because only one matches its current operands. Zero candidates
+remain an unknown HIR call; several candidates, or a required instruction
+attribute with no same-named HIR value, require an explicit `tf.schedule`.
+
 ## 2. Operand and result roles
 
 The selected instruction's input `ParamDef`s determine the schedule boundary:
@@ -37,10 +47,27 @@ The selected instruction's input `ParamDef`s determine the schedule boundary:
   declaration order.
 - A `READ | WRITE` parameter is present on both sides. Its result has exactly
   the type of the value passed for that parameter.
+- An input parameter declared `optional=True` is absent from both sides when
+  the authored schedule does not supply it. Supplying it preserves its declared
+  effects. This applies equally to the optional workspace operands of `Reduce`
+  and `Dot`; it does not allocate a workspace on the author's behalf.
 - A write-only result takes fixed shape, dtype, layout, and storage facts from
-  its parameter pattern and instruction attributes. Fields left open by the
-  destination pattern come from the read tile. A layout not otherwise stated
-  is compact.
+  the instruction's own declarations. Its shape is the image of the write
+  access map over the instruction's iteration domain. Its dtype comes from
+  the instruction's `dtype` attribute, then the parameter pattern, then the
+  read tile. Its storage follows the destination pattern and layout attributes;
+  an unstated storage inherits the read tile's storage. Unless a layout is
+  explicitly declared, shard propagation uses the read types and the same
+  access relations, with completely collapsed axes becoming `Broadcast` and
+  receiving fresh strides. A result without a derived shard layout is compact.
+
+Automatic selection and explicit `tf.schedule` use the same instruction
+lowering and emission path. An instruction declaring an `atom` uses that atom's
+participant and fragment geometry. Other instructions issue whole when their
+write access maps collapse an axis Split across participants. Otherwise,
+single-issue verification uses local fragments. Candidate matching projects
+logical Split axes when that projection is possible; if factored splits have
+no local logical box, it compares whole types instead.
 
 Each single-issue operand MUST match the corresponding instruction parameter
 pattern. A source window is matched in the arrangement in which it lies: its
@@ -52,6 +79,11 @@ does not assign issues to frames; issue assignment is a lowering decision.
 
 An instruction without a registered access relation cannot be selected by a
 schedule.
+
+The target-neutral instruction set reported by `schedule facts` includes
+`T.binary`, `T.cast`, `T.clamp`, `T.unary`, `T.copy`, `T.relu`, and `T.reduce`.
+Their capability is `all targets`; target-specific instructions are added when
+the selected target admits their capabilities.
 
 ## 3. Repeat and order
 
@@ -129,6 +161,13 @@ contributes no bound; it is neither treated as zero bandwidth nor rejected.
 
 The concrete mapping of issues to participants is a lowering contract rather
 than authored ScheduleOp state.
+
+Finalization MUST NOT reject a program because analysis reports capacity
+findings. It MUST retain the function-level analysis metadata on the resulting
+PrimFunction and print the same report header as `analyze` before the entire
+TIR program. Placement and cache findings remain analysis diagnostics; whether
+to adopt the result is the user's decision. Successful finalization MUST leave
+stdout and stderr empty, and JSON output MUST contain only the `source` field.
 
 ## 6. Reference value semantics
 

@@ -15,10 +15,12 @@ import isl
 from tilefoundry.ir.core import Call, Expr, get_metadata
 from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.types import DType, Mesh, TensorType, TupleType, Type
 from tilefoundry.ir.types.int_tuple import repeat_like
 from tilefoundry.ir.types.layout import ComposedLayout, flatten
+from tilefoundry.ir.types.mesh import separate
 from tilefoundry.ir.types.utils import static_dim_value
 from tilefoundry.target.base import Target, UnsupportedCapabilityError
 from tilefoundry.target.facts import TopologyFacts
@@ -26,7 +28,7 @@ from tilefoundry.utils.isl_utils import cardinality
 from tilefoundry.visitor_registry.access_relation import leaves_of, projected
 from tilefoundry.visitor_registry.contexts import CostContext
 
-from .access import Access, AccessPrecision, resolve_access
+from .access import Access, resolve_access
 from .facts import MemoryHierarchyFacts
 from .iteration_scope import IterationScope, walk_scopes
 from .loop_domain import induction_name
@@ -38,6 +40,7 @@ from .metadata import (
     Spread,
     TrafficBytes,
 )
+from .precision import AnalysisPrecision
 
 
 @dataclass(frozen=True)
@@ -48,7 +51,7 @@ class ReachedAddresses:
     output_index: int | None
     dtype: DType | None
     reached: isl.set | None
-    exact: bool
+    precision: AnalysisPrecision
 
     def __post_init__(self) -> None:
         if (self.dtype is None) != (self.reached is None):
@@ -197,18 +200,11 @@ class MovingBoundary:
     _relations: dict[int, isl.map] = field(default_factory=dict, init=False, repr=False)
     _held: dict[int, isl.set] = field(default_factory=dict, init=False, repr=False)
     _reached: dict[int, isl.set] = field(default_factory=dict, init=False, repr=False)
-    _space_wave_reached: dict[int, isl.set] = field(
-        default_factory=dict, init=False, repr=False
-    )
+    _space_wave_reached: dict[int, isl.set] = field(default_factory=dict, init=False, repr=False)
     _unit_relations: dict[int, isl.map] = field(default_factory=dict, init=False, repr=False)
     _unit_reached: dict[tuple[int, str | None], isl.set | None] = field(
         default_factory=dict, init=False, repr=False
     )
-
-    @property
-    def exact(self) -> bool:
-        """Whether this boundary's access relation is exact."""
-        return self.access.precision is AccessPrecision.EXACT
 
     def _relation(self, window: int) -> isl.map:
         relation = self._relations.get(window)
@@ -288,11 +284,15 @@ class MovingBoundary:
 
 
 def time_axis(boundary: MovingBoundary) -> int | None:
-    """Return the outermost loop whose iterations reach the same addresses."""
+    """Return the outermost loop whose iterations reach the same addresses.
+
+    First-iteration restrictions give held(axis) <= held(axis - 1), so only
+    the reverse inclusion remains to prove equality.
+    """
     for axis, loop_scope in enumerate(_loop_scopes(boundary.scope)):
-        if loop_scope.trips() <= 1:
+        if loop_scope.trips() <= 1 or loop_scope.is_variant(boundary.access.buffer):
             continue
-        if boundary.held(axis).is_equal(boundary.held(axis - 1)):
+        if boundary.held(axis - 1).is_subset(boundary.held(axis)):
             return axis
     return None
 
@@ -306,9 +306,9 @@ def space_axes(
     window = boundary.scope.depth - 1
     wave_reached = boundary.space_wave_reached(window)
     shared = []
+    shape = flatten(flatten(boundary.mesh.layout).shape)
     for axis, parameter_name in enumerate(boundary.axis_parameters):
-        shape = flatten(flatten(boundary.mesh.layout).shape)
-        extent = static_dim_value(shape[axis]) if axis < len(shape) else None
+        extent = static_dim_value(shape[axis])
         unit_reached = boundary.unit_reached(window, parameter_name)
         if extent is not None and extent > 1 and unit_reached is not None:
             if wave_reached.is_equal(unit_reached):
@@ -419,50 +419,89 @@ def _missing_boundaries(
     try:
         output = ctx.local_type_of(call)
     except ValueError:
-        return (ReachedAddresses(call, None, None, None, False),)
+        return (ReachedAddresses(call, None, None, None, AnalysisPrecision.LOWER_BOUND),)
     output_count = len(output.fields) if isinstance(output, TupleType) else 1
     missing_inputs = (
-        ReachedAddresses(call.args[index], None, None, None, False)
+        ReachedAddresses(call.args[index], None, None, None, AnalysisPrecision.LOWER_BOUND)
         for index in sorted(set(range(len(call.args))) - recorded_inputs)
         if operands[index].read > 0 or operands[index].write > 0
     )
     missing_outputs = (
-        ReachedAddresses(call, index, None, None, False)
+        ReachedAddresses(call, index, None, None, AnalysisPrecision.LOWER_BOUND)
         for index in sorted(set(range(output_count)) - recorded_outputs)
         if operands[-1].read > 0 or operands[-1].write > 0
     )
     return (*missing_inputs, *missing_outputs)
 
 
-def _uncounted_boundaries(call: Call, ctx: CostContext) -> tuple[ReachedAddresses, ...]:
+def _uncounted_boundaries(
+    call: Call,
+    ctx: CostContext,
+    precision: AnalysisPrecision = AnalysisPrecision.LOWER_BOUND,
+) -> tuple[ReachedAddresses, ...]:
     """Represent every boundary when no positional movement answer exists."""
     try:
         output = ctx.local_type_of(call)
     except ValueError:
-        return (ReachedAddresses(call, None, None, None, False),)
+        return (ReachedAddresses(call, None, None, None, precision),)
     output_count = len(output.fields) if isinstance(output, TupleType) else 1
     return (
-        *(ReachedAddresses(arg, None, None, None, False) for arg in call.args),
-        *(ReachedAddresses(call, index, None, None, False) for index in range(output_count)),
+        *(ReachedAddresses(arg, None, None, None, precision) for arg in call.args),
+        *(ReachedAddresses(call, index, None, None, precision) for index in range(output_count)),
     )
 
 
-def _axis_parameters(
-    scope: IterationScope, mesh: Mesh | None
-) -> tuple[str | None, ...]:
-    """Map each axis of the innermost mesh to its retained isl parameter."""
+def _axis_parameters(scope: IterationScope, mesh: Mesh | None) -> tuple[str | None, ...]:
+    """Map each wave-mesh axis to its retained isl parameter."""
     if mesh is None:
         return ()
-    names_by_axis = {
-        axis: name
-        for name, coordinate in _mesh_parameters(scope)
-        if coordinate.target.mesh == mesh
-        and coordinate.args
-        and (axis := static_dim_value(coordinate.args[0])) is not None
-    }
+    names_by_axis = {}
+    for name, coordinate in _mesh_parameters(scope):
+        axis = static_dim_value(coordinate.args[0])
+        if axis is None:
+            continue
+        start = 0
+        for level in separate(coordinate.target.mesh):
+            rank = len(flatten(flatten(level.layout).shape))
+            if level == mesh and start <= axis < start + rank:
+                names_by_axis[axis - start] = name
+            start += rank
     return tuple(
         names_by_axis.get(axis) for axis in range(len(flatten(flatten(mesh.layout).shape)))
     )
+
+
+def _wave_mesh(scope: IterationScope, topology_level: str) -> Mesh | None:
+    """Find the enclosing mesh at the topology whose units form this wave."""
+    cursor = scope
+    while cursor is not None:
+        if isinstance(cursor.owner, MeshRegion):
+            for mesh in separate(cursor.owner.mesh):
+                topology = mesh.topologies[0]
+                if getattr(topology, "name", topology) == topology_level:
+                    return mesh
+        cursor = cursor.parent
+    return None
+
+
+def _one_time_fill(scope: IterationScope, operands: tuple[TrafficBytes, ...]) -> bool:
+    """A write-only initializer outside loops streams once, without cache reuse."""
+    return scope.depth == 0 and all(item.read == 0 for item in operands)
+
+
+def _shared_origin(
+    scope: IterationScope | None, topology_level: str, wave: tuple[int, int]
+) -> bool:
+    """A material definition made by multiple wave units is not shared data.
+
+    Registered storage-sharing edges have already resolved the origin, so a
+    view of an enclosing definition does not become fresh within this mesh.
+    """
+    mesh = None if scope is None else _wave_mesh(scope, topology_level)
+    if mesh is None:
+        return True
+    axes = tuple(range(len(flatten(flatten(mesh.layout).shape))))
+    return shared_units(mesh, axes, wave) <= 1
 
 
 def moving_boundaries(
@@ -472,17 +511,28 @@ def moving_boundaries(
     wave: tuple[int, int],
     ctx: CostContext,
     labels: Mapping[int, str],
+    owners: Mapping[int, Expr],
 ) -> tuple[MovingBoundary, ...]:
-    """Collect boundaries that move bytes at *memory_level* in one scope walk."""
+    """Collect boundaries that move bytes at *memory_level* in one scope walk.
+
+    Every accessed value has a liveness interval; storage_owners resolves all
+    intervals and their storage-source chains, so owners covers each buffer.
+    """
     whole = replace(ctx, topology_level=None, topologies=())
     wave_units, declared_units = wave
+    topology_level = ctx.topology_level or ctx.scope.module.resolve_target().get_facts(
+        TopologyFacts
+    ).parallel_level
+    definitions = {
+        value_id: scope for scope in walk_scopes(root) for value_id in scope.relations
+    }
     found: list[MovingBoundary] = []
     for scope in walk_scopes(root):
         mesh_parameters = _mesh_parameters(scope)
         position = None
         if wave_units < declared_units and mesh_parameters:
             position = _linear_position(mesh_parameters)
-        mesh = scope.enclosing_mesh()
+        mesh = _wave_mesh(scope, topology_level)
         axis_parameters = _axis_parameters(scope, mesh)
         wave_stated = not (
             wave_units < declared_units and mesh_parameters and position is None
@@ -492,6 +542,8 @@ def moving_boundaries(
         for call, _recorded in scope.accesses.get("narrow", {}).values():
             moved = get_metadata(call, MemoryMetadata)
             if moved is None or len(moved.operands) != len(call.args) + 1:
+                continue
+            if _one_time_fill(scope, moved.operands):
                 continue
             device_recorded = scope.accesses.get("device", {}).get(id(call))
             device_by_boundary = (
@@ -590,7 +642,11 @@ def moving_boundaries(
                         wave_units=wave_units,
                         wave_stated=wave_stated,
                         mesh_parameters=mesh_parameters,
-                        axis_parameters=axis_parameters,
+                        axis_parameters=axis_parameters
+                        if _shared_origin(
+                            definitions.get(id(owners[id(access.buffer)])), topology_level, wave
+                        )
+                        else (),
                         position=position,
                     )
                 )
@@ -608,13 +664,18 @@ def _uncounted_movements(
     found: list[tuple[IterationScope, ReachedAddresses]] = []
     for scope in walk_scopes(root):
         for call in scope.refused.get("narrow", ()):
-            found.extend((scope, item) for item in _uncounted_boundaries(call, whole))
+            found.extend(
+                (scope, item)
+                for item in _uncounted_boundaries(call, whole, AnalysisPrecision.UNKNOWN)
+            )
         for call, _recorded in scope.accesses.get("narrow", {}).values():
             moved = get_metadata(call, MemoryMetadata)
             operands = () if moved is None else moved.operands
             accesses = _call_accesses(scope, call)
             if len(operands) != len(call.args) + 1:
                 found.extend((scope, item) for item in _uncounted_boundaries(call, whole))
+                continue
+            if _one_time_fill(scope, operands):
                 continue
             for access in accesses:
                 movement = (
@@ -639,13 +700,12 @@ def _uncounted_movements(
                                 access.output_index,
                                 None,
                                 None,
-                                False,
+                                AnalysisPrecision.LOWER_BOUND,
                             ),
                         )
                     )
             found.extend(
-                (scope, item)
-                for item in _missing_boundaries(call, accesses, operands, whole)
+                (scope, item) for item in _missing_boundaries(call, accesses, operands, whole)
             )
     return tuple(found)
 
@@ -669,10 +729,16 @@ def reached_by(
         if position is None:
             return None
 
-    if len(operands) != len(call.args) + 1:
-        return _uncounted_boundaries(call, ctx)
-
     refused = call in scope.refused.get("narrow", ())
+    if len(operands) != len(call.args) + 1:
+        return _uncounted_boundaries(
+            call,
+            ctx,
+            AnalysisPrecision.UNKNOWN if refused else AnalysisPrecision.LOWER_BOUND,
+        )
+    if _one_time_fill(scope, operands):
+        return ()
+
     accesses = _call_accesses(scope, call)
     result: list[ReachedAddresses] = []
     for access in accesses:
@@ -692,7 +758,7 @@ def reached_by(
                     output_index=access.output_index,
                     dtype=None,
                     reached=None,
-                    exact=False,
+                    precision=AnalysisPrecision.LOWER_BOUND,
                 )
             )
             continue
@@ -711,7 +777,7 @@ def reached_by(
                 output_index=access.output_index,
                 dtype=leaves[0].dtype,
                 reached=reached,
-                exact=access.precision is AccessPrecision.EXACT and not refused,
+                precision=AnalysisPrecision.UNKNOWN if refused else access.precision,
             )
         )
     result.extend(_missing_boundaries(call, accesses, operands, ctx))
@@ -803,7 +869,7 @@ def _window_footprints(
                     boundary.access.output_index,
                     boundary.dtype,
                     boundary.reached(window),
-                    boundary.exact,
+                    boundary.access.precision,
                 )
             )
         if key in footprints:
@@ -845,15 +911,14 @@ def _reuse_rows(
                 buffer=item.boundary.label,
                 time=(
                     induction_name(item.time_scope.owner)
-                    if item.time_scope is not None
-                    and isinstance(item.time_scope.owner, LoopRegion)
+                    if item.time_scope is not None and isinstance(item.time_scope.owner, LoopRegion)
                     else ""
                 ),
                 space=",".join(item.space),
                 holds_bytes=holds,
                 reuse_bytes=reuse,
                 fits=holds < capacity,
-                complete=counted.complete,
+                precision=counted.precision,
             )
         )
     return tuple(sorted(rows, key=lambda row: row.reuse_bytes, reverse=True))
@@ -867,11 +932,12 @@ def reuse_windows(
     declared_units: int,
     ctx: CostContext,
     labels: Mapping[int, str],
+    owners: Mapping[int, Expr],
 ) -> tuple[ReuseWindow, ...]:
     """Describe one cache-residency window per buffer that is read again."""
     wave = (wave_units, declared_units)
     boundaries = moving_boundaries(
-        root, memory_level=memory_level, wave=wave, ctx=ctx, labels=labels
+        root, memory_level=memory_level, wave=wave, ctx=ctx, labels=labels, owners=owners
     )
     buffers = _by_buffer(boundaries, wave)
     if not buffers or ctx.scope is None:
@@ -895,36 +961,15 @@ def merged(items: Iterable[ReachedAddresses]) -> tuple[ReachedAddresses, ...]:
         if previous is None:
             grouped[key] = item
             continue
-        if previous.reached is None and item.reached is None:
-            grouped[key] = ReachedAddresses(
-                previous.buffer, previous.output_index, None, None, False
-            )
-            continue
+        precision = previous.precision.join(item.precision)
         if previous.reached is None:
-            grouped[key] = ReachedAddresses(
-                item.buffer,
-                item.output_index,
-                item.dtype,
-                item.reached,
-                False,
+            grouped[key] = replace(item, precision=precision)
+        elif item.reached is None:
+            grouped[key] = replace(previous, precision=precision)
+        else:
+            grouped[key] = replace(
+                previous, reached=previous.reached.union(item.reached), precision=precision
             )
-            continue
-        if item.reached is None:
-            grouped[key] = ReachedAddresses(
-                previous.buffer,
-                previous.output_index,
-                previous.dtype,
-                previous.reached,
-                False,
-            )
-            continue
-        grouped[key] = ReachedAddresses(
-            buffer=previous.buffer,
-            output_index=previous.output_index,
-            dtype=previous.dtype,
-            reached=previous.reached.union(item.reached),
-            exact=previous.exact and item.exact,
-        )
     return tuple(grouped.values())
 
 
@@ -935,22 +980,24 @@ def footprint_of(
     labels: Mapping[int, str],
 ) -> Footprint:
     """Count unioned addresses and pack their element widths into bytes."""
-    items = tuple(items)
     totals: dict[tuple[str, str], int] = {}
-    complete = True
+    precision = AnalysisPrecision.EXACT
     for item in items:
         if item.reached is None:
-            complete = False
+            precision = precision.join(item.precision)
             continue
         amount = cardinality(item.reached.coalesce())
-        if amount is None or item.dtype is None:
-            complete = False
+        if amount is None:
+            precision = precision.join(
+                AnalysisPrecision.UNKNOWN
+                if item.precision is AnalysisPrecision.UNKNOWN
+                else AnalysisPrecision.LOWER_BOUND
+            )
             continue
         packed = -(-(amount * item.dtype.bit_width) // 8)
         key = (labels[id(item.buffer)], memory_level)
         totals[key] = totals.get(key, 0) + packed
-        if not item.exact:
-            complete = False
+        precision = precision.join(item.precision)
 
     buffers = tuple(
         (
@@ -959,7 +1006,7 @@ def footprint_of(
         )
         for (name, level), size in sorted(totals.items())
     )
-    return Footprint(buffers=buffers, complete=complete)
+    return Footprint(buffers=buffers, precision=precision)
 
 
 def wave_of(

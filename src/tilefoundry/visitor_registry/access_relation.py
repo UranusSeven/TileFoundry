@@ -15,6 +15,7 @@ from typing import Callable
 import isl
 
 from tilefoundry.ir.core.expr import Constant
+from tilefoundry.ir.core.param_def import MemoryEffect
 from tilefoundry.ir.isl_interop import index_set, isl_to_dim, shape_to_isl_domain
 from tilefoundry.ir.types import TensorType, TupleType, Type
 from tilefoundry.ir.types.shard_layout import layout_axis_to_tensor_axis
@@ -1260,71 +1261,29 @@ def linearized_view(out_shape: tuple, in_shape: tuple) -> "AffineAccess":
     return AffineAccess(isl.map(f"{{ [{domain}] -> [{', '.join(reads)}] }}"))
 
 
-def view_relations(
-    source: int = 0,
-    mapping: "Callable[..., tuple[AffineAccess, AffineAccess]] | None" = None,
-    field: "Callable[..., int | None] | None" = None,
-    over: "Callable[..., Sequence] | None" = None,
-) -> Callable[..., AccessRelations]:
-    """An Op whose whole purpose is to re-address one operand's bytes.
-
-    A reshape, a slice, a reshard, an item of a tuple: the result is those same
-    elements under another name, though a name whose layout may factor its axes
-    differently, so the source states its own positions. Where those elements
-    came from is all this states; whether the two ends can be given the same
-    addresses is the allocation's answer, not this handler's.
-    """
-
-    def _handler(call, ctx) -> AccessRelations:
-        held = ctx.type_of(call.args[source])
-        taken = 0 if field is None else (field(call, ctx) or 0)
-        result = _field_of(held, taken)
-        out_rank = len(result.shape) if hasattr(result, "shape") else 0
-        walked = out_rank if over is None else len(tuple(over(call, ctx)))
-        out_rank = walked
-
-        if mapping is not None:
-            reads, written = mapping(call, ctx)
-        else:
-            reads = identity_access(walked)
-            written = identity_access(out_rank)
-        if isinstance(held, TupleType):
-            begin, count = leaf_span(held, taken)
-            coordinates = ", ".join(f"d{index}" for index in range(walked))
-            reads = AffineAccess(
-                isl.map(f"{{ [{coordinates}] -> [l] : {begin} <= l < {begin + count} }}")
-            )
-        walks = (getattr(result, "shape", ()) or ()) if over is None else over(call, ctx)
-        return iterating(
-            walks,
-            AccessRelations(
-                inputs=tuple(
-                    BoundaryRelation(reads if index == source else control_read(walked, ctx, arg))
-                    for index, arg in enumerate(call.args)
-                ),
-                outputs=(BoundaryRelation(written),),
-            ),
-        )
-
-    return _handler
-
-
 def identity_relations(n_inputs: int) -> Callable[..., AccessRelations]:
     """Identity relations.
 
     Factory for a GLOBAL-level access-relation handler whose ``n_inputs``
     inputs and single output are all elementwise identity.
 
-    Each input contributes its own-rank identity; the output uses its own
-    rank. A structural (non-tensor) input arg — e.g. ``TupleGetItem``'s tuple
-    operand — has no shape of its own, so it borrows the output's rank.
+    Read operands contribute their own-rank identities. A write-only operand
+    uses the read iteration rank, so its type need not be known yet. A
+    structural (non-tensor) operand borrows that rank as well.
     """
 
     def _handler(call, ctx) -> AccessRelations:
         walked = ctx.type_of(call.args[0])
         out_rank = len(walked.shape)
 
-        def _rank_of(arg) -> int:
+        params = tuple(
+            param for param in type(call.target)._op_schema.signature if param.kind == "input"
+        )
+
+        def _rank_of(index) -> int:
+            if params[index].effect == MemoryEffect.WRITE:
+                return out_rank
+            arg = call.args[index]
             ty = ctx.type_of(arg)
             return len(ty.shape) if hasattr(ty, "shape") else out_rank
 
@@ -1332,7 +1291,7 @@ def identity_relations(n_inputs: int) -> Callable[..., AccessRelations]:
             walked.shape,
             AccessRelations(
                 inputs=tuple(
-                    BoundaryRelation(identity_access(_rank_of(call.args[index])))
+                    BoundaryRelation(identity_access(_rank_of(index)))
                     for index in range(n_inputs)
                 ),
                 outputs=(BoundaryRelation(identity_access(out_rank)),),
@@ -1385,6 +1344,5 @@ __all__ = [
     "settled",
     "shape_from_relation",
     "static_bytes",
-    "view_relations",
     "window_source",
 ]

@@ -8,7 +8,6 @@ from tilefoundry.ir.core import (
     Call,
     Constant,
     Expr,
-    Tuple,
     VerifyError,
     describe_expr,
     get_metadata,
@@ -19,7 +18,6 @@ from tilefoundry.ir.core.module import Module
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.types import TensorType, TupleType, Type
 from tilefoundry.ir.types.mesh import Mesh, separate, within_scope
 from tilefoundry.ir.types.shard_layout import shard_layout_of
@@ -41,7 +39,13 @@ from tilefoundry.visitor_registry.access_relation import (
 from tilefoundry.visitor_registry.contexts import Cost, CostContext, FunctionScope
 from tilefoundry.visitor_registry.visitors import CostEvaluator
 
-from .allocation import AllocationValue, alias_components, find_aliases, solve_allocation
+from .allocation import (
+    AllocationValue,
+    alias_components,
+    find_aliases,
+    solve_allocation,
+    storage_owners,
+)
 from .errors import AnalysisError
 from .facts import TARGET_MEMORY_OWNER, MemoryHierarchyFacts
 from .footprint import (
@@ -53,8 +57,8 @@ from .footprint import (
     reuse_windows,
     wave_of,
 )
-from .iteration_scope import IterationScope, walk_scopes
-from .liveness import Liveness, analyze_liveness, result_copies
+from .iteration_scope import IterationScope, build_scopes, walk_scopes
+from .liveness import LiveInterval, Liveness, analyze_liveness, result_copies
 from .metadata import (
     Breakdown,
     MemoryLevelPeak,
@@ -65,6 +69,7 @@ from .metadata import (
     TrafficBytes,
     ValueLifetime,
 )
+from .precision import AnalysisPrecision
 from .visitor import AnalyzeContext
 
 SELECTOR = "memory"
@@ -379,49 +384,30 @@ def add_traffic(
                 _accumulate(into.per_unit.setdefault(name, {}), unit, moved, total_trips)
 
 
-def view_root(value: Expr) -> Expr:
-    """Follow region results and tuple projections to their material value."""
-    while True:
-        if isinstance(value, MeshRegion):
-            value = value.body
-            continue
-        if isinstance(value, Call) and isinstance(value.target, TupleGetItem):
-            source = view_root(value.args[0])
-            index = value.args[1]
-            if (
-                isinstance(source, Tuple)
-                and isinstance(index, Constant)
-                and type(index.value) is int
-                and 0 <= index.value < len(source.elements)
-            ):
-                value = source.elements[index.value]
-                continue
-        return value
-
-
-def _resident_value_ids(function: Function, liveness: Liveness) -> frozenset[int]:
-    """Values whose SSA interval represents independently resident bytes."""
-    result = {id(parameter) for parameter in function.params}
+def _allocation_intervals(
+    liveness: Liveness, parameter_ids: frozenset[int], owners: dict[int, Expr]
+) -> tuple[LiveInterval, ...]:
+    """Select independently resident intervals from storage-aware liveness."""
+    resident = set(parameter_ids)
     for interval in liveness.intervals:
         value = interval.value
-        if isinstance(value, (Call, Constant, LoopRegion)) and view_root(value) is value:
-            result.add(id(value))
+        owner = owners[id(value)]
+        if isinstance(value, (Call, Constant, LoopRegion)) and owner is value:
+            resident.add(id(value))
         if isinstance(value, LoopRegion):
-            result.update(id(phi) for phi in value.carried_args)
-    return frozenset(result)
+            resident.update(id(phi) for phi in value.carried_args)
+    return tuple(interval for interval in liveness.intervals if id(interval.value) in resident)
 
 
 def _project_allocation_values(
     liveness: Liveness,
-    resident_ids: frozenset[int],
     parameter_ids: frozenset[int],
     facts: MemoryHierarchyFacts,
     local: CostContext,
+    owners: dict[int, Expr],
 ) -> tuple[AllocationValue, ...]:
     """Project structural intervals into the analysed topology window."""
-    intervals = tuple(
-        interval for interval in liveness.intervals if id(interval.value) in resident_ids
-    )
+    intervals = _allocation_intervals(liveness, parameter_ids, owners)
     result: list[AllocationValue] = []
     labels = value_labels(interval.value for interval in intervals)
     for label, interval in zip(labels, intervals, strict=True):
@@ -519,9 +505,7 @@ def values_in_region(
             continue
         declared = facts.explicit(lifetime.memory_level)
         if declared is None or not declared.owner:
-            raise AnalysisError(
-                f"memory: level {lifetime.memory_level!r} has no declared owner"
-            )
+            raise AnalysisError(f"memory: level {lifetime.memory_level!r} has no declared owner")
         if declared.owner == TARGET_MEMORY_OWNER:
             continue
         owner_position = positions.get(declared.owner)
@@ -555,10 +539,10 @@ def analyze_value_lifetimes(
     )
     projected = _project_allocation_values(
         liveness,
-        _resident_value_ids(function, liveness),
         frozenset(id(parameter) for parameter in function.params),
         facts,
         local,
+        storage_owners(build_scopes(module, function), liveness),
     )
     return tuple(item.lifetime for item in projected)
 
@@ -751,6 +735,8 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
         if item.reached is not None:
             distinct.setdefault(id(item.buffer), item.buffer)
     footprint_labels = dict(zip(distinct, value_labels(distinct.values()), strict=True))
+    liveness = analyze_liveness(function)
+    owners = storage_owners(context.root, liveness)
     reuse = (
         reuse_windows(
             context.root,
@@ -759,6 +745,7 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
             declared_units=wave[1],
             ctx=locals_by_unit.get(topology_level, whole),
             labels=footprint_labels,
+            owners=owners,
         )
         if memory_level is not None and wave is not None
         else ()
@@ -779,7 +766,6 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
                     ),
                 ),
             )
-    liveness = analyze_liveness(function)
     placement = CostContext(
         scope=FunctionScope(module, function),
         topology_level=topology_level,
@@ -787,10 +773,10 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
     )
     allocation_values = _project_allocation_values(
         liveness,
-        _resident_value_ids(function, liveness),
         frozenset(id(parameter) for parameter in function.params),
         facts,
         placement,
+        owners,
     )
     lifetimes = tuple(item.lifetime for item in allocation_values)
     rmem_values = tuple(
@@ -798,7 +784,7 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
     )
     rmem_groups = alias_components(
         len(rmem_values),
-        find_aliases(rmem_values, liveness, context.root),
+        find_aliases(rmem_values, liveness, context.root, owners),
     )
     rmem_components = {
         id(item.value): group for item, group in zip(rmem_values, rmem_groups, strict=True)
@@ -868,6 +854,7 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
                 values,
                 liveness,
                 context.root,
+                owners=owners,
                 options=solver_options,
             )
             peak = solved.peak_bytes
@@ -914,22 +901,28 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
         for item in levels
         if item.exceeds_capacity
     )
-    overfull_snapshot_holds: set[int] = set()
+    advisories: tuple[str, ...] = ()
+    reliable = (AnalysisPrecision.EXACT, AnalysisPrecision.LOWER_BOUND)
+    overfull_snapshot_holds: set[tuple[int, bool]] = set()
     if cache is not None and wave is not None:
         cache_level, _backing_level, cache_capacity_bytes = cache
-        overfull_windows: dict[str, int] = {}
+        overfull_windows: dict[str, tuple[int, AnalysisPrecision]] = {}
         for row in reuse:
             if not row.fits:
                 window = row.time or row.space
-                overfull_windows.setdefault(window, row.holds_bytes)
+                overfull_windows.setdefault(window, (row.holds_bytes, row.precision))
                 if not row.time:
-                    overfull_snapshot_holds.add(row.holds_bytes)
-        errors += tuple(
-            f"{cache_level} reuse window {window} holds {format_bytes(holds_bytes)} at a "
-            f"{wave[0]}-unit wave, exceeding capacity "
-            f"{format_bytes(cache_capacity_bytes)}"
-            for window, holds_bytes in overfull_windows.items()
-        )
+                    overfull_snapshot_holds.add((row.holds_bytes, row.precision in reliable))
+        for window, (holds_bytes, precision) in overfull_windows.items():
+            message = (
+                f"{cache_level} reuse window {window} holds {format_bytes(holds_bytes)} at a "
+                f"{wave[0]}-unit wave, exceeding capacity "
+                f"{format_bytes(cache_capacity_bytes)}"
+            )
+            if precision in reliable:
+                errors += (message,)
+            else:
+                advisories += (message,)
     footprint = None
     cache_level = ""
     cache_capacity_bytes = None
@@ -953,12 +946,19 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
             for _buffer, breakdown in footprint.buffers
             for _level, spread in breakdown.kinds
         )
-        if used > cache_capacity_bytes and used not in overfull_snapshot_holds:
-            errors += (
+        if (
+            used >= cache_capacity_bytes
+            and (used, footprint.precision in reliable) not in overfull_snapshot_holds
+        ):
+            message = (
                 f"{cache_level} working set {format_bytes(used)} at the first iteration "
                 f"of a {wave_units}-unit wave exceeds capacity "
-                f"{format_bytes(cache_capacity_bytes)}",
+                f"{format_bytes(cache_capacity_bytes)}"
             )
+            if footprint.precision in reliable:
+                errors += (message,)
+            else:
+                advisories += (message,)
     attach(
         function,
         RegionMemoryMetadata(
@@ -973,6 +973,7 @@ def analyze_memory(function: Function, context: AnalyzeContext) -> None:
             peaks=levels,
             solver_status="feasible",
             errors=errors,
+            advisories=advisories,
         ),
     )
 

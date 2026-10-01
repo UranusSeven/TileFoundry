@@ -1,13 +1,15 @@
-"""Author the distribution of a tiled cast between scheduled instructions.
+"""Author an elementwise and reduction epilogue between scheduled instructions.
 
 Each K tile of ``b_f32`` is copied into registers held by the loader warp,
 narrowed there, and copied into shared memory. The author therefore owns the
 three storage transitions; lowering does not invent a distribution for an
-unscheduled whole-tensor cast.
+unscheduled whole-tensor cast. The accumulator epilogue then exercises
+automatically selected binary, ReLU, reduction, and cast instructions alongside
+an explicit reduction, producing an ``(M, 1)`` result.
 """
 
 from tilefoundry import func, module
-from tilefoundry.dsl import Mesh, T, Tensor, Topology, tf
+from tilefoundry.dsl import Mesh, ReduceKind, T, Tensor, Topology, tf
 from tilefoundry.dsl.tf import *  # noqa: F401, F403 -- authored tile loops
 from tilefoundry.ir.types import ComposedLayout, Layout, ShardLayout, Split
 from tilefoundry.ir.types import Mesh as ThreadMesh
@@ -43,7 +45,8 @@ class WGMMA_CAST_BETWEEN_SCHEDULES:
     def gemm(
         a: Tensor[(M, K), "bf16"],
         b_f32: Tensor[(K, N), "f32"],
-    ) -> Tensor[(M, N), "bf16", "umat"]:
+        bias: Tensor[(M, N), "f32"],
+    ) -> Tensor[(M, 1), "bf16", "umat"]:
         with Mesh(("cta",), layout=(1,), names=("block",)) as _cta:
             with Mesh(
                 ("thread",), layout=(2, 128),
@@ -82,5 +85,16 @@ class WGMMA_CAST_BETWEEN_SCHEDULES:
                         )
 
                 with threads[1, :] as _compute:
-                    result = tf.cast(acc, dtype="bf16")
+                    bias_r = tf.schedule((bias,), op=T.copy(rmem_layout=ACC))
+                    acc = tf.relu(acc + bias_r)
+                    explicit = tf.schedule(
+                        (acc,),
+                        op=T.reduce(
+                            axes=(1,), keepdim=True, kind=ReduceKind.SUM
+                        ),
+                    )
+                    automatic = tf.reduce(
+                        acc, axes=(1,), keepdim=True, kind=ReduceKind.SUM
+                    )
+                    result = tf.cast(explicit + automatic, dtype="bf16")
                 return result

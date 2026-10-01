@@ -13,7 +13,10 @@ from math import prod
 import isl
 
 from tilefoundry.analysis import MemoryMetadata, analyze
-from tilefoundry.analysis.iteration_scope import build_scopes, walk_scopes
+from tilefoundry.analysis.iteration_scope import IterationScope, build_scopes, walk_scopes
+from tilefoundry.analysis.liveness import storage_source
+from tilefoundry.inspection.analysis_report import render_analysis
+from tilefoundry.inspection.values import ReportIdentity, ReportSelection
 from tilefoundry.ir.core import (
     BindingMetadata,
     Call,
@@ -22,7 +25,9 @@ from tilefoundry.ir.core import (
     SourceSpanMetadata,
     Tuple,
     Var,
+    attach_metadata,
     get_metadata,
+    op_identifier,
 )
 from tilefoundry.ir.core.kinds import BinaryKind
 from tilefoundry.ir.core.module import Module
@@ -33,13 +38,10 @@ from tilefoundry.ir.hir.math.binary import Binary as HirBinary
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.schedule import ScheduleOp
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
-from tilefoundry.ir.hir.tensor.cast import Cast as HirCast
-from tilefoundry.ir.hir.tensor.reshape import Reshape
+from tilefoundry.ir.hir.tensor._view_layout import derive_view_layout
 from tilefoundry.ir.hir.tensor.slice import Slice
-from tilefoundry.ir.hir.tensor.transpose import Transpose
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.hir.tensor.zeros import Zeros
-from tilefoundry.ir.tir.cast import Cast as TirCast
 from tilefoundry.ir.tir.cuda.nn.mma import operand_relations
 from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
@@ -75,12 +77,13 @@ from tilefoundry.visitor_registry.access_relation import (
     iteration_universe,
     projected_axes,
 )
+from tilefoundry.visitor_registry.candidates import candidate_ops, sole_candidate
 from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 from tilefoundry.visitor_registry.registries import typeinfer_registry
+from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
 
 _INDEX = TensorType.umat_scalar()
 _BINDING = TensorType.scalar(DType.i64, storage=StorageKind.RMEM)
-_VIEW_OPS = (Slice, Reshape, Transpose)
 _DIM_BINARY = {
     BinaryKind.ADD: DimAdd,
     BinaryKind.SUB: DimSub,
@@ -184,6 +187,22 @@ class Names:
         binding = get_metadata(authored, BindingMetadata) if authored is not None else None
         return self.fresh(binding.name if binding is not None else fallback)
 
+
+def _scope_names(root: IterationScope, names: Names) -> dict[int, str]:
+    """Name emitted MeshRegions in pre-order, omitting zero-only scopes.
+
+    The root mesh is emitted separately as cta by run, not visit_MeshRegion.
+    """
+    found = {}
+    for scope in walk_scopes(root):
+        region = scope.owner
+        if not isinstance(region, MeshRegion) or region is root.owner.body:
+            continue
+        if not (isinstance(region.body, Call) and isinstance(region.body.target, Zeros)):
+            found[id(region)] = names.fresh("scope")
+    return found
+
+
 def _frame(mesh: Mesh) -> Mesh:
     rank = len(tuple(flatten(flatten(mesh.layout).shape)))
     return Mesh(mesh.topologies, mesh.layout, tuple(f"d{index}" for index in range(rank)))
@@ -256,6 +275,7 @@ class Lowering(ExprVisitor[Expr]):
         if not isinstance(self.function.return_type, TensorType):
             raise LoweringError("scheduled lowering currently requires one tensor result")
 
+        self.scope_names = _scope_names(self.scopes, self.names)
         result_type = self.function.return_type
         out_type = TensorType(tuple(result_type.shape), result_type.dtype, None, StorageKind.GMEM)
         self.output = Var(self.names.fresh("out"), type=out_type)
@@ -319,15 +339,9 @@ class Lowering(ExprVisitor[Expr]):
         seen: set[int] = set()
         while id(value) not in seen:
             seen.add(id(value))
-            bound = self.bindings.get(id(value))
-            if bound is not None:
-                value = bound
-                continue
-            if isinstance(value, Call) and isinstance(value.target, _VIEW_OPS):
-                value = value.args[0]
-                continue
-            if isinstance(value, MeshRegion):
-                value = value.body
+            following = storage_source(value, self.bindings)
+            if following is not None:
+                value = following
                 continue
             if isinstance(value, LoopRegion) and len(value.init_args) == 1:
                 value = value.init_args[0]
@@ -345,11 +359,7 @@ class Lowering(ExprVisitor[Expr]):
         if not isinstance(type_, TensorType):
             raise LoweringError(f"{_label(expr)} has non-tensor material result {type_!r}")
         storage_type = _storage_type(type_)
-        stem = (
-            self.names.fresh("value")
-            if isinstance(expr.target, HirCast)
-            else self.names.binding(self.authored_values.get(id(expr)))
-        )
+        stem = self.names.binding(self.authored_values.get(id(expr)))
         if storage_type.storage is StorageKind.RMEM:
             var = Var(stem, type=storage_type)
             cursor.bind(
@@ -501,7 +511,7 @@ class Lowering(ExprVisitor[Expr]):
             cursor.add(
                 MeshScope(
                     self._physical_frame(region.mesh),
-                    Var(self.names.fresh("scope"), type=_BINDING),
+                    Var(self.scope_names[id(region)], type=_BINDING),
                     built,
                 )
             )
@@ -574,17 +584,44 @@ class Lowering(ExprVisitor[Expr]):
         else:
             visitor = getattr(self, f"visit_{type(target).__name__}", None)
             if visitor is None:
-                raise LoweringError(
-                    f"{_label(call)} uses unknown HIR call {type(target).__name__}"
-                )
-            result = visitor(call, cursor)
+                result = self._lower_automatic_instruction(call, cursor)
+            else:
+                result = visitor(call, cursor)
         return result
+
+    def _lower_automatic_instruction(self, call: Call, cursor: _Cursor) -> Expr:
+        target = call.target
+        candidates = candidate_ops(type(target))
+        if not candidates:
+            raise LoweringError(
+                f"{_label(call)} uses unknown HIR call {type(target).__name__}"
+            )
+        op = sole_candidate(target)
+        if op is None:
+            available = ", ".join(op_identifier(candidate) for candidate in candidates)
+            raise LoweringError(
+                f"{_label(call)} has instruction candidates [{available}] but no automatic "
+                "selection; write tf.schedule to choose the instruction and its attributes"
+            )
+        if not isinstance(call.type, TensorType):
+            raise LoweringError(f"{_label(call)} candidate result is not a tensor")
+        if call.type.storage is not StorageKind.RMEM:
+            name = type(target)._op_schema.name
+            identifier = op_identifier(type(op))
+            raise LoweringError(
+                f"{_label(call)} is an unscheduled {call.type.storage} {name}; "
+                f"{identifier} accepts only "
+                "rmem operands, so write an explicit tf.schedule for each storage transition"
+            )
+        return self._lower_instruction(call, op, cursor)
 
     def visit_MeshCoord(self, call: Call, _cursor: _Cursor) -> Expr:
         return self._dim(call)
 
-    def visit_Binary(self, call: Call, _cursor: _Cursor) -> Expr:
-        return self._dim(call)
+    def visit_Binary(self, call: Call, cursor: _Cursor) -> Expr:
+        if isinstance(call.type, TensorType) and call.type.shape == ():
+            return self._dim(call)
+        return self._lower_automatic_instruction(call, cursor)
 
     def visit_TupleGetItem(self, call: Call, cursor: _Cursor) -> Expr:
         source = self.visit(call.args[0], cursor)
@@ -614,18 +651,45 @@ class Lowering(ExprVisitor[Expr]):
         )
 
     def visit_Reshape(self, call: Call, cursor: _Cursor) -> Expr:
-        return self._visit_view(call, cursor)
+        source = self.visit(call.args[0], cursor)
+        desired = replace(call.type, layout=_plain_layout(call.type))
+        return self._window(
+            source,
+            tuple(i64_const(0) for _ in source.type.shape),
+            tuple(source.type.shape),
+            desired,
+            cursor,
+            "tile",
+        )
 
     def visit_Transpose(self, call: Call, cursor: _Cursor) -> Expr:
-        return self._visit_view(call, cursor)
-
-    def _visit_view(self, call: Call, cursor: _Cursor) -> Expr:
         source = self.visit(call.args[0], cursor)
-        desired = call.type
-        layout = _plain_layout(desired)
-        desired = replace(desired, layout=layout)
+        result = self._declare(call, call.type, 1, cursor)
+        source_type = self.logical.get(id(source), source.type)
+        perm = call.target.perm
+
+        def transposed(layout: Layout) -> Layout:
+            return Layout(
+                tuple(layout.shape[p] for p in perm),
+                None if layout.strides is None else tuple(layout.strides[p] for p in perm),
+            )
+
+        scope = self.scope_for_call[id(call)]
+        layout = derive_output_shard_layout(
+            (source_type,), scope.relations[id(call)][1], tuple(call.type.shape),
+            fresh_strides=False,
+        )
+        if layout is None:
+            layout = derive_view_layout(
+                replace(source_type, layout=_plain_layout(source_type)),
+                tuple(call.type.shape),
+                transposed,
+            )
+        if layout is None:
+            raise LoweringError(f"{_label(call)} cannot transpose its source layout")
+        desired = replace(call.type, layout=layout)
         starts = tuple(i64_const(0) for _ in source.type.shape)
-        return self._window(
+        view = self._window(
             source,
             starts,
             tuple(source.type.shape),
@@ -633,6 +697,12 @@ class Lowering(ExprVisitor[Expr]):
             cursor,
             "tile",
         )
+        self.logical[id(view)] = desired
+        self._emit_instruction(
+            call, Copy(), (("src", view), ("dst", result)), scope.enclosing_mesh(),
+            None, result, cursor,
+        )
+        return result
 
     def visit_Zeros(self, call: Call, cursor: _Cursor) -> Expr:
         if call.type.storage is StorageKind.GMEM:
@@ -644,22 +714,6 @@ class Lowering(ExprVisitor[Expr]):
             self.owner_cursors[id(self.function)],
         )
         self._emit_fill(result, call.type, cursor)
-        return result
-
-    def visit_Cast(self, call: Call, cursor: _Cursor) -> Expr:
-        if call.type.storage is StorageKind.GMEM:
-            raise LoweringError(
-                f"{_label(call)} is an unscheduled gmem cast; T.cast accepts only rmem "
-                "operands, so write an explicit tf.schedule for each storage transition"
-            )
-        result = self._declare(
-            call,
-            call.type,
-            1,
-            self.owner_cursors[id(self.function)],
-        )
-        source = self.visit(call.args[0], cursor)
-        self._emit_cast(source, result, call.type, cursor)
         return result
 
     def visit_InsertSlice(self, call: Call, cursor: _Cursor) -> Expr:
@@ -731,19 +785,23 @@ class Lowering(ExprVisitor[Expr]):
         )
 
     def visit_ScheduleOp(self, call: Call, cursor: _Cursor) -> Expr:
-        if access_relation_registry.lookup(type(call.target.op)) is None:
+        return self._lower_instruction(call, call.target.op, cursor)
+
+    def _lower_instruction(self, call: Call, op, cursor: _Cursor) -> Expr:
+        if access_relation_registry.lookup(type(op)) is None:
             raise LoweringError(
-                f"{_label(call)} selects {type(call.target.op).__name__}, which has no "
+                f"{_label(call)} selects {type(op).__name__}, which has no "
                 "registered access relation"
             )
         scope = self.scope_for_call.get(id(call))
         mesh = scope.enclosing_mesh() if scope is not None else None
-        params = self._instruction_params(call.target.op)
+        params = self._instruction_params(op, len(call.args))
         reads = tuple(param for param in params if param.effect & MemoryEffect.READ)
         writes = tuple(param for param in params if param.effect & MemoryEffect.WRITE)
         produced = tuple(param for param in writes if not param.effect & MemoryEffect.READ)
         output_window = self.output_windows.get(id(call))
         written = None
+        buffers = call.target.buffers if isinstance(call.target, ScheduleOp) else 1
         if produced and output_window is None:
             staged = isinstance(call.type, TensorType) and call.type.storage in (
                 StorageKind.SMEM,
@@ -752,15 +810,16 @@ class Lowering(ExprVisitor[Expr]):
             if (
                 isinstance(call.type, TensorType)
                 and call.type.storage is StorageKind.RMEM
-                and call.target.buffers != 1
+                and buffers != 1
             ):
                 raise LoweringError(f"{_label(call)} staged buffer has no owning scope")
-            destination = (
-                self.owner_cursors.get(id(self._staging_owner(call))) if staged else cursor
-            )
+            if staged:
+                destination = self.owner_cursors.get(id(self._staging_owner(call)))
+            else:
+                destination = self.owner_cursors[id(self.function)]
             if destination is None:
                 raise LoweringError(f"{_label(call)} staged buffer has no owning scope")
-            written = self._declare(call, call.type, call.target.buffers, destination)
+            written = self._declare(call, call.type, buffers, destination)
         read_values = {
             param.name: self.visit(value, cursor)
             for param, value in zip(reads, call.args, strict=True)
@@ -774,14 +833,9 @@ class Lowering(ExprVisitor[Expr]):
                 raise LoweringError(f"{_label(call)} has no storage for {param.name}")
             operands.append((param.name, value))
 
-        if (atom := getattr(call.target.op, "atom", None)) is not None:
-            if any(value is None for _, value in operands):
-                raise LoweringError(f"{_label(call)} cannot issue an atom into an output window")
-            self._emit_atom(call, atom, tuple(operands), mesh, cursor)
-        else:
-            written = self._emit_transfer(
-                call, tuple(operands), mesh, output_window, written, cursor
-            )
+        written = self._emit_instruction(
+            call, op, tuple(operands), mesh, output_window, written, cursor
+        )
         result_param = next(param for param in params if param.effect & MemoryEffect.WRITE)
         if result_param.effect & MemoryEffect.READ:
             return read_values[result_param.name]
@@ -813,33 +867,35 @@ class Lowering(ExprVisitor[Expr]):
             "window",
         )
 
-    def _emit_transfer(self, call, operands, mesh, output_window, written, cursor):
-        if mesh is None:
-            raise LoweringError(f"{_label(call)} instruction issue has no lexical mesh")
-        declared = next(
-            (held for _role, value in operands if value is not None and (held := self._holder_mesh(self.logical.get(id(value), value.type))) is not None),
-            None,
-        )
-        try:
-            frame = self._physical_frame(declared or nonunit_mesh(mesh))
-        except ValueError as error:
-            raise LoweringError(f"{_label(call)} {error}") from error
-        issue, issued = _Cursor(), []
-        for role, value in operands:
-            if value is None:
-                value = self._output_window(output_window, call.type, issue)
-                self.logical[id(value)], written = call.type, value
-            desired = self.logical.get(id(value), value.type)
-            issued.append(self._whole_operand(value, desired, frame, issue, f"{role}_frame"))
-        issue.add(Evaluate(type(call.target.op)(), tuple(issued)))
-        cursor.add(MeshScope(frame, Var(self.names.fresh("threads"), type=_BINDING), issue.build()))
-        return written
-
-    def _emit_atom(self, call, atom, operands, mesh, cursor) -> None:
+    def _emit_instruction(self, call, op, operands, mesh, output_window, written, cursor):
+        atom = getattr(op, "atom", None)
+        if atom is None:
+            if mesh is None:
+                raise LoweringError(f"{_label(call)} instruction issue has no lexical mesh")
+            declared = next(
+                (held for _role, value in operands if value is not None and (held := self._holder_mesh(self.logical.get(id(value), value.type))) is not None),
+                None,
+            )
+            try:
+                frame = self._physical_frame(declared or nonunit_mesh(mesh))
+            except ValueError as error:
+                raise LoweringError(f"{_label(call)} {error}") from error
+            issue, issued = _Cursor(), []
+            for role, value in operands:
+                if value is None:
+                    value = self._output_window(output_window, call.type, issue)
+                    self.logical[id(value)], written = call.type, value
+                desired = self.logical.get(id(value), value.type)
+                issued.append(self._whole_operand(value, desired, frame, issue, f"{role}_frame"))
+            issue.add(Evaluate(self._issued_op(op), tuple(issued)))
+            cursor.add(MeshScope(frame, Var(self.names.fresh("threads"), type=_BINDING), issue.build()))
+            return written
+        if any(value is None for _, value in operands):
+            raise LoweringError(f"{_label(call)} cannot issue an atom into an output window")
         logical = tuple(self.logical.get(id(value), value.type) for _, value in operands)
         shapes = atom.operand_shapes()
         try:
-            relations = operand_relations(call.target.op, logical)
+            relations = operand_relations(op, logical)
             projected = tuple(projected_axes(boundary.pattern) for boundary in relations.inputs)
             if any(axis is None for mapped in projected for axis in mapped):
                 raise ValueError(
@@ -853,7 +909,7 @@ class Lowering(ExprVisitor[Expr]):
                 replace(type_, shape=shape)
                 for type_, shape in zip(logical, shapes, strict=True)
             )
-            tile, _ = _iteration_geometry(operand_relations(call.target.op, single_types))
+            tile, _ = _iteration_geometry(operand_relations(op, single_types))
         except ValueError as error:
             raise LoweringError(f"{_label(call)} {error}") from error
         if len(whole) != len(tile):
@@ -868,7 +924,9 @@ class Lowering(ExprVisitor[Expr]):
                 f"{_label(call)} axis {axis_names[axis]} extent {whole[axis]} "
                 f"is not divisible by atom {tile[axis]}"
             )
-        order = call.target.order or tuple(range(len(whole)))
+        order = (
+            call.target.order if isinstance(call.target, ScheduleOp) else None
+        ) or tuple(range(len(whole)))
         if mesh is None:
             raise LoweringError(f"{_label(call)} has atom axes but no declared physical mesh")
         try:
@@ -903,7 +961,7 @@ class Lowering(ExprVisitor[Expr]):
                                 f"{role}_view",
                             )
                         )
-                    issue.add(Evaluate(type(call.target.op)(atom=atom.on(frame)), tuple(issued)))
+                    issue.add(Evaluate(type(op)(atom=atom.on(frame)), tuple(issued)))
                     return issue.build()
                 axis = order[depth]
                 low, extent = lows.get(axis, 0), tile[axis] if axis in lows else whole[axis]
@@ -923,6 +981,7 @@ class Lowering(ExprVisitor[Expr]):
 
             body = emit(0, {}, {})
             cursor.add(MeshScope(frame, Var(self.names.fresh("threads"), type=_BINDING), body))
+        return written
 
     @staticmethod
     def _shift_fragment(type_: TensorType, shift: int) -> TensorType:
@@ -938,14 +997,38 @@ class Lowering(ExprVisitor[Expr]):
         return replace(type_, layout=layout)
 
     @staticmethod
-    def _instruction_params(op) -> tuple:
+    def _instruction_params(op, operand_count: int | None = None) -> tuple:
         schema = getattr(type(op), "_op_schema", None)
         if schema is None:
             raise LoweringError(f"{type(op).__name__} is not a registered operation")
         params = tuple(param for param in schema.signature if param.kind == "input")
         if any(param.effect is None for param in params):
             raise LoweringError(f"{type(op).__name__} does not declare every operand memory effect")
+        if operand_count is not None:
+            required_reads = sum(
+                bool(param.effect & MemoryEffect.READ)
+                for param in params
+                if not param.optional
+            )
+            optional_reads = tuple(
+                param for param in params if param.optional and param.effect & MemoryEffect.READ
+            )
+            supplied_optional = operand_count - required_reads
+            included = {id(param) for param in optional_reads[: max(0, supplied_optional)]}
+            params = tuple(
+                param for param in params if not param.optional or id(param) in included
+            )
         return params
+
+    @staticmethod
+    def _issued_op(op):
+        """Keep required dispatch attributes; view-selection attributes are consumed."""
+        attributes = {
+            param.name: getattr(op, param.name)
+            for param in type(op)._op_schema.signature
+            if param.kind == "attribute" and not param.has_default
+        }
+        return type(op)(**attributes)
 
     def _physical_frame(self, mesh: Mesh) -> Mesh:
         frame = _frame(mesh)
@@ -1045,28 +1128,6 @@ class Lowering(ExprVisitor[Expr]):
                 )
             )
 
-    def _emit_cast(
-        self,
-        source: Expr,
-        target: Expr,
-        logical_type: TensorType,
-        cursor: _Cursor,
-    ) -> None:
-        mesh = self._holder_mesh(logical_type)
-        if mesh is None:
-            raise LoweringError("register cast result has no holder mesh")
-        frame = self._physical_frame(mesh)
-        issue = _Cursor()
-        written = self._whole_operand(target, logical_type, frame, issue, "value_view")
-        issue.add(Evaluate(TirCast(), (source, written)))
-        cursor.add(
-            MeshScope(
-                frame,
-                Var(self.names.fresh("threads"), type=_BINDING),
-                issue.build(),
-            )
-        )
-
     def _emit_copy(
         self,
         source: Expr,
@@ -1132,6 +1193,10 @@ class ConvertHIRToTIR(ModulePass):
             raise LoweringError(f"{getattr(authored, 'name', self.entry)!r} is not an HIR function")
         result = analyze(module, authored, analysis=("memory",))
         lowered = Lowering(result.module, authored, result.function).run()
+        lowered.metadata = result.function.metadata
+        for record in render_analysis(result).summary:
+            if isinstance(record, (ReportIdentity, ReportSelection)):
+                attach_metadata(lowered, record)
         functions = tuple(
             lowered if function is authored else function for function in module.functions
         )

@@ -240,12 +240,10 @@ def declared_layout(pattern, bindings: dict, mesh: Mesh | None):
     return None if inner is None or frame is None else ShardLayout(inner, pattern.attrs, frame)
 
 
-def declared_write_type(op, param, pattern: TensorPattern | None, inputs: dict, mesh) -> TensorType:
+def declared_write_type(
+    op, param, pattern: TensorPattern, inputs: dict, mesh, relations, collapsed
+) -> TensorType:
     """Resolve one write-only operand from its declaration and read operands."""
-    if pattern is None:
-        raise ValueError(
-            f"{type(op).__name__} {param.name} is write-only and declares no result shape"
-        )
     layout_storages = {
         "gmem_layout": StorageKind.GMEM,
         "smem_layout": StorageKind.SMEM,
@@ -258,8 +256,20 @@ def declared_write_type(op, param, pattern: TensorPattern | None, inputs: dict, 
     )
     source = next(iter(inputs.values()))
     bindings = dict(getattr(getattr(op, "atom", None), "bindings", {}))
-    shape = declared_shape(pattern, bindings) or tuple(source.shape)
-    dtype = pattern.dtype if hasattr(pattern.dtype, "bit_width") else source.dtype
+    from tilefoundry.visitor_registry.access_relation import shape_from_relation  # noqa: PLC0415
+    from tilefoundry.visitor_registry.shard_propagate import (  # noqa: PLC0415
+        derive_output_shard_layout,
+    )
+
+    shape = shape_from_relation(relations, source.shape)
+    stated_dtype = getattr(op, "dtype", None)
+    dtype = (
+        stated_dtype
+        if hasattr(stated_dtype, "bit_width")
+        else pattern.dtype
+        if hasattr(pattern.dtype, "bit_width")
+        else source.dtype
+    )
     layout = None
     if isinstance(pattern.storage, StorageKind):
         storage = pattern.storage
@@ -268,11 +278,13 @@ def declared_write_type(op, param, pattern: TensorPattern | None, inputs: dict, 
         storage, layout = stated[0]
     else:
         storage = None
+        constrained = False
         for rule in between_rules(type(op)):
             if not isinstance(rule, DistinctConstraint) or rule.field != "storage":
                 continue
             if param.name not in (rule.left, rule.right):
                 continue
+            constrained = True
             other = rule.right if param.name == rule.left else rule.left
             if other in inputs:
                 choices = tuple(
@@ -282,9 +294,19 @@ def declared_write_type(op, param, pattern: TensorPattern | None, inputs: dict, 
                 )
                 storage = choices[0] if len(choices) == 1 else None
                 break
+        if not constrained and pattern.storage is None:
+            storage = source.storage
         if storage is None:
             raise ValueError(f"{type(op).__name__} does not determine {param.name} storage")
     layout = layout or declared_layout(pattern.layout, bindings, mesh)
+    if layout is None:
+        layout = derive_output_shard_layout(
+            tuple(inputs.values()),
+            relations,
+            shape,
+            complete_reduction_dims=collapsed,
+            fresh_strides=bool(collapsed),
+        )
     layout = layout or Layout(shape, tuple(compact_row_major(shape)))
     return TensorType(shape, dtype, layout, storage)
 

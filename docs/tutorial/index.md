@@ -15,17 +15,24 @@ implementation is source code, and either can be pointed at any command.
         │                              ▼
    published model            the reference is finished
 
-  step two — make it fast; both roads lead back to the same source
+  step two — choose the schedule, implement, and measure
 
         ┌────── change the HIR ◄────── not yet ───────────────────┐
         ▼                                                         │
    authored HIR ─────► analyze ─────► predicted performance ok? ──┘
-        ▲                                     │
-        │                                    yes
-        │                                     ▼
-        │          write a runtime twin ─────► check ─────► measure
-        │                                                     │
-        │                                       measured performance ok?
-        │                                             ┌───────┴───────┐
-        └─────────────────── no ◄─────────────────────┘               └──► ship
+                                              │
+                                             yes
+                                              ▼
+       candidates + facts ─────► tf.schedule ─────► finalize ─────► TIR
+
+        ┌────── revise the schedule ◄────── not yet ──────────────────┐
+        ▼                                                             │
+       TIR ─────► implement a backend ───► check ─────► agrees? ──────┘
+                                                 yes │
+                                                     ▼
+                                                  measure
+                                                     │
+                                       measured performance ok?
+                                             ┌───────┴───────┐
+                          no: return to step two             └──► ship
 ```

@@ -1,3 +1,10 @@
+# analysis target=nvidia.h200_sxm module=GEMM_8192X17408X5120_REGISTER_STORE function=gemm topology=cta wave=1/1
+# selection requested=memory executed=memory
+# memory traffic=gmem:r250.00MB/w544.00MB@logical,r15.94GB/w544.00MB@total,r15.94GB/w544.00MB@cta,r15.94GB/w273.06MB@thread;rmem:r43.30GB/w42.77GB@logical,r43.31GB/w43.30GB@total,r43.31GB/w43.30GB@cta,r183.88MB/w173.19MB@thread;smem:r127.50MB/w1.91MB@logical,r127.50MB/w127.50MB@total,r127.50MB/w127.50MB@cta,r43.83MB/w127.50MB@thread footprint=a:16.00KB;b:32.00KB;v10:83:64.00KB footprint-precision=exact peak=gmem:522.00MB;rmem:128.00KB;smem:192.00KB persistent=gmem:250.00MB
+#   buffer=b holds=175.50MB time=m space=none reuse=10.46GB fits=no precision=exact
+#   buffer=a holds=3.81MB time=n space=none reuse=83.75MB fits=yes precision=exact
+#   error="l2 reuse window m holds 175.50MB at a 1-unit wave, exceeding capacity 47.68MB"
+
 from __future__ import annotations
 
 from tilefoundry import prim_func
@@ -21,7 +28,7 @@ def gemm(
             ]
         )
         T.fill(out, 0.0)
-        value = T.alloc_tensor(
+        tile_out = T.alloc_tensor(
             tensor_type=Tensor[
                 (128, 256),
                 "bf16",
@@ -31,7 +38,7 @@ def gemm(
         )
         with Mesh(
             (Topology("thread", 384),), Layout((3, 128), (128, 1)), names=("d0", "d1")
-        ) as scope_3:
+        ) as scope:
             for m in range(0, 8192, 128):
                 for n in range(0, 17408, 256):
                     with Mesh(
@@ -77,7 +84,7 @@ def gemm(
                             outer=Layout(((4, 2, 8), (4, 64)), ((4096, 512, 64), (1024, 1))),
                         ), shape=(64, 256)))
                     for k in range(0, 5120, 64):
-                        with scope_3[:1, :32] as scope:
+                        with scope[:1, :32] as scope_1:
                             tile = T.tensor_view(
                                 T.ptr_of(a[m:m + 128, k:k + 64]),
                                 layout=Layout((128, 64), (5120, 1)),
@@ -104,7 +111,7 @@ def gemm(
 ), names=("d0",)
                             ) as threads_2:
                                 T.copy_async_tensor(tile_1, rhs_stages[(k // 64) % 4])
-                        with scope_3[1:] as scope_1:
+                        with scope[1:] as scope_2:
                             with Mesh(
                                 (Topology("thread", 384),), ComposedLayout(
     inner=None,
@@ -421,7 +428,7 @@ def gemm(
                                                 rhs_view_7,
                                                 atom=T.cuda.sm90.Wgmma(n=256, form=T.cuda.sm90.Form.SS, a_major=T.cuda.sm90.Major.K, mesh=threads_4),
                                             )
-                    with scope_3[1:] as scope_2:
+                    with scope[1:] as scope_3:
                         with Mesh(
                             (Topology("thread", 384),), ComposedLayout(
     inner=None,
@@ -429,14 +436,19 @@ def gemm(
     outer=Layout((2, 4, 8, 4), (128, 32, 4, 1)),
 ), names=("d0", "d1", "d2", "d3")
                         ) as threads_5:
-                            value_view = T.tensor_view(
-                                T.ptr_of(value[0:0 + 128, 0:0 + 256]),
+                            src_frame = T.tensor_view(
+                                T.ptr_of(acc[0:0 + 128, 0:0 + 256]),
                                 layout=((2 @ threads_5.d0, 8 @ threads_5.d2, 2, 4 @ threads_5.d1, 2, 4 @ threads_5.d3, 32), (16384, 1, 8, 16, 64, 128, 512)),
                                 shape=(128, 256),
                             )
-                            T.cast(acc, value_view)
-                            value_view_1 = T.tensor_view(
-                                T.ptr_of(value[0:0 + 128, 0:0 + 256]),
+                            dst_frame = T.tensor_view(
+                                T.ptr_of(tile_out[0:0 + 128, 0:0 + 256]),
+                                layout=((2 @ threads_5.d0, 8 @ threads_5.d2, 2, 4 @ threads_5.d1, 2, 4 @ threads_5.d3, 32), (16384, 1, 8, 16, 64, 128, 512)),
+                                shape=(128, 256),
+                            )
+                            T.cast(src_frame, dst_frame, dtype='bf16')
+                            tile_out_view = T.tensor_view(
+                                T.ptr_of(tile_out[0:0 + 128, 0:0 + 256]),
                                 layout=((2 @ threads_5.d0, 8 @ threads_5.d2, 2, 4 @ threads_5.d1, 2, 4 @ threads_5.d3, 32), (16384, 1, 8, 16, 64, 128, 512)),
                                 shape=(128, 256),
                             )
@@ -445,4 +457,4 @@ def gemm(
                                 layout=Layout((128, 256), (17408, 1)),
                                 shape=(128, 256),
                             )
-                            T.copy(value_view_1, window)
+                            T.copy(tile_out_view, window)
