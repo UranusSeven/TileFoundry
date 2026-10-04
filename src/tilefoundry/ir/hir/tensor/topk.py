@@ -18,7 +18,7 @@ from tilefoundry.ir.core import Call, Constant, Op
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._shard_checks import reject_partials
-from tilefoundry.ir.pattern import Tensor
+from tilefoundry.ir.pattern import is_ranked_tensor
 from tilefoundry.ir.types import DType, Layout, TensorType, TupleType
 from tilefoundry.ir.types.dim import (
     DimAdd,
@@ -65,7 +65,7 @@ class TopK(Op):
     ``int`` at evaluation time — not a pad+mask workaround.
     """
 
-    x = ParamDef(kind="input", pattern=Tensor)
+    x = ParamDef(kind="input", pattern=is_ranked_tensor())
     k = ParamDef(kind="attribute", annotation=ShapeDim)
     axis = ParamDef(kind="attribute", annotation=int, default=-1)
     largest = ParamDef(kind="attribute", annotation=bool, default=True)
@@ -94,7 +94,7 @@ class _DimUpperBoundVisitor(ExprVisitor[int | None]):
         return value if isinstance(value, int) and not isinstance(value, bool) else None
 
     def visit_DimVar(self, d: DimVar, ctx=None) -> int:
-        return d.hi - 1
+        return d.hi
 
     def visit_Call(self, d: Call, ctx=None) -> int | None:
         target = d.target
@@ -125,7 +125,7 @@ class _DimUpperBoundVisitor(ExprVisitor[int | None]):
 def _dim_upper_bound(d) -> "int | None":
     """Return a best-effort inclusive static upper bound.
 
-    Constants are exact and ``DimVar`` uses ``hi - 1``. Supported arithmetic
+    Constants are exact and ``DimVar`` uses ``hi``. Supported arithmetic
     recurses when its operands permit a sound bound; subtraction and negative
     multiplication fail open as ``None``.
 

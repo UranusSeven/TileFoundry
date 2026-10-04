@@ -519,13 +519,13 @@ Example:
 # example
 @register_op
 class Binary(Op):
-    lhs  = ParamDef(kind="input", pattern=Tensor)
-    rhs  = ParamDef(kind="input", pattern=Tensor)
+    lhs  = ParamDef(kind="input", pattern=is_ranked_tensor())
+    rhs  = ParamDef(kind="input", pattern=is_ranked_tensor())
     kind = ParamDef(kind="attribute", annotation=BinaryKind)
 
 @register_op
 class ReduceSum(Op):
-    input    = ParamDef(kind="input", pattern=Tensor)
+    input    = ParamDef(kind="input", pattern=is_ranked_tensor())
     axis     = ParamDef(kind="attribute", annotation=int)
     keepdims = ParamDef(kind="attribute", annotation=bool, default=False)
 ```
@@ -617,12 +617,14 @@ The implementation is split by responsibility under `ir/pattern/`:
   `OrPattern`, `AndPattern`, `SequencePattern`,
   `SwitchPattern`, `RangePattern`,
   `LayoutPattern`, `SwizzlePattern`, `ComposedLayoutPattern`, `MeshPattern`,
-  `ShardLayoutPattern`, `ScalarPattern`, `TensorPattern`, `WildcardPattern`, and
-  `StarPattern`. It also owns the `Scalar` and `Tensor` singletons.
+  `ShardLayoutPattern`, `TensorPattern`, `WildcardPattern`, and
+  `StarPattern`.
 - `predicates.py` defines the computed-condition base `Predicate`; integer
   `Term` expressions and Boolean `Formula` predicates; and the named
   arrangement predicates `Forward`, `Injective`, `WholeVectors`,
-  `PlainArrangement`, `BoxDims`, and `TensorMap`.
+  `PlainArrangement`, `BoxDims`, and `TensorMap`; and the tensor predicate
+  `Ranked`. It also owns the `is_ranked_tensor(**fields)` and
+  `is_scalar_tensor(**fields)` factories.
 - `match.py` owns the public `PatternMatcher` and structural `Refusal` evidence.
   An unstated (`None`) pattern field admits any value. Pattern nodes carry data
   only; declaration text and refusal text belong to inspection
@@ -696,11 +698,16 @@ Two consumer surfaces:
 
 - **Parser dispatch** — `ParamDef.pattern` ([§2.3](#23-op)) is matched against an
   argument's `Expr.type` during overload resolution. Subclasses used:
-  `ScalarPattern` (rank-0), `TensorPattern(shape?, dtype?)` (non-scalar), and
-  `AndPattern(parts)` (conjunction). Two singletons are exported as
-  convenience: `Scalar = ScalarPattern()` and `Tensor = TensorPattern()`.
+  `TensorPattern(shape?, dtype?, storage?, layout?)` (any rank), and
+  `AndPattern(parts)` (conjunction). Two factories construct
+  convenience patterns: `is_scalar_tensor(**fields)` returns
+  `TensorPattern(shape=(), **fields)` for rank-0 tensors;
+  `is_ranked_tensor(**fields)` returns a `TensorPattern` with a `Ranked`
+  predicate and MUST reject rank-0.
   A tensor rank is stated by giving `shape` that many positions; wildcard
-  positions constrain only the sequence length. During effect-Op verification,
+  positions constrain only the sequence length. An omitted shape admits any
+  rank. During selection, `umat` satisfies any concrete storage requirement
+  because its placement is undecided; lowering MUST materialize it before TIR. During effect-Op verification,
   input patterns match in `ParamDef` order against one shared capture
   environment, so a later operand can require a value captured by an earlier
   operand.

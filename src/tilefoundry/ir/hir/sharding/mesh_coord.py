@@ -8,7 +8,7 @@ from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.mesh_scope import covered_by_scope
-from tilefoundry.ir.pattern import Scalar
+from tilefoundry.ir.pattern import is_scalar_tensor
 from tilefoundry.ir.types import DType, TensorType
 from tilefoundry.ir.types.layout import flatten
 from tilefoundry.ir.types.mesh import Mesh
@@ -36,7 +36,7 @@ class MeshCoord(Op):
     """
 
     mesh = ParamDef(kind="attribute", annotation=Mesh)
-    axis = ParamDef(kind="input", pattern=Scalar)
+    axis = ParamDef(kind="input", pattern=is_scalar_tensor())
 
 
 @register_typeinfer(MeshCoord)
@@ -44,7 +44,11 @@ def _(call: "Call", ctx: "TypeInferContext") -> TypeInferResults:
     """A coordinate is one number about this unit, so it carries no placement."""
     if not isinstance(call.target.mesh, Mesh):
         ctx.error(call, "MeshCoord.mesh must be a Mesh")
-    if ctx.current_mesh is None or not covered_by_scope(call.target.mesh, ctx.current_mesh):
+    try:
+        covered = ctx.current_mesh is not None and covered_by_scope(call.target.mesh, ctx.current_mesh)
+    except ValueError as error:
+        ctx.error(call, str(error))
+    if not covered:
         ctx.error(call, "MeshCoord.mesh must be bound by the current mesh scope")
     if not call.args:
         ctx.error(call, "missing required input 'axis'")

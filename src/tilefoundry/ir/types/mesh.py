@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from tilefoundry.ir.types.int_tuple import product
-from tilefoundry.ir.types.layout import ComposedLayout, Layout, LayoutBase, flatten, get
+from tilefoundry.ir.types.layout import ComposedLayout, Layout, LayoutBase, flatten, get, size
 from tilefoundry.ir.types.layout import rank as _rank
+from tilefoundry.ir.types.layout_algebra import filter, is_contiguous
 from tilefoundry.ir.types.stride import compact_major, compact_row_major, crd2idx, idx2crd
 from tilefoundry.ir.types.tensor_type import ShapeDim
 
@@ -255,57 +255,26 @@ def starts(mesh: Mesh) -> tuple[int, ...]:
     return tuple(idx2crd(offset, sizes, compact_major(sizes)))
 
 
-def selected_run(arrangement: Layout, start: int) -> tuple[tuple, tuple, int]:
-    """Reduce one level's selected positions to its joined modes and start."""
-    strides = arrangement.strides
-    if strides is None:
-        return tuple(flatten(arrangement.shape)), (), start
-    modes = [
-        (extent, stride)
-        for extent, stride in zip(flatten(arrangement.shape), flatten(strides))
-        if extent != 1
-    ]
-    joined: list[list] = []
-    for extent, stride in sorted(modes, key=lambda mode: (mode[1], mode[0])):
-        if joined and joined[-1][0] * joined[-1][1] == stride:
-            joined[-1][0] *= extent
-        else:
-            joined.append([extent, stride])
-    return (
-        tuple(extent for extent, _ in joined),
-        tuple(stride for _, stride in joined),
-        start,
-    )
-
-
-def _continuous_interval(run: tuple[tuple, tuple, int]) -> tuple[int, int] | None:
-    extents, strides, start = run
-    if not isinstance(start, int):
-        return None
-    if not extents:
-        return start, start + 1
-    if len(extents) != 1 or strides != (1,) or not isinstance(extents[0], int):
-        return None
-    return start, start + extents[0]
-
-
 def within_scope(mesh: Mesh, current: Mesh) -> bool:
-    """Whether each continuous run selected by *mesh* is within *current*."""
-    scope = {
-        getattr(topology, "name", topology): selected_run(arrangement, start)
-        for topology, arrangement, start in zip(
-            current.topologies, levels(current), starts(current)
-        )
-    }
-    for topology, arrangement, start in zip(
-        mesh.topologies, levels(mesh), starts(mesh)
-    ):
-        name = getattr(topology, "name", topology)
-        inner = _continuous_interval(selected_run(arrangement, start))
-        outer = _continuous_interval(scope[name]) if name in scope else None
-        if inner is None or outer is None:
+    """Whether each continuous selection is contained in the enclosing level.
+
+    Defer dimension interop: it imports core/types, whose staged imports
+    include this mesh.
+    """
+    from tilefoundry.ir.isl_interop import dim_at_most  # noqa: PLC0415
+
+    enclosing = dict(zip(_named(current), zip(levels(current), starts(current))))
+    for name, arrangement, start in zip(_named(mesh), levels(mesh), starts(mesh)):
+        if name not in enclosing:
             return False
-        if not (outer[0] <= inner[0] and inner[1] <= outer[1]):
+        outer_arrangement, at_start = enclosing[name]
+        inner = filter(arrangement, major="row")
+        outer = filter(outer_arrangement, major="row")
+        if not is_contiguous(inner, major="row") or not is_contiguous(outer, major="row"):
+            return False
+        if not dim_at_most(at_start, start):
+            return False
+        if not dim_at_most(start + size(inner), at_start + size(outer)):
             return False
     return True
 
@@ -322,7 +291,7 @@ def check_topology(mesh: Mesh) -> None:
         declared = getattr(topology, "size", None)
         if not isinstance(declared, int) or isinstance(declared, bool):
             continue
-        count = product(tuple(flatten(arrangement.shape)))
+        count = size(arrangement)
         if isinstance(count, int) and count > declared:
             raise ValueError(
                 f"mesh level {getattr(topology, 'name', topology)!r} has {count} "
@@ -392,23 +361,19 @@ def make_mesh(*meshes: Mesh) -> Mesh:
                 or isinstance(inner.layout, ComposedLayout),
             )
             if not within_scope(result, current):
-                parent_runs = {
-                    name: selected_run(arrangement, start)
-                    for name, arrangement, start in zip(
-                        here, levels(current), starts(current)
-                    )
+                parent_positions = {
+                    name: (filter(arrangement, major="row"), start)
+                    for name, arrangement, start in zip(here, levels(current), starts(current))
                     if name in there
                 }
-                inner_runs = {
-                    name: selected_run(arrangement, start)
-                    for name, arrangement, start in zip(
-                        there, levels(inner), starts(inner)
-                    )
+                inner_positions = {
+                    name: (filter(arrangement, major="row"), start)
+                    for name, arrangement, start in zip(there, levels(inner), starts(inner))
                 }
                 raise ValueError(
-                    f"replacement scope selects runs {inner_runs}, outside parent "
-                    f"scope runs {parent_runs}; both must be continuous and each "
-                    "replacement run must be contained in its parent run"
+                    f"replacement scope selects positions {inner_positions}, outside parent "
+                    f"scope positions {parent_positions}; both must be continuous and each "
+                    "replacement selection must be contained in its parent selection"
                 )
         else:
             shared = sorted(set(here) & set(there))
@@ -443,7 +408,6 @@ __all__ = [
     "check_topology",
     "levels",
     "make_mesh",
-    "selected_run",
     "separate",
     "starts",
     "within_scope",

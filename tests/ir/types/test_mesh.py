@@ -8,10 +8,17 @@ from tilefoundry.ir.mesh_scope import (
     mesh_scope_matches_required_scope,
     states_consistent_positions,
 )
-from tilefoundry.ir.types import ComposedLayout, Layout, Mesh, Topology, make_mesh
+from tilefoundry.ir.types import (
+    ComposedLayout,
+    Layout,
+    Mesh,
+    Topology,
+    make_mesh,
+)
+from tilefoundry.ir.types.dim import DimVar
 from tilefoundry.ir.types.int_tuple import product
 from tilefoundry.ir.types.layout_algebra import size
-from tilefoundry.ir.types.mesh import check_topology, separate
+from tilefoundry.ir.types.mesh import check_topology, separate, within_scope
 
 
 def test_mesh_position_consistency_is_an_explicit_predicate() -> None:
@@ -140,3 +147,37 @@ def test_mesh_refuses_a_repeated_topology_name() -> None:
             (Topology("thread", 4), Topology("thread", 32)),
             Layout(((4,), (32,)), ((1,), (1,))),
         )
+
+
+_SEQUENCE = DimVar("mesh_sequence", 64, 2048)
+_CHUNKS = _SEQUENCE // 64
+_TOPOLOGY = (Topology("cta", 132),)
+_FULL = Mesh(_TOPOLOGY, Layout((2, _CHUNKS, 2), (2 * _CHUNKS, 2, 1)))
+_FLAT = Mesh(_TOPOLOGY, Layout((4 * _CHUNKS,), (1,)))
+_HALF = Mesh(_TOPOLOGY, Layout((2 * _CHUNKS,), (1,)))
+_HOLES = Mesh(_TOPOLOGY, Layout((2, _CHUNKS), (2 * _CHUNKS, 1)))
+_STRIDED = Mesh(_TOPOLOGY, Layout((_CHUNKS,), (3,)))
+
+
+@pytest.mark.parametrize(
+    ("inner", "outer", "covered", "within"),
+    (
+        (_FULL, _FULL, True, True),
+        (_FULL, _FLAT, True, True),
+        (_HALF, _FULL, False, True),
+        (_FULL, _HALF, False, False),
+        (_FULL, THR, False, False),
+    ),
+    ids=("same", "equivalent", "contained", "exceeds", "different-topology"),
+)
+def test_symbolic_scopes_compare_by_selected_positions(inner, outer, covered, within) -> None:
+    assert covered_by_scope(inner, outer) is covered
+    assert within_scope(inner, outer) is within
+
+
+@pytest.mark.parametrize("selection", (_HOLES, _STRIDED), ids=("holes", "strided"))
+def test_a_scope_with_gaps_is_refused(selection) -> None:
+    assert not within_scope(selection, selection)
+    assert not within_scope(selection, _FULL)
+    with pytest.raises(ValueError, match="both must be continuous"):
+        make_mesh(make_mesh(THR, selection), selection)

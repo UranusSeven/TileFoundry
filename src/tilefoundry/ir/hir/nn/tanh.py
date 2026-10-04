@@ -8,7 +8,7 @@ from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._shard_checks import reject_partials
-from tilefoundry.ir.pattern import Tensor
+from tilefoundry.ir.pattern import is_ranked_tensor
 from tilefoundry.ir.types import TensorType
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
@@ -21,7 +21,7 @@ _COMMUTES_WITH = frozenset({"max", "min"})
 
 @register_op
 class Tanh(Op):
-    x = ParamDef(kind="input", pattern=Tensor)
+    x = ParamDef(kind="input", pattern=is_ranked_tensor())
 
 
 @register_typeinfer(Tanh)
@@ -37,4 +37,4 @@ def _eval_tanh(ctx):
     return TensorValue(data=torch.tanh(ctx.args[0].data), type=ctx.result_type)
 
 
-register_access_relation(Tanh)(identity_relations(1))
+register_access_relation(Tanh)(identity_relations)

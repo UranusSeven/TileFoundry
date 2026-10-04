@@ -11,8 +11,8 @@ from __future__ import annotations
 
 from tilefoundry.ir.types.int_tuple import flatten, product
 from tilefoundry.ir.types.layout import ComposedLayout, Layout, size
-from tilefoundry.ir.types.layout_algebra import is_inverse_projectable
-from tilefoundry.ir.types.mesh import Mesh, check_topology, levels, selected_run, starts
+from tilefoundry.ir.types.layout_algebra import filter, is_contiguous, is_inverse_projectable
+from tilefoundry.ir.types.mesh import Mesh, check_topology, levels, starts
 from tilefoundry.ir.types.storage import StorageKind, resolve_storage
 from tilefoundry.ir.types.stride import compact_major
 
@@ -53,16 +53,26 @@ def covered_by_scope(mesh: Mesh, current: Mesh) -> bool:
     CTA's threads -- says which positions it is by where its run starts and how
     its modes step, and a value laid out over that same run is inside it
     however either of them wrote the axes down.
+
+    Dimension interop imports core/types; defer until staged type imports finish.
     """
+    from tilefoundry.ir.isl_interop import normalize_dim  # noqa: PLC0415
+
+    def selection(arrangement, start):
+        reduced = filter(arrangement, major="row")
+        if is_contiguous(reduced, major="row"):
+            return normalize_dim(size(reduced)), start
+        return reduced, start
+
     scope = {
-        getattr(topology, "name", topology): selected_run(arrangement, start)
+        getattr(topology, "name", topology): selection(arrangement, start)
         for topology, arrangement, start in zip(
             current.topologies, levels(current), starts(current)
         )
     }
     return all(
         getattr(topology, "name", topology) in scope
-        and selected_run(arrangement, start)
+        and selection(arrangement, start)
         == scope[getattr(topology, "name", topology)]
         for topology, arrangement, start in zip(
             mesh.topologies, levels(mesh), starts(mesh)

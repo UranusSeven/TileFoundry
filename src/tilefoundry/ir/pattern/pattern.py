@@ -368,13 +368,8 @@ class MeshPattern(Pattern):
         require_per_mode(self.layout)
 
 @dataclass(frozen=True)
-class ScalarPattern(Pattern):
-    pass
-
-
-@dataclass(frozen=True)
 class TensorPattern(Pattern):
-    """Match a non-scalar ``TensorType`` field by field."""
+    """Match a ``TensorType`` of any rank, constrained by its stated fields."""
 
     dtype: Any = None
     shape: tuple | None = None
@@ -389,10 +384,6 @@ class ShardLayoutPattern(Pattern):
     attrs: tuple
     mesh: MeshPattern
 
-Scalar: ScalarPattern = ScalarPattern()
-Tensor: TensorPattern = TensorPattern()
-
-
 __all__ = [
     "AndPattern",
     "ComposedLayoutPattern",
@@ -401,14 +392,11 @@ __all__ = [
     "OrPattern",
     "Pattern",
     "RangePattern",
-    "Scalar",
-    "ScalarPattern",
     "SequencePattern",
     "ShardLayoutPattern",
     "StarPattern",
     "SwizzlePattern",
     "SwitchPattern",
-    "Tensor",
     "TensorPattern",
     "WildcardPattern",
 ]

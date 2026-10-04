@@ -319,17 +319,25 @@ def starts(mesh: Mesh) -> tuple[int, ...]:
     ...
 
 
-def selected_run(arrangement: Layout, start: int) -> tuple[tuple, tuple, int]:
-    """Reduce one level's selected positions to its joined modes and start."""
-    ...
-
-
 def within_scope(mesh: Mesh, current: Mesh) -> bool:
-    """Return whether each continuous run selected by mesh is within current."""
+    """Return whether each continuous position set is contained in current."""
     ...
 ```
 
 - constraints:
+  - Scope comparison MUST reduce each level's arrangement with
+    `filter(arrangement, major="row")`, retaining the level's start. Filtering
+    removes shape-one and stride-zero modes and coalesces adjacent modes after
+    affine dimension normalization. For continuous selections,
+    `covered_by_scope` MUST compare starts and normalized sizes, independent
+    of mode order. Otherwise it MUST conservatively compare the filtered
+    arrangements and starts for equality.
+  - `within_scope` MUST require both filtered selections to be continuous and
+    prove containment of their half-open intervals `[start, start + size)`.
+    Static continuity is `size == cosize`; symbolic continuity requires either
+    coalescing direction to leave one mode with stride one. Symbolic interval bounds MUST use the
+    conservative dimension range of their difference; an unproved bound
+    MUST return False.
   - a compile-time constant that does not enter the IR graph; describes the device
     domain, not a tensor layout object. A slice never becomes an IR/SSA value.
 
@@ -373,9 +381,10 @@ Mesh composition uses the following rules:
   inner mesh. The combined `ComposedLayout.offset` MUST then be re-encoded in
   device numbering from those per-level starts. Replacing an unsliced suffix
   and replacing the whole mesh retain their existing behavior. Every replaced
-  level MUST reduce to one continuous run contained in the enclosing level's
-  continuous run. A replacement or enclosing selection that does not reduce to
-  one continuous run MUST be rejected rather than approximated as an interval.
+  level MUST select a continuous position set contained in the enclosing level's
+  continuous position set. Continuity and containment MUST hold throughout the
+  declared dimension envelopes. A replacement or enclosing selection with holes
+  MUST be rejected rather than approximated as an interval.
 - `make_mesh(*meshes)` invokes `check_topology` on its result. For each named
   level with a concrete declared extent, its position count MUST NOT exceed
   that extent; symbolic extents are deferred until dimensions are bound. A
@@ -657,7 +666,13 @@ Let `sl: ShardLayout`, `T: TensorType`, and `G = sl.layout.shape`.
   `N > mesh_extent(a)` is canonicalized at parse time into a
   factorised form (`(mesh_extent(a) @ m.a, N // mesh_extent(a))`); the
   factorised residual axis enters the IR as a non-`Split` layout dim. See
-  [parser §2.1](./parser.md#21-syntax).
+  [parser §2.1](./parser.md#21-syntax). A symbolic logical axis split across
+  multiple mesh axes MUST be factored in mesh-axis order by exact successive
+  quotients: equal extents yield one, and a `DimMul` containing the mesh extent
+  as either factor yields its other factor. Integer quotients MUST be exact;
+  undecidable divisions MUST be rejected. Thus `NC * 128` split over `(NC, 64)`
+  becomes `(NC, 64, 2)`, with the residual `2` unbound. Symbolic factored shapes
+  keep `strides=None` until specialization.
 - `local_shape(sl)[k] = G[k] / sl.mesh.layout.shape[a] = 1` iff some mesh axis
   `a` has `sl.attrs[a] = Split(k)`.
 - `local_shape(sl)[k] = G[k]` otherwise.
@@ -905,16 +920,37 @@ def shard_layout_local_shape(
     ...
 
 
-def coalesce(layout: Layout | ComposedLayout, trg_profile=...):
+def coalesce(layout: Layout | ComposedLayout, trg_profile=..., *, major: str = "col"):
     """Merge contiguous modes, optionally within profile-selected groups.
 
     Args:
-        layout: Layout to simplify under CuTe's mode-zero-fast convention.
+        layout: Layout to simplify.
+        major: "col" (mode zero fastest) or "row" (last mode fastest).
         trg_profile: Optional nesting whose terminals select groups to merge.
 
     Returns:
         The equivalent layout with contiguous modes merged.
     """
+    ...
+
+
+def composition(left, right, offset: int = 0, *, major: str = "col"):
+    """Compose CuTe layouts; offset belongs to the swizzle overload."""
+    ...
+
+
+def complement(layout: Layout, max_idx: int = 1, *, major: str = "col") -> Layout:
+    """Return the modes filling the layout's gaps below max_idx."""
+    ...
+
+
+def logical_divide(layout: Layout, tile, *, major: str = "col") -> Layout:
+    """Compose a tile and its complement into the source layout."""
+    ...
+
+
+def zipped_divide(layout: Layout, tile, *, major: str = "col") -> Layout:
+    """Gather hierarchical tile and remainder modes into two modes."""
     ...
 
 
@@ -958,13 +994,16 @@ def right_inverse(layout: Layout | ComposedLayout):
 
 - constraints:
   - `canonical_shard_layout` MUST factor each logical axis split by one or more
-    static mesh axes in mesh-axis order, remap each `Split` to its factor, and
-    append a non-unit residual factor. It MUST reject indivisible or
-    unrepresentable dynamic multi-axis splits.
+    mesh axes in mesh-axis order, remap each `Split` to its factor, and append
+    a non-unit residual factor. Symbolic multi-axis splits MUST use successive
+    exact integer or structural product quotients as specified in
+    [shard §7.1.1](./shard.md#711-layoutshape).
+    It MUST reject indivisible or undecidable dynamic multi-axis splits.
   - `shard_layout_local_shape` MUST multiply the divisors of multiple `Split`
     attributes that name the same layout axis. Equal symbolic split and mesh
-    extents produce local extent one; other symbolic split relations MUST be
-    rejected as undecidable. An unconsumed symbolic extent MAY pass through
+    extents produce local extent one. A `DimMul` with the mesh extent as either
+    factor MUST yield its other factor as the local extent; other symbolic split
+    relations MUST be rejected as undecidable. An unconsumed symbolic extent MAY pass through
     only when `require_static=False`; strict mode MUST reject it.
   - `try_c_order_strides` MUST return `None` unless every shape entry is a
     non-boolean integer.
@@ -972,9 +1011,32 @@ def right_inverse(layout: Layout | ComposedLayout):
     mode-zero-fast convention. With `trg_profile`, it MUST apply that rule at
     each profile terminal, preserve unmatched trailing modes, and reject a
     profile that asks for more modes at any nesting level with that level in
-    the diagnostic. A row-major consumer MUST reverse modes within each of its
-    groups before calling this CuTe operation; `coalesce` itself does not
-    reinterpret storage order.
+    the diagnostic. `major="row"` MUST process modes from last to first and
+    return the reduced modes in their stated order. Merge comparisons MUST
+    normalize dimension expressions on both sides.
+  - `filter(layout, profile=..., major="col")` MUST remove shape-one and
+    stride-zero modes before coalescing, with the same profile and major-order
+    conventions. `is_contiguous(layout, major="col")` takes the already filtered
+    result with the same `major` and MUST test it without repeating filtering,
+    using `size == cosize` for static extents and one unit-stride mode
+    after coalescing in either direction for symbolic extents.
   - Inverting a composed mesh layout MUST accept only an identity inner mapping
     and an inverse-projectable primitive outer layout; other layouts MUST raise
     `NotProjectable` rather than guess an inverse.
+  - General `composition` MUST support a `Layout` on the left and a `Layout`,
+    integer tile, tuple of per-mode tiles, or identity `None` on the right,
+    preserving unmatched trailing modes in a tuple dispatch. The existing
+    swizzle overload MUST retain its offset semantics.
+  - `logical_divide` MUST compose the tile with its complement; `zipped_divide`
+    MUST gather the hierarchical result into tile and remainder modes.
+    Tiles MUST have integer extents and strides. `None` denotes an unsplit mode.
+    All three operations and `complement` MUST interpret traversal order via
+    `major="col"` or `major="row"`, without changing their per-mode tile dispatch.
+    Overlapping modes in `complement` MUST remain rejected as `NotProjectable`.
+  - `tile_view_layout` and `tile_inner_type` MUST receive operand-axis tile
+    `counts` projected from the caller's validated instruction repeat, rather
+    than infer them from whole and tile shape ratios. Prefix extraction MUST
+    retain the existing grouped and flat mode boundaries and remap `Split`
+    axes to the retained modes. An absent prefix or a removed sharded axis
+    MUST retain its existing diagnostic. Count-one axes MUST retain symbolic
+    extents without requiring division or a static extent.
