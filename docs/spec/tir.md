@@ -563,6 +563,12 @@ class Copy(Op):
   - `src` declares `READ`; `dst` declares `WRITE`.
   - both operands are whole-byte tensors in gmem, smem, or rmem, with equal
     dtype. Their storages MAY be equal; same-storage copy is still a byte move.
+  - with equal storage, `src` and `dst` have equal shapes, or both carry a
+    `ShardLayout` with the same `layout`. Then both shapes regroup row-major onto
+    that per-thread buffer ([semantic-analysis §3.1](./semantic-analysis.md#31-logical-shape-to-layout-domain)),
+    and `dst` receives each element of `src` at the same linear index: its access
+    relation walks `src` and reaches `dst` at the row-major reshape of each
+    coordinate.
   - `execution_mesh` is the mesh declaration shared by every rmem operand's
     `ShardLayoutPattern.mesh`. `rmem_layout` and `smem_layout` optionally state
     the author's landing arrangements.
@@ -683,6 +689,10 @@ class Reduce(Op):
     and no offset.
   - `Reduce` carries no dispatch parameter; runtime selects the strategy.
   - `workspace` is present only when lowering sizes cross-warp staging.
+  - `workspace` is rank 1 and holds at least one slot per warp of `src`'s thread
+    mesh, `ceil(threads / 32)` over the mesh's static positive extents. Its access
+    relation reaches slots `[0, ceil(threads / 32))` from every iteration; which
+    warp uses which slot is the runtime's choice.
   - All forms lower to the single public runtime entry
     `tilefoundry::ops::reduce<Op, Axes>(src, dst[, workspace])`.
   - Sharded extents and tiers are derived inside the runtime; this TIR declaration does not expose

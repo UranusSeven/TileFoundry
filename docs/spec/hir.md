@@ -761,6 +761,7 @@ An output with no real sharding receives a fresh C-order `Layout`.
   runtime.
 - A compile-time integer subscript, `tf.shape_of(x)[k]`, reads one dimension and
   produces the canonical rank-0 `i64` `umat` scalar for that dimension.
+- Neither reads an element of its input, and neither moves bytes.
 
 ##### Arange
 
@@ -831,6 +832,8 @@ class FullLike(Op):
 - constraints:
   - The result MUST have exactly `x`'s type and every element MUST equal
     `value` converted to that dtype.
+  - `x` is read for its Type only: no element of `x` is read, and every element
+    of the result is written.
 
 ##### Quant
 
@@ -1465,6 +1468,9 @@ class RoPE(Op):
     pos_ids: Tensor
 ```
 - constraints:
+  - `q` and `k` MUST have the same rank, at least 1, and the same even
+    `head_dim` (last axis). Their other extents MAY differ, so grouped-query
+    attention gives `q` more heads than `k`.
   - The rotation is the **rotate-half** form: the last axis splits in two
     halves and the pair `(x[i], x[i + d/2])` rotates together. This is the
     unqualified HF convention (`apply_rotary_pos_emb` / `rotate_half`); the

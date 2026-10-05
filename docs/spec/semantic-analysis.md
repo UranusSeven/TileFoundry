@@ -63,25 +63,49 @@ relation service ([visitor-registry §4.1](./visitor-registry.md#41-access-relat
 The access relation is the boundary model shared by relation-derived type
 behavior, shard propagation, dependence and movement: per boundary, an affine
 access map from the Op's own iteration space to a tensor's index space. Its
-carrier `AccessRelations` and the registry that produces it are both defined in
+carrier `AccessRelation`, the tuple of them one Op states, and the registry
+that produces it are all defined in
 [visitor-registry §4.1](./visitor-registry.md#41-access-relation-service--access_relation).
 The rule reads only the access maps' affine structure (which domain dim each
 axis uses), never the domain bounds, so it is size-agnostic and identical for
 static and dynamic shapes.
 
-An effect-form TIR instruction uses the same carrier even though its call is
-unit-typed. Its boundary order is derived from its input `ParamDef`s:
+An effect-form TIR instruction uses the same tuple even though its call is
+unit-typed:
 
-- `AccessRelations.inputs` contains every parameter whose `effect` includes
-  `READ`, in parameter order.
-- `AccessRelations.outputs` contains every parameter whose `effect` includes
-  `WRITE`, in parameter order.
-- A `READ | WRITE` parameter appears on both sides.
+- One relation per input `ParamDef`, in parameter order, comes first, whether
+  that operand is read, written or both.
+- Its relations after those are its Unit result's, as for any Op.
+- Which operands are read and which are written is each parameter's `effect`,
+  not its position: the argument prefix is not the set of reads.
 
-These output boundaries describe written operands, not SSA results of the TIR
-call. An HIR consumer such as [`tf.schedule`](./schedule.md) may use them to
-derive its own value result. Instructions selected by such a consumer MUST
-register their relation explicitly; there is no fallback relation.
+An HIR consumer such as [`tf.schedule`](./schedule.md) may use the relations
+of written operands to derive its own value result. Instructions selected by
+such a consumer MUST register their relation explicitly; there is no fallback
+relation.
+
+### 2.1 IR to isl conversion
+
+Every analysis service converts IR values to isl through the functions that
+[types §11](./types.md#11-isl-interoperability) owns, and every
+boundary carries what its parameters stand for in the `values` of its
+`AccessRelation` ([visitor-registry §4.1](./visitor-registry.md#41-access-relation-service--access_relation)).
+Both use the one `IslParamValues` dictionary, from isl parameter name to IR value.
+
+- constraints:
+  - A service MUST compose converted values as isl objects. It MUST NOT render
+    an isl object back to text and splice that text into a new relation.
+  - A loop domain MUST treat each enclosing induction variable, and each
+    capture of one, as a dimension of the space, not as a parameter. Each other
+    leaf of a loop bound MUST be a parameter with a stated range; a loop bound
+    with an unbounded parameter is refused.
+  - A parameter of an access relation that an enclosing scope already names
+    MUST keep that name, and a capture of that value MUST be the same
+    parameter, so one value is one parameter across the scope.
+  - The parameter name has no meaning. A reader MUST find what a parameter
+    stands for in `values`, not in its name. Boundaries of one Op MUST share a
+    parameter only when they bind the same object, which `iterating` makes so
+    before the Op's boundaries are combined.
 
 ## 3. Shard propagation
 
@@ -92,6 +116,19 @@ register their relation explicitly; there is no fallback relation.
 - The current interpretation is canonical regroup: linearize first
   along the logical shape's row-major order, then reinterpret along
   the layout domain's row-major order.
+- `layout_to_isl_map` ([types §11](./types.md#11-isl-interoperability))
+  implements this regroup for a `ShardLayout`. A logical axis whose extent is
+  the product of consecutive flattened layout positions maps onto them, so a
+  symbolic extent stays representable; any other regroup goes through the flat
+  index and needs static extents.
+- A reader with no topology level addresses logical coordinates. A reader at a
+  named topology level addresses the positions one unit of that level holds:
+  a position cut by mesh axes at that level or coarser is split into digits,
+  the cutting axes outermost first in mesh-axis order and then the residual,
+  and each such digit is that unit's mesh coordinate.
+- A mesh coordinate is an isl parameter while the placement is built. The
+  access relation service fixes it to the requested unit, 0 on every mesh axis
+  unless stated, and removes it before any boundary is counted.
 
 ### 3.2 Relation-driven shard propagation
 

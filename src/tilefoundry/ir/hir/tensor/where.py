@@ -19,9 +19,7 @@ from tilefoundry.ir.types.storage import StorageKind
 from tilefoundry.ir.types.stride import try_compact_major
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelations,
-    AffineAccess,
-    BoundaryRelation,
+    AccessRelation,
     broadcast_shapes,
     is_one,
     iterating,
@@ -29,7 +27,6 @@ from tilefoundry.visitor_registry.access_relation import (
     relations_of,
     shape_from_relation,
 )
-from tilefoundry.visitor_registry.isl_utility import shape_to_isl_domain
 from tilefoundry.visitor_registry.shard_propagate import derive_output_shard_layout
 
 
@@ -49,10 +46,9 @@ def _broadcast_all(shapes: tuple[tuple, ...]) -> tuple:
     return out_shape
 
 
-def _maps(shapes: tuple[tuple, ...]) -> tuple[object, tuple[AffineAccess, ...], dict]:
+def _maps(shapes: tuple[tuple, ...]) -> tuple[AccessRelation, ...]:
     out_shape = _broadcast_all(shapes)
     rank = len(out_shape)
-    domain, param_map = shape_to_isl_domain(out_shape)
     dims = [f"d{i}" for i in range(rank)]
     source = "[" + ", ".join(dims) + "]"
     maps = []
@@ -62,29 +58,16 @@ def _maps(shapes: tuple[tuple, ...]) -> tuple[object, tuple[AffineAccess, ...], 
             "0" if is_one(shape[i]) and not is_one(out_shape[pad + i]) else dims[pad + i]
             for i in range(len(shape))
         ]
-        maps.append(AffineAccess(isl.map(f"{{ {source} -> [{', '.join(accessed)}] }}")))
-    maps.append(AffineAccess(isl.map(f"{{ {source} -> [{', '.join(dims)}] }}")))
-    return (domain, tuple(maps), param_map)
+        maps.append(AccessRelation(isl.map(f"{{ {source} -> [{', '.join(accessed)}] }}")))
+    maps.append(AccessRelation(isl.map(f"{{ {source} -> [{', '.join(dims)}] }}")))
+    return tuple(maps)
 
 
 @register_access_relation(Where)
-def _where_access_relation(call: "Call", ctx) -> AccessRelations:
+def _where_access_relation(call: "Call", ctx) -> tuple[AccessRelation, ...]:
     input_types = tuple(ctx.type_of(arg) for arg in call.args)
     shapes = tuple(type_.shape for type_ in input_types)
-    out_shape = _broadcast_all(shapes)
-    _domain, maps, _params = _maps(shapes)
-    return iterating(
-        out_shape,
-        AccessRelations(
-            inputs=tuple(BoundaryRelation(item) for item in maps[:-1]),
-            outputs=(BoundaryRelation(maps[-1]),),
-        ),
-    )
-
-
-def _data_relation(relations: AccessRelations) -> AccessRelations:
-    """The same Op without its condition: the two branches and the result."""
-    return AccessRelations(inputs=relations.inputs[1:3], outputs=relations.outputs)
+    return iterating(_broadcast_all(shapes), _maps(shapes))
 
 
 @register_typeinfer(Where)
@@ -103,10 +86,10 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
     try:
         relation = relations_of(call, ctx)
         out_shape = shape_from_relation(
-            relation, _broadcast_all((condition.shape, input_.shape, other.shape))
+            relation[len(call.args)],
+            _broadcast_all((condition.shape, input_.shape, other.shape)),
         )
-        data_relation = _data_relation(relation)
-        data_shard = derive_output_shard_layout((input_, other), data_relation, out_shape)
+        data_shard = derive_output_shard_layout((input_, other), relation[1:], out_shape)
         layout = (
             data_shard
             if data_shard is not None

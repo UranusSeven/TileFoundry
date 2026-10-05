@@ -20,14 +20,13 @@ from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._shard_checks import check_multilinear_partials, reject_partials
-from tilefoundry.ir.isl_interop import index_set
+from tilefoundry.ir.isl_interop import shape_to_isl_set
 from tilefoundry.ir.pattern import is_ranked_tensor
 from tilefoundry.ir.types import TupleType
+from tilefoundry.ir.types.utils import is_literal_shape
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelations,
-    AffineAccess,
-    BoundaryRelation,
+    AccessRelation,
     iterating,
     logical_coordinates,
     reached_at,
@@ -55,6 +54,8 @@ def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
     pos_ty = ctx.type_of(call.args[4])
     if not q_ty.shape or not k_ty.shape:
         ctx.error(call, "q and k must be at least rank-1")
+    if len(q_ty.shape) != len(k_ty.shape):
+        ctx.error(call, f"q rank {len(q_ty.shape)} != k rank {len(k_ty.shape)}")
     head_dim_q = q_ty.shape[-1]
     head_dim_k = k_ty.shape[-1]
     if isinstance(head_dim_q, int) and head_dim_q % 2 != 0:
@@ -82,7 +83,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TupleType:
 
 
 @register_access_relation(RoPE)
-def _rope_access_relation(call: "Call", ctx: "TypeInferContext") -> AccessRelations:
+def _rope_access_relation(call: "Call", ctx: "TypeInferContext") -> tuple[AccessRelation, ...]:
     """GLOBAL level: a rotation per element, read out of a table by position.
 
     Rotating Q and rotating K are instances of the same work, so the space this
@@ -102,10 +103,9 @@ def _rope_access_relation(call: "Call", ctx: "TypeInferContext") -> AccessRelati
     own = ", ".join(f"d{index}" for index in range(rank))
     value = isl.map(f"{{ [{walked}] -> [{own}] : d{rank} = 0 }}")
     grouped = isl.map(f"{{ [{walked}] -> [{own}] : d{rank} = 1 }}")
-    narrower = index_set(tuple(k_ty.shape))
-    if narrower is not None:
-        grouped = grouped.intersect_range(narrower)
-    value, grouped = AffineAccess(value), AffineAccess(grouped)
+    if is_literal_shape(k_ty.shape):
+        grouped = grouped.intersect_range(shape_to_isl_set(tuple(k_ty.shape), {}))
+    value, grouped = AccessRelation(value), AccessRelation(grouped)
     positions = ctx.type_of(call.args[4])
     tables = []
     for operand in (2, 3):
@@ -113,37 +113,29 @@ def _rope_access_relation(call: "Call", ctx: "TypeInferContext") -> AccessRelati
         logical_table = ctx.type_of(call.args[operand])
         rows = len(logical_table.shape) - 1
         tables.append(
-            BoundaryRelation(
-                reached_at(
-                    rank + 1,
-                    table,
-                    logical_table,
-                    {rows: carried.get(head_dim, "0")},
-                    free=tuple(range(rows)),
-                )
+            reached_at(
+                rank + 1,
+                table,
+                logical_table,
+                {rows: carried.get(head_dim, "0")},
+                free=tuple(range(rows)),
             )
         )
     return iterating(
         (*q_ty.shape, 2),
-        AccessRelations(
-            inputs=(
-                BoundaryRelation(value),
-                BoundaryRelation(grouped),
-                *tables,
-                BoundaryRelation(
-                    reached_at(
-                        rank + 1,
-                        positions,
-                        ctx.type_of(call.args[4]),
-                        {},
-                        free=tuple(range(len(ctx.type_of(call.args[4]).shape))),
-                    )
-                ),
+        (
+            value,
+            grouped,
+            *tables,
+            reached_at(
+                rank + 1,
+                positions,
+                ctx.type_of(call.args[4]),
+                {},
+                free=tuple(range(len(ctx.type_of(call.args[4]).shape))),
             ),
-            outputs=(
-                BoundaryRelation(value),
-                BoundaryRelation(grouped),
-            ),
+            value,
+            grouped,
         ),
     )
 

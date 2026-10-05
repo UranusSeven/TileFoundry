@@ -14,12 +14,12 @@ from tilefoundry.ir.core import Call, Expr
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
 from tilefoundry.ir.hir.tensor.insert_slice import InsertSlice
-from tilefoundry.ir.isl_interop import index_set
+from tilefoundry.ir.isl_interop import shape_to_isl_set
 from tilefoundry.ir.types import TensorType
-from tilefoundry.ir.types.utils import local_type_of, tensor_types
+from tilefoundry.ir.types.utils import is_literal_shape, local_type_of, tensor_types
 from tilefoundry.ir.visitor import ExprVisitor
 from tilefoundry.utils.isl_utils import equates
-from tilefoundry.visitor_registry.access_relation import relation_of, renaming_relation
+from tilefoundry.visitor_registry.access_relation import renaming_relation
 from tilefoundry.visitor_registry.buffer_alias import aliased_operand
 from tilefoundry.visitor_registry.contexts import TypeInferContext
 
@@ -97,10 +97,14 @@ def storage_owners(root: IterationScope, liveness: Liveness) -> dict[int, Expr]:
         if isinstance(value, Call) and (position := aliased_operand(value)) is not None:
             operand = value.args[position]
             ctx = TypeInferContext()
-            relation = relation_of(
-                renaming_relation(value, ctx, declarations[key].projected_relations(value, ctx))
+            relation = renaming_relation(
+                value, ctx, declarations[key].projected_relations(value, ctx)
+            ).relation
+            box = (
+                shape_to_isl_set(tuple(operand.type.shape), {})
+                if is_literal_shape(operand.type.shape)
+                else None
             )
-            box = index_set(operand.type.shape)
             if (
                 box is None
                 or not relation.is_single_valued()
@@ -245,15 +249,18 @@ def operand_to_result_relation(
             return None
         if not isinstance(held, TensorType):
             return None
-        box = index_set(held.shape)
-        return None if box is None else scope.domain.flat_product(box).coalesce()
+        if not is_literal_shape(held.shape):
+            return None
+        return scope.domain.flat_product(shape_to_isl_set(tuple(held.shape), {})).coalesce()
 
     def value_box(value: Expr) -> isl.set | None:
         try:
             held = local_type_of(value.type)
         except (TypeError, ValueError, NotImplementedError):
             return None
-        return index_set(held.shape) if isinstance(held, TensorType) else None
+        if not isinstance(held, TensorType) or not is_literal_shape(held.shape):
+            return None
+        return shape_to_isl_set(tuple(held.shape), {})
 
     def composed(inputs: isl.map, outputs: isl.map) -> isl.map | None:
         try:
@@ -574,30 +581,25 @@ def aligned(value: int, alignment: int) -> int:
     return -(-value // alignment) * alignment
 
 
-def calculate_starts(
+def _first_fit(
+    order: list[set[int]],
     values: tuple[AllocationValue, ...],
-    aliased: set[tuple[int, int]],
     interference: set[tuple[int, int]],
     alignments: tuple[int, ...],
     limit: int,
-) -> tuple[tuple[int, ...], int]:
-    """Construct a complete aligned seed with every required alias merged."""
-    roots = alias_components(len(values), aliased)
-    components: dict[int, set[int]] = defaultdict(set)
-    for index in range(len(values)):
-        components[roots[index]].add(index)
+    pinned: dict[int, int],
+    floor: int,
+) -> tuple[tuple[int, ...], int] | None:
+    """Place alias components in *order*, each at the lowest address its conflicts leave.
 
-    ordered = sorted(
-        components.values(),
-        key=lambda component: (
-            min(values[index].lifetime.defined_at for index in component),
-            -max(values[index].lifetime.bytes for index in component),
-        ),
-    )
+    A component holding a pinned value takes that address; every other one starts
+    at *floor*, aligned to the component, or above. None when the components
+    cannot share a pinned address or one would end past *limit*.
+    """
     placed: list[tuple[set[int], int, int]] = []
     addresses = [0] * len(values)
     peak = 0
-    for component in ordered:
+    for component in order:
         size = max(values[index].lifetime.bytes for index in component)
         alignment = max(alignments[index] for index in component)
 
@@ -609,28 +611,114 @@ def calculate_starts(
             )
 
         blocked = tuple(item for item in placed if conflicts(item[0]))
+        pins = {pinned[index] for index in component if index in pinned}
+        if len(pins) > 1:
+            return None
+        lowest = aligned(floor, alignment)
         candidates = sorted(
-            {
-                0,
-                *(aligned(address + held, alignment) for other, address, held in blocked if other),
+            pins
+            or {
+                lowest,
+                *(
+                    aligned(address + held, alignment)
+                    for other, address, held in blocked
+                    if other and aligned(address + held, alignment) >= lowest
+                ),
             }
         )
         address = next(
-            candidate
-            for candidate in candidates
-            if all(
-                candidate + size <= other_address or other_address + other_size <= candidate
-                for other, other_address, other_size in blocked
-                if other
-            )
+            (
+                candidate
+                for candidate in candidates
+                if all(
+                    candidate + size <= other_address or other_address + other_size <= candidate
+                    for other, other_address, other_size in blocked
+                    if other
+                )
+            ),
+            None,
         )
-        if address + size > limit:
-            raise AnalysisError("allocation: failed to construct a bounded feasible seed")
+        if address is None or address + size > limit:
+            return None
         for index in component:
             addresses[index] = address
         placed.append((component, address, size))
         peak = max(peak, address + size)
     return tuple(addresses), peak
+
+
+def _satisfies(
+    addresses: tuple[int, ...],
+    values: tuple[AllocationValue, ...],
+    interference: set[tuple[int, int]],
+    alignments: tuple[int, ...],
+    limit: int,
+    pinned: dict[int, int],
+    floor: int,
+) -> bool:
+    """Whether a seed meets every constraint the solver states about addresses."""
+    for index, (address, item, alignment) in enumerate(
+        zip(addresses, values, alignments, strict=True)
+    ):
+        if address % alignment or address + item.lifetime.bytes > limit:
+            return False
+        if index in pinned and address != pinned[index]:
+            return False
+        if index not in pinned and address < floor:
+            return False
+    return all(
+        addresses[left] + values[left].lifetime.bytes <= addresses[right]
+        or addresses[right] + values[right].lifetime.bytes <= addresses[left]
+        for left, right in interference
+    )
+
+
+def calculate_starts(
+    values: tuple[AllocationValue, ...],
+    aliased: set[tuple[int, int]],
+    interference: set[tuple[int, int]],
+    alignments: tuple[int, ...],
+    limit: int,
+    *,
+    pinned: dict[int, int] | None = None,
+    floor: int = 0,
+) -> tuple[tuple[int, ...], int] | None:
+    """A complete aligned seed with every required alias merged, or None.
+
+    Alias components are placed first-fit by first definition -- the original
+    seed, then again holding persistent values at their pinned addresses -- and
+    largest first. Each seed is checked against every address constraint the
+    solver states, and the most compact one that meets them all is kept, the
+    earlier attempt winning a tie. None when none does: a heuristic that fails
+    proves nothing about the model, so it must not bound the search.
+    """
+    pinned = pinned or {}
+    roots = alias_components(len(values), aliased)
+    components: dict[int, set[int]] = defaultdict(set)
+    for index in range(len(values)):
+        components[roots[index]].add(index)
+
+    def size(component: set[int]) -> int:
+        return max(values[index].lifetime.bytes for index in component)
+
+    def first(component: set[int]) -> int:
+        return min(values[index].lifetime.defined_at for index in component)
+
+    by_definition = sorted(components.values(), key=lambda c: (first(c), -size(c)))
+    largest_first = sorted(components.values(), key=lambda c: (-size(c), first(c)))
+    attempts = (
+        (by_definition, {}, 0),
+        (by_definition, pinned, floor),
+        (largest_first, pinned, floor),
+    )
+    seeds = [
+        seed
+        for order, pins, lowest in attempts
+        if (seed := _first_fit(order, values, interference, alignments, limit, pins, lowest))
+        is not None
+        and _satisfies(seed[0], values, interference, alignments, limit, pinned, floor)
+    ]
+    return min(seeds, key=lambda seed: seed[1]) if seeds else None
 
 
 def find_aliases(
@@ -691,11 +779,15 @@ def solve_allocation(
         model.add_modulo_equality(0, address, alignment).with_name(f"align_{index}")
 
     persistent_end = 0
-    for address, item, alignment in zip(addresses, values, alignments, strict=True):
+    pinned: dict[int, int] = {}
+    for index, (address, item, alignment) in enumerate(
+        zip(addresses, values, alignments, strict=True)
+    ):
         if not item.lifetime.persistent:
             continue
         persistent_end = aligned(persistent_end, alignment)
         model.add(address == persistent_end)
+        pinned[index] = persistent_end
         persistent_end += item.lifetime.bytes
     for address, item in zip(addresses, values, strict=True):
         if not item.lifetime.persistent:
@@ -727,18 +819,26 @@ def solve_allocation(
         ).only_enforce_if(right_before)
         model.add_bool_or(left_before, right_before)
 
-    address_hints, peak_hint = calculate_starts(
-        values, context.aliased, interference, alignments, limit
+    seed = calculate_starts(
+        values,
+        context.aliased,
+        interference,
+        alignments,
+        limit,
+        pinned=pinned,
+        floor=persistent_end,
     )
-    model.add(peak <= peak_hint)
-    for address, suggested in zip(addresses, address_hints, strict=True):
-        model.add_hint(address, suggested)
-    for (left, right), (left_before, right_before) in order_choices.items():
-        left_end = address_hints[left] + values[left].lifetime.bytes
-        right_end = address_hints[right] + values[right].lifetime.bytes
-        model.add_hint(left_before, int(left_end <= address_hints[right]))
-        model.add_hint(right_before, int(right_end <= address_hints[left]))
-    model.add_hint(peak, peak_hint)
+    if seed is not None:
+        address_hints, peak_hint = seed
+        model.add(peak <= peak_hint)
+        for address, suggested in zip(addresses, address_hints, strict=True):
+            model.add_hint(address, suggested)
+        for (left, right), (left_before, right_before) in order_choices.items():
+            left_end = address_hints[left] + values[left].lifetime.bytes
+            right_end = address_hints[right] + values[right].lifetime.bytes
+            model.add_hint(left_before, int(left_end <= address_hints[right]))
+            model.add_hint(right_before, int(right_end <= address_hints[left]))
+        model.add_hint(peak, peak_hint)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = options.timeout_seconds

@@ -12,10 +12,9 @@ from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.isl_interop import (
     dim_range,
-    index_set,
     isl_to_dim,
     normalize_dim,
-    shape_to_isl_domain,
+    shape_to_isl_set,
 )
 from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.dim import (
@@ -30,6 +29,7 @@ from tilefoundry.ir.types.dim import (
     simplify_dim,
 )
 from tilefoundry.utils.isl_utils import cardinality
+from tilefoundry.visitor_registry.access_relation import AccessRelation, iterating
 
 P = DimVar("P", 2048, 1_048_576)
 Q = DimVar("Q", 2, 32)
@@ -171,49 +171,115 @@ def test_cardinality_distinguishes_empty_and_unbounded_parameter_contexts():
     assert cardinality(unbounded) is None
 
 
-def test_shape_to_isl_domain_encoding():
+def test_shape_to_isl_set_encoding():
     """Static extents inline.
 
-    Static extents inline; a bare DimVar keeps its own param name; a
-    composite mints one opaque param bounded by ``dim_range`` and dedups
-    across axes on the canonical expression.
+    Static extents inline; a bare DimVar is a parameter bounded by its envelope;
+    a composite mints one opaque param bounded by ``dim_range``, shared across
+    axes holding the same object. Every parameter is named into ``values``.
     """
-    dom, param_map = shape_to_isl_domain((8, 4))
+    values = {}
+    dom = shape_to_isl_set((8, 4), values)
     assert dom.dim(isl.dim_type.PARAM) == 0
     assert dom.dim(isl.dim_type.SET) == 2
-    assert param_map == {}
+    assert values == {}
 
-    dom, param_map = shape_to_isl_domain((P,))
-    assert dom.get_dim_name(isl.dim_type.PARAM, 0) == "P"
-    assert param_map == {"P": P}
+    dom = shape_to_isl_set((P,), values)
+    name = dom.get_dim_name(isl.dim_type.PARAM, 0)
+    assert values == {name: P}
+    assert f"{P.lo} <= {name} <= {P.hi}" in str(dom)
 
+    values = {}
     d = simplify_dim(DimFloorDiv, (P, 4))
-    dom, param_map = shape_to_isl_domain((d, 128, d))
+    dom = shape_to_isl_set((d, 128, d), values)
     assert dom.dim(isl.dim_type.PARAM) == 1
     name = dom.get_dim_name(isl.dim_type.PARAM, 0)
     lo, hi = dim_range(d)
     assert f"{lo} <= {name} <= {hi - 1}" in str(dom)
-    assert param_map[name] is d
-
-    dom, param_map = shape_to_isl_domain(())
-    assert dom.dim(isl.dim_type.SET) == 0
-    assert param_map == {}
+    assert values == {name: d}
 
 
-def test_shape_to_isl_domain_same_name_conflicting_bounds_raises():
-    with pytest.raises(ValueError, match="conflicting bounds"):
-        shape_to_isl_domain((DimVar("S", 1, 7), DimVar("S", 1, 15)))
+def test_shape_to_isl_set_names_each_value_once():
+    """One object is one parameter; two DimVars sharing a name are two.
+
+    A name is a fixed prefix and a number, whatever the value is called, and
+    skips any name already taken. An Op's relations are lined up by identity
+    the same way, into new relations: one stated relation reused by two Ops
+    leaves both its map and its values as they were.
+    """
+    narrow, wide = DimVar("S", 1, 7), DimVar("S", 1, 15)
+    values = {}
+    dom = shape_to_isl_set((narrow, wide), values)
+    assert dom.dim(isl.dim_type.PARAM) == 2
+    assert sorted(values.values(), key=lambda dim: dim.hi) == [narrow, wide]
+
+    again = shape_to_isl_set((wide,), values)
+    assert again.dim(isl.dim_type.PARAM) == 1
+    assert values[again.get_dim_name(isl.dim_type.PARAM, 0)] is wide
+    assert len(values) == 2
+
+    def fixed(name: str) -> bool:
+        return name[0] == "p" and name[1:].isdigit()
+
+    unspellable = DimVar("1 seq-len/ä", 1, 9)
+    probe: dict = {}
+    shape_to_isl_set((unspellable,), probe)
+    (named,) = probe
+    assert fixed(named), f"{named!r} is read off the value's own name"
+    assert shape_to_isl_set((unspellable,), probe).dim_max_val(0).get_num_si() == 8
+    following = int(named[1:]) + 1
+    taken = {f"p{following}": narrow, f"p{following + 1}": wide}
+    shape_to_isl_set((DimVar("S", 1, 3),), taken)
+    (fresh,) = set(taken) - {f"p{following}", f"p{following + 1}"}
+    assert fixed(fresh) and taken[f"p{following}"] is narrow and taken[f"p{following + 1}"] is wide
+
+    walk = "0 <= d0 < 8"
+    n, other_n, s = DimVar("N", 1, 64), DimVar("N", 1, 32), DimVar("S", 1, 4)
+    shared = AccessRelation(isl.map(f"[N] -> {{ [d0] -> [d0 + N] : {walk} }}"), {"N": n})
+    renamed = AccessRelation(isl.map(f"[M] -> {{ [d0] -> [d0 - M] : {walk} }}"), {"M": n})
+    homonym = AccessRelation(isl.map(f"[N] -> {{ [d0] -> [N] : {walk} }}"), {"N": other_n})
+    twice = AccessRelation(
+        isl.map(f"[A, B] -> {{ [d0] -> [d0 + A - B] : {walk} }}"), {"A": n, "B": n}
+    )
+    on_coordinate = AccessRelation(isl.map(f"[d0] -> {{ [i] -> [i + d0] : {walk} }}"), {"d0": s})
+    swapped = (
+        AccessRelation(isl.map(f"[p0, p1] -> {{ [d0] -> [p0, p1] : {walk} }}"), {"p0": n, "p1": s}),
+        AccessRelation(isl.map(f"[p0, p1] -> {{ [d0] -> [p0, p1] : {walk} }}"), {"p0": s, "p1": n}),
+    )
+    stated = (shared, renamed, homonym, twice, on_coordinate, *swapped)
+    before = [(access.relation, dict(access.values)) for access in stated]
+    for op in (stated, (shared, homonym, shared)):
+        held = iterating((8,), op)
+        names: dict[int, str] = {}
+        for access in held:
+            for name, value in access.values.items():
+                assert names.setdefault(id(value), name) == name, "one value, one name"
+        assert len(set(names.values())) == len(names), "two values, two names"
+        assert all(name == "N" or fixed(name) for name in names.values())
+        assert names[id(n)] != names[id(other_n)]
+    held = iterating((8,), stated)
+    one = held[3].values
+    assert len(one) == 1 and next(iter(one.values())) is n, "two names for one value merge"
+    assert held[3].relation.is_equal(
+        isl.map(f"[{next(iter(one))}] -> {{ [d0] -> [d0] : {walk} }}")
+    ), "and merging equates them rather than dropping one"
+    first, second = (dict(map(reversed, access.values.items())) for access in held[5:])
+    assert first == second, "a swap captures neither name"
+    assert held[5].relation.is_equal(
+        isl.map(f"[{first[n]}, {first[s]}] -> {{ [d0] -> [{first[n]}, {first[s]}] : {walk} }}")
+    )
+    for access, (relation, values) in zip(stated, before, strict=True):
+        assert access.relation is relation and access.values == values
 
 
-def test_index_set_is_the_nonnegative_literal_shape_special_case():
-    for shape in ((8, 4), (), (0, 3)):
-        domain, param_map = shape_to_isl_domain(shape)
-        assert param_map == {}
-        assert index_set(shape).is_equal(domain)
-
-    assert index_set((-1, 3)) is None
-    assert index_set((P,)) is None
-    assert index_set((True,)) is None
+def test_shape_to_isl_set_literal_shapes():
+    """A literal shape is a box, a zero-dim shape one point, a negative one nothing."""
+    assert cardinality(shape_to_isl_set((8, 4), {})) == 32
+    assert cardinality(shape_to_isl_set((), {})) == 1
+    assert shape_to_isl_set((0, 3), {}).is_empty()
+    assert shape_to_isl_set((-1, 3), {}).is_empty()
+    with pytest.raises(TypeError, match="bool"):
+        shape_to_isl_set((True,), {})
 
 
 def test_round_trip_lossless_for_every_dim_kind():
@@ -242,8 +308,9 @@ def test_round_trip_lossless_for_every_dim_kind():
         simplify_dim(DimMod, (P, 128)),
         simplify_dim(DimAdd, (128, simplify_dim(DimFloorDiv, (P, 4)))),
     )
-    domain, param_map = shape_to_isl_domain(dims)
+    values = {}
+    domain = shape_to_isl_set(dims, values)
     recovered = tuple(
-        isl_to_dim(domain.dim_max(i).add_constant(1), param_map) for i in range(len(dims))
+        isl_to_dim(domain.dim_max(i).add_constant(1), values) for i in range(len(dims))
     )
     assert recovered == dims

@@ -12,11 +12,17 @@ from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._helpers import resolve_anchor_storage
 from tilefoundry.ir.hir._shard_checks import check_multilinear_partials
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import TensorType
-from tilefoundry.ir.types.shard_layout import shard_layout_of, split_target_axes
+from tilefoundry.ir.types import Layout, TensorType
+from tilefoundry.ir.types.shard_layout import (
+    ShardLayout,
+    canonical_shard_layout,
+    shard_layout_of,
+    split_target_axes,
+)
+from tilefoundry.ir.types.stride import try_compact_major
 from tilefoundry.visitor_registry import register_typeinfer
 from tilefoundry.visitor_registry.access_relation import (
-    AccessRelations,
+    AccessRelation,
     broadcast_shapes,
     matmul_relations,
     register_access_relation,
@@ -63,7 +69,7 @@ def _k_split_axes(t, k_tensor_axis: int) -> "frozenset[int]":
 
 
 @register_access_relation(MatMul)
-def _matmul_access_relation(call: "Call", ctx) -> AccessRelations:
+def _matmul_access_relation(call: "Call", ctx) -> tuple[AccessRelation, ...]:
     """Every coordinate of each operand a contraction reaches, read once."""
     lhs = ctx.type_of(call.args[0])
     rhs = ctx.type_of(call.args[1])
@@ -110,7 +116,7 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
 
     out_batch = broadcast_shapes(lhs.shape[:-2], rhs.shape[:-2], raising=False)
     out_shape = shape_from_relation(
-        relation, (*out_batch, lhs.shape[a_m], rhs.shape[b_n], lhs.shape[a_k])
+        relation[len(call.args)], (*out_batch, lhs.shape[a_m], rhs.shape[b_n], lhs.shape[a_k])
     )
     k_domain_dim = len(out_shape)
     try:
@@ -122,7 +128,15 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
         )
     except ValueError as e:
         ctx.error(call, str(e))
-    layout = shard if shard is not None else (shard_layout_of(lhs.layout) or lhs.layout)
+    layout = shard
+    if layout is None:
+        held = shard_layout_of(lhs.layout) or lhs.layout
+        if isinstance(held, ShardLayout):
+            layout = canonical_shard_layout(out_shape, held.mesh, held.attrs)
+        elif held is None or tuple(held.shape) == tuple(out_shape):
+            layout = held
+        else:
+            layout = Layout(shape=out_shape, strides=try_compact_major(out_shape))
     storage = resolve_anchor_storage(ctx, call, lhs.storage, rhs.storage)
     return TensorType(shape=out_shape, dtype=lhs.dtype, layout=layout, storage=storage)
 
