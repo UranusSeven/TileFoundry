@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 
+from tilefoundry.ir.core.inspection import Printable, PrinterBase
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.pattern import (
     ComposedLayoutPattern,
@@ -21,10 +23,11 @@ from tilefoundry.ir.pattern import (
     predicates as P,
 )
 from tilefoundry.ir.pattern.utils import declared_shape, matched_row_issues, selected_pattern
-from tilefoundry.ir.types import ComposedLayout, Layout, Mesh, ShardLayout, TensorType
+from tilefoundry.ir.types import ComposedLayout, DType, Layout, Mesh, ShardLayout, TensorType
 from tilefoundry.ir.types.layout_algebra import coalesce
 from tilefoundry.ir.types.mesh import levels, starts
 from tilefoundry.ir.types.utils import tile_view_layout
+from tilefoundry.utils.python_source import PythonExpr
 
 _MISS = object()
 
@@ -42,7 +45,7 @@ def execution_mesh_pattern(execution_mesh: Mesh) -> MeshPattern:
     return MeshPattern((topology.name,), layout)
 
 
-class MmaAtom:
+class MmaAtom(Printable):
     """One instruction declaration; an instance binds its authored parameters."""
 
     namespace: str
@@ -70,9 +73,12 @@ class MmaAtom:
         held = {}
         for param in self.parameters:
             value = bindings[param.name] if param.name in bindings else self._implied(param, held)
+            if param.annotation is DType and isinstance(value, str):
+                value = DType.from_name(value)
             if matched(param.pattern, value, held) is None:
+                shown = value.name if isinstance(value, DType) else repr(value)
                 raise ValueError(
-                    f"{self.reference_name}: {param.name}={value!r} is not one "
+                    f"{self.reference_name}: {param.name}={shown} is not one "
                     f"it takes{self._where(held)}; it takes {param.name} "
                     f"{param.pattern!r}"
                 )
@@ -162,30 +168,27 @@ class MmaAtom:
     def on(self, mesh: Mesh) -> MmaAtom:
         return type(self)(mesh=mesh, **self.bindings)
 
-    def written(self, mesh: str | None = None) -> str:
-        stated, held = [], {}
-        for param in self.parameters:
-            value = self.bindings[param.name]
-            try:
-                implied = self._implied(param, held)
-            except ValueError:
-                implied = None
-            if implied is None or implied != value:
-                stated.append(f"{param.name}={self.written_value(value)}")
-            held[param.name] = value
-        if mesh is not None:
-            stated.append(f"mesh={mesh}")
+    def print(self, printer: PrinterBase, ctx=None) -> str:
+        """This atom as importable DSL source, written with *printer*.
+
+        The atom states its own name, every binding in parameter order and an
+        Enum's ``namespace`` spelling; every other value, the mesh included, is
+        printed by *printer* in the same import context.
+        """
+        if ctx is not None:
+            ctx.use(PythonExpr(("from tilefoundry.dsl import T",), "T"))
+        stated = [
+            f"{name}={self._printed_value(value, printer, ctx)}"
+            for name, value in self.bindings.items()
+        ]
+        if self.mesh is not None:
+            stated.append(f"mesh={printer.print(self.mesh, ctx)}")
         return f"{self.reference_name}({', '.join(stated)})"
 
-    @classmethod
-    def written_value(cls, value) -> str:
-        if type(value) is int:
-            return str(value)
-        return f"{cls.namespace}.{type(value).__name__}.{value.name}"
-
-    @property
-    def reference(self) -> str:
-        return self.written()
+    def _printed_value(self, value, printer: PrinterBase, ctx) -> str:
+        if isinstance(value, Enum):
+            return f"{self.namespace}.{type(value).__name__}.{value.name}"
+        return printer.print(value, ctx)
 
     def __eq__(self, other):
         return (
@@ -198,7 +201,17 @@ class MmaAtom:
         return hash((type(self), tuple(self.bindings.items()), self.mesh))
 
     def __repr__(self):
-        return self.written(None if self.mesh is None else repr(self.mesh))
+        stated = [f"{name}={self._repr_value(value)}" for name, value in self.bindings.items()]
+        if self.mesh is not None:
+            stated.append(f"mesh={self.mesh!r}")
+        return f"{self.reference_name}({', '.join(stated)})"
+
+    def _repr_value(self, value) -> str:
+        if isinstance(value, Enum):
+            return f"{self.namespace}.{type(value).__name__}.{value.name}"
+        if isinstance(value, DType):
+            return repr(value.name)
+        return repr(value)
 
 
 @dataclass(frozen=True, init=False)

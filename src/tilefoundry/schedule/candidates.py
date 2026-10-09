@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from enum import Enum
 from math import prod
 from typing import Any, Mapping
 
@@ -11,11 +10,11 @@ import isl
 
 from tilefoundry.analysis import analyze
 from tilefoundry.analysis.iteration_scope import build_scopes, walk_scopes
+from tilefoundry.analysis.visitor import AnalyzeContext
 from tilefoundry.inspection import PatternPrinter, PythonPrinter
 from tilefoundry.ir.core import (
     Call,
     OpCapability,
-    Var,
     get_metadata,
     op_identifier,
     value_label,
@@ -23,6 +22,7 @@ from tilefoundry.ir.core import (
 from tilefoundry.ir.core.metadata import SourceSpanMetadata
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.hir.math.binary import Binary as HirBinary
+from tilefoundry.ir.hir.schedule import operand_relations
 from tilefoundry.ir.pattern import (
     PatternMatcher,
     SwitchPattern,
@@ -30,7 +30,8 @@ from tilefoundry.ir.pattern import (
     between_rules,
     declared_execution_mesh,
 )
-from tilefoundry.ir.types import TensorType, UnitType
+from tilefoundry.ir.pattern.utils import variants
+from tilefoundry.ir.types import TensorType
 from tilefoundry.ir.types.dim import is_dim_op_call
 from tilefoundry.ir.types.int_tuple import flatten
 from tilefoundry.ir.types.utils import try_local_type_of
@@ -47,7 +48,6 @@ from tilefoundry.visitor_registry.candidates import (
     instruction_from_hir,
     sole_candidate,
 )
-from tilefoundry.visitor_registry.contexts import FunctionScope, TypeInferContext
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,7 @@ def _input_params(op_type: type, operand_count: int | None = None) -> tuple[Para
 
 
 def _site_types(
-    call: Call, ctx: TypeInferContext
+    call: Call, ctx: AnalyzeContext
 ) -> tuple[tuple[TensorType, ...], TensorType]:
     def candidate_type(type_):
         """Project a site unless it is already one indivisible scheduled issue."""
@@ -114,8 +114,8 @@ def _site_types(
     return reads, output
 
 
-def _sites(module, function, ctx: TypeInferContext) -> tuple[_Site, ...]:
-    root = build_scopes(module, function)
+def _sites(module, function, ctx: AnalyzeContext) -> tuple[_Site, ...]:
+    root = build_scopes(module, function, ctx=ctx)
     owners = {identity: scope for scope in walk_scopes(root) for identity in scope.relations}
     sites = []
     for expr in collect_exprs(function.body):
@@ -153,12 +153,11 @@ def _relation_shape(boundary) -> tuple[int, tuple[int | None, ...]]:
 
 
 def _site_relation_shape(site: _Site) -> tuple:
-    args = tuple(Var(name=name, type=type_) for name, type_ in site.reads)
-    call = Call(target=site.call.target, args=args, type=site.leaves[0][1])
-    relations = relations_of(call, TypeInferContext())
+    reads = tuple(type_ for _name, type_ in site.reads)
+    relations = operand_relations(site.call.target, reads)
     return (
-        tuple(_relation_shape(boundary) for boundary in relations[: len(args)]),
-        tuple(_relation_shape(boundary) for boundary in relations[len(args) :]),
+        tuple(_relation_shape(boundary) for boundary in relations[: len(reads)]),
+        tuple(_relation_shape(boundary) for boundary in relations[len(reads) :]),
     )
 
 
@@ -187,11 +186,9 @@ def _instruction_relation_shape(site: _Site, op) -> tuple | None:
     types = _instruction_operands(site, op)
     if types is None:
         return None
-    args = tuple(Var(name=f"operand{index}", type=type_) for index, type_ in enumerate(types))
-    call = Call(target=op, args=args, type=UnitType())
-    relations = relations_of(call, TypeInferContext())
+    relations = operand_relations(op, types)
     params = _input_params(type(op), len(site.reads))
-    operands = relations[: len(args)]
+    operands = relations[: len(types)]
     reads = tuple(
         _relation_shape(boundary)
         for param, boundary in zip(params, operands, strict=True)
@@ -205,21 +202,16 @@ def _instruction_relation_shape(site: _Site, op) -> tuple | None:
     return reads, writes
 
 
-def _parameter_values(param: ParamDef, site: _Site) -> tuple:
-    if param.has_default:
+def _site_integer_parameter_values(param: ParamDef, site: _Site) -> tuple:
+    if param.annotation is not int:
         return ()
-    annotation = param.annotation
-    if isinstance(annotation, type) and issubclass(annotation, Enum):
-        return tuple(annotation)
-    if annotation is int:
-        largest = max(
-            extent
-            for _name, type_ in (*site.reads, *site.leaves)
-            for extent in type_.shape
-            if isinstance(extent, int) and not isinstance(extent, bool)
-        )
-        return tuple(range(1, largest + 1))
-    return ()
+    largest = max(
+        extent
+        for _name, type_ in (*site.reads, *site.leaves)
+        for extent in type_.shape
+        if isinstance(extent, int) and not isinstance(extent, bool)
+    )
+    return tuple(range(1, largest + 1))
 
 
 def _variant_instances(
@@ -231,24 +223,18 @@ def _variant_instances(
         instruction = instruction_from_hir(site.call.target, op_type)
         return () if instruction is None else ((instruction, {}),)
     declaration = capability.declaration
-    states: tuple[dict, ...] = ({},)
-    for param in declaration.parameters:
-        if param.has_default:
-            continue
-        held = []
-        for state in states:
-            for value in _parameter_values(param, site):
-                matcher = PatternMatcher(state)
-                if matcher.match(param.pattern, value) and matcher.solve():
-                    held.append({**state, param.name: value})
-        states = tuple(held)
-    variants = []
+    states = variants(
+        declaration.parameters,
+        vary_defaulted=False,
+        values=lambda param: _site_integer_parameter_values(param, site),
+    )
+    instances = []
     for state in states:
         try:
-            variants.append((declaration(**state), state))
+            instances.append((declaration(**state), state))
         except ValueError:
             continue
-    return tuple(variants)
+    return tuple(instances)
 
 
 def _instantiate(op_type: type, capability: OpCapability, variant):
@@ -289,32 +275,6 @@ def _declared_shape(pattern: TensorPattern, bindings: dict) -> tuple[int, ...] |
     return tuple(shape)
 
 
-def _field_name(value) -> str:
-    return getattr(value, "name", str(value)).lower()
-
-
-def _field_refusals(
-    name: str,
-    pattern: TensorPattern,
-    type_: TensorType,
-    bindings: dict,
-) -> list[str]:
-    printer = PatternPrinter()
-    refused = []
-    for field in ("dtype", "storage"):
-        wanted = getattr(pattern, field)
-        actual = getattr(type_, field)
-        matcher = PatternMatcher(bindings)
-        if matcher.match(wanted, actual) and matcher.solve():
-            continue
-        if isinstance(wanted, Enum) or hasattr(wanted, "name") and not hasattr(wanted, "match"):
-            written = _field_name(wanted)
-        else:
-            written = printer.written(wanted, field)
-        refused.append(f"{name} {field}={_field_name(actual)}, reads {field}={written}")
-    return refused
-
-
 def _type_refusals(
     name: str,
     pattern: TensorPattern | None,
@@ -331,10 +291,7 @@ def _type_refusals(
     matcher = PatternMatcher(bindings)
     if matcher.match(simplified, single) and matcher.solve():
         return single, ()
-    refused = _field_refusals(name, simplified, single, bindings)
-    if not refused:
-        refused.append(f"{name}: {PatternPrinter().refusal(matcher.refusal)}")
-    return single, tuple(refused)
+    return single, (f"{name}: {PatternPrinter().refusal(matcher.refusal)}",)
 
 
 def _whole_tiles(site: _Site, op, variant) -> bool:
@@ -357,31 +314,10 @@ def _whole_tiles(site: _Site, op, variant) -> bool:
     return True
 
 
-def _pattern_refusals(site: _Site, op, variant) -> tuple[str, ...]:
-    bindings = dict(getattr(variant, "bindings", {}))
-    asked = _asked(site, op)
-    if asked is None:
-        return ("operand counts differ",)
-    given = {}
-    refused = []
-    for param, whole in asked:
-        pattern = _operand_pattern(param, op, bindings)
-        if pattern is None:
-            refused.append(f"{param.name} states no tensor pattern")
-            continue
-        simplified = replace(pattern, layout=None)
-        refused.extend(_field_refusals(param.name, simplified, whole, bindings))
-        given[param.name] = whole
-    for rule in between_rules(type(op)):
-        if rule.field in ("storage", "dtype") and not rule.holds(given):
-            refused.append(rule.refused(given))
-    return tuple(refused)
-
-
 def _asked(site: _Site, op) -> tuple[tuple[ParamDef, TensorType], ...] | None:
     params = _input_params(type(op), len(site.reads))
     read_params = tuple(param for param in params if param.effect == MemoryEffect.READ)
-    write_params = tuple(param for param in params if param.effect == MemoryEffect.WRITE)
+    write_params = tuple(param for param in params if param.effect & MemoryEffect.WRITE)
     if len(read_params) != len(site.reads) or len(write_params) > len(site.leaves):
         return None
     return (
@@ -474,7 +410,7 @@ def candidates(
 ) -> dict[str, Any]:
     """Report instruction candidates for every unscheduled supported HIR site."""
     result = analyze(module, entry, analysis=("memory",), dims=dims)
-    ctx = TypeInferContext(scope=FunctionScope(result.module, result.function))
+    ctx = AnalyzeContext(result.module, result.module.resolve_target(), None, None)
     sites = _sites(result.module, result.function, ctx)
     if not sites:
         raise ValueError("source has no unscheduled candidate site")
@@ -491,10 +427,10 @@ def candidates(
         for op_type, capability in declared:
             if op_type not in site.instructions:
                 continue
-            variants = _variant_instances(op_type, capability, site)
-            if not variants:
+            instances = _variant_instances(op_type, capability, site)
+            if not instances:
                 continue
-            prototype, _binding = variants[0]
+            prototype, _binding = instances[0]
             op = _instantiate(op_type, capability, prototype)
             if _instruction_relation_shape(site, op) != site_shape:
                 continue
@@ -504,13 +440,10 @@ def candidates(
             ):
                 handed_result = True
             accepted, reasons, needs = [], [], []
-            for variant, binding in variants:
+            for variant, binding in instances:
                 held = _instantiate(op_type, capability, variant)
-                if not _whole_tiles(site, held, variant):
-                    reasons.append(_pattern_refusals(site, held, variant))
-                    continue
                 rejected = _refusals(site, held, variant)
-                if rejected:
+                if rejected or not _whole_tiles(site, held, variant):
                     reasons.append(rejected)
                     continue
                 accepted.append(_written_bindings(binding))
@@ -534,9 +467,9 @@ def candidates(
                         }
                     )
         operands = [
-            *(f"{name}={type_printer.visit(type_)}" for name, type_ in site.reads),
+            *(f"{name}={type_printer.print(type_)}" for name, type_ in site.reads),
             *(
-                f"{name}={type_printer.visit(type_)}"
+                f"{name}={type_printer.print(type_)}"
                 for name, type_ in site.leaves
                 if handed_result
             ),

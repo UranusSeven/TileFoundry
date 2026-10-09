@@ -5,14 +5,14 @@ from typing import Literal
 import torch
 
 from tilefoundry.evaluator.registry import register_eval
-from tilefoundry.evaluator.value import TensorValue
+from tilefoundry.evaluator.value import TensorValue, to_torch_dtype
 from tilefoundry.ir.core import Op
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir._helpers import resolve_anchor_storage
 from tilefoundry.ir.hir._shard_checks import check_multilinear_partials
 from tilefoundry.ir.pattern import is_ranked_tensor
-from tilefoundry.ir.types import Layout, TensorType
+from tilefoundry.ir.types import DType, FloatDType, Layout, StorageKind, TensorType
 from tilefoundry.ir.types.shard_layout import (
     ShardLayout,
     canonical_shard_layout,
@@ -40,6 +40,13 @@ class MatMul(Op):
     rhs = ParamDef(kind="input", pattern=is_ranked_tensor())
     a_layout = ParamDef(kind="attribute", annotation=Literal["MK", "KM"], default="MK")
     b_layout = ParamDef(kind="attribute", annotation=Literal["NK", "KN"], default="KN")
+    out_dtype = ParamDef(kind="attribute", annotation=DType, optional=True, default=None)
+
+    def __init__(self, **attrs) -> None:
+        out_dtype = attrs.get("out_dtype")
+        if isinstance(out_dtype, str):
+            attrs["out_dtype"] = DType.from_name(out_dtype)
+        super().__init__(**attrs)
 
 
 def matmul_axes(op: MatMul) -> tuple[int, int, int, int]:
@@ -84,8 +91,17 @@ def _elements(shape: tuple) -> int:
     return counted
 
 
-@register_typeinfer(MatMul)
-def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+def matmul_result_dtype(op: MatMul, lhs: TensorType) -> DType:
+    """The result dtype: ``out_dtype`` when stated, else the operand dtype."""
+    return lhs.dtype if op.out_dtype is None else op.out_dtype
+
+
+def matmul_result_shape_and_layout(call: "Call", ctx: "TypeInferContext") -> tuple:
+    """Check the operands against each other and derive the result shape and layout.
+
+    Every target's MatMul rule reads its shape and layout here; only the result
+    storage is the target's to decide.
+    """
     lhs = ctx.type_of(call.args[0])
     rhs = ctx.type_of(call.args[1])
     try:
@@ -137,17 +153,41 @@ def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
             layout = held
         else:
             layout = Layout(shape=out_shape, strides=try_compact_major(out_shape))
-    storage = resolve_anchor_storage(ctx, call, lhs.storage, rhs.storage)
-    return TensorType(shape=out_shape, dtype=lhs.dtype, layout=layout, storage=storage)
+    return out_shape, layout
+
+
+@register_typeinfer(MatMul)
+def _(call: "Call", ctx: "TypeInferContext") -> TensorType:
+    lhs = ctx.type_of(call.args[0])
+    rhs = ctx.type_of(call.args[1])
+    shape, layout = matmul_result_shape_and_layout(call, ctx)
+    on_chip = {lhs.storage, rhs.storage} & {StorageKind.SMEM, StorageKind.RMEM}
+    if on_chip and ctx.resolve_target() is None:
+        storage = StorageKind.UMAT
+    else:
+        storage = resolve_anchor_storage(ctx, call, lhs.storage, rhs.storage)
+    return TensorType(
+        shape=shape, dtype=matmul_result_dtype(call.target, lhs), layout=layout, storage=storage
+    )
 
 
 @register_eval(MatMul)
 def _eval_matmul(ctx):
+    """Multiply in the operand dtype, or widen to f32 and round once.
+
+    The operand-dtype product serves when the result keeps that dtype and the
+    operand is not an 8-bit float, which torch cannot multiply.
+    """
     lhs = ctx.args[0].data
     rhs = ctx.args[1].data
     if ctx.op.a_layout == "KM":
         lhs = lhs.transpose(-1, -2)
     if ctx.op.b_layout == "NK":
         rhs = rhs.transpose(-1, -2)
-    out = torch.matmul(lhs, rhs)
+    operand = ctx.args[0].type.dtype
+    fp8 = isinstance(operand, FloatDType) and operand.bit_width == 8
+    if ctx.result_type.dtype == operand and not fp8:
+        out = torch.matmul(lhs, rhs)
+    else:
+        out = torch.matmul(lhs.float(), rhs.float()).to(to_torch_dtype(ctx.result_type.dtype))
     return TensorValue(data=out, type=ctx.result_type)

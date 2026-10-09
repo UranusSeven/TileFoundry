@@ -39,9 +39,11 @@ from tilefoundry.ir.types.shard_layout import (
     Partial,
     Split,
 )
+from tilefoundry.target import CpuTarget, CudaTarget
 from tilefoundry.visitor_registry.contexts import TrafficBytes
 
 _MM = MatMul()
+_H200 = CudaTarget("nvidia.h200_sxm")
 
 
 _M = Mesh((Topology("gpu", 4),), Layout((4,), (1,)), ("g",))
@@ -129,6 +131,20 @@ COST_CASES = [
         topology_level="cta",
         topologies=(_CTA,),
     ),
+    CostCase(
+        name="fp8_operands_count_their_flops_and_write_the_wider_result",
+        op=MatMul(out_dtype="f32"),
+        inputs=(
+            make_tensor_type((2, 3), DType.fp8e4m3),
+            make_tensor_type((3, 4), DType.fp8e4m3),
+        ),
+        flops={DType.fp8e4m3: 2 * 2 * 3 * 4},
+        traffic=(
+            TrafficBytes(read=2 * 3 * 1),
+            TrafficBytes(read=3 * 4 * 1),
+            TrafficBytes(write=2 * 4 * 4),
+        ),
+    ),
 ]
 
 
@@ -176,14 +192,57 @@ def test_matmul_layouts_share_shape_and_cost(op, lhs_shape, rhs_shape):
     )
 
 
-@pytest.mark.parametrize(("op", "lhs_shape", "rhs_shape"), LAYOUT_CASES)
-def test_matmul_layouts_evaluate(op, lhs_shape, rhs_shape):
+def _layout_eval_case(param) -> EvalCase:
+    op, lhs_shape, rhs_shape = param.values
     lhs = torch.arange(6, dtype=torch.float32).reshape(lhs_shape)
     rhs = torch.arange(12, dtype=torch.float32).reshape(rhs_shape)
     logical_lhs = lhs.transpose(-1, -2) if op.a_layout == "KM" else lhs
     logical_rhs = rhs.transpose(-1, -2) if op.b_layout == "NK" else rhs
+    return EvalCase(param.id, op, (lhs, rhs), logical_lhs @ logical_rhs, atol=0, rtol=0)
 
-    run_eval_case(EvalCase("matmul_layout", op, (lhs, rhs), logical_lhs @ logical_rhs))
+
+_SIXTEENS = (torch.full((2, 3), 16.0), torch.full((3, 4), 16.0))
+_BF16_LHS = torch.tensor([[1.0, 2.0**-8]], dtype=torch.bfloat16)
+_BF16_RHS = torch.tensor([[1.0], [1.0]], dtype=torch.bfloat16)
+
+
+EVAL_CASES = [
+    *(_layout_eval_case(param) for param in LAYOUT_CASES),
+    EvalCase(
+        "fp8_into_f32",
+        MatMul(out_dtype="f32"),
+        tuple(t.to(torch.float8_e4m3fn) for t in _SIXTEENS),
+        _SIXTEENS[0] @ _SIXTEENS[1],
+        atol=0,
+        rtol=0,
+    ),
+    EvalCase(
+        "bf16_into_f32_keeps_bits_bf16_would_drop",
+        MatMul(out_dtype=DType.f32),
+        (_BF16_LHS, _BF16_RHS),
+        torch.tensor([[1.0 + 2.0**-8]]),
+        atol=0,
+        rtol=0,
+    ),
+    EvalCase(
+        "bf16_without_out_dtype_is_unchanged",
+        MatMul(out_dtype=None),
+        (_BF16_LHS, _BF16_RHS),
+        _BF16_LHS @ _BF16_RHS,
+        atol=0,
+        rtol=0,
+    ),
+]
+
+
+@pytest.mark.parametrize("case", EVAL_CASES, ids=lambda c: c.name)
+def test_matmul_evaluates(case):
+    """Each layout reads its operands' logical axes; the result is rounded once.
+
+    16 * 16 summed over K = 3 is 768, past e4m3's largest finite value (448),
+    so an fp8 result rounded to fp8 before it is widened cannot match.
+    """
+    run_eval_case(case)
 
 
 def _sharded(shape, attrs):
@@ -203,6 +262,70 @@ CASES = [
         inputs=(make_tensor_type((0, 16), DType.bf16), make_tensor_type((16, 8), DType.bf16)),
         expected=make_tensor_type((0, 8), DType.bf16),
     ),
+    TypeInferCase(
+        name="cuda_on_chip_result_is_where_the_mma_writes_it",
+        op=MatMul(out_dtype="f32"),
+        inputs=(
+            make_tensor_type((64, 16), DType.bf16, "smem"),
+            make_tensor_type((16, 32), DType.bf16, "smem"),
+        ),
+        expected=make_tensor_type((64, 32), DType.f32, "rmem"),
+        target=_H200,
+    ),
+    TypeInferCase(
+        name="cuda_fp8_register_lhs_reads_like_rs",
+        op=MatMul(out_dtype="f32"),
+        inputs=(
+            make_tensor_type((64, 32), DType.fp8e4m3, "rmem"),
+            make_tensor_type((32, 32), DType.fp8e4m3, "smem"),
+        ),
+        expected=make_tensor_type((64, 32), DType.f32, "rmem"),
+        target=_H200,
+    ),
+    TypeInferCase(
+        name="cuda_on_chip_without_an_mma_is_refused",
+        op=_MM,
+        inputs=(
+            make_tensor_type((64, 16), DType.f32, "smem"),
+            make_tensor_type((16, 32), DType.f32, "smem"),
+        ),
+        expected=ExpectedError(
+            match="no nvidia.h200_sxm MMA reads lhs f32 smem and rhs f32 smem into f32"
+        ),
+        target=_H200,
+    ),
+    TypeInferCase(
+        name="cuda_logical_operands_keep_the_neutral_rule",
+        op=_MM,
+        inputs=(make_tensor_type((64, 16), DType.bf16), make_tensor_type((16, 32), DType.bf16)),
+        expected=make_tensor_type((64, 32), DType.bf16),
+        target=_H200,
+    ),
+    TypeInferCase(
+        name="on_chip_without_a_target_is_undecided",
+        op=MatMul(out_dtype="f32"),
+        inputs=(
+            make_tensor_type((64, 16), DType.bf16, "smem"),
+            make_tensor_type((16, 32), DType.bf16, "smem"),
+        ),
+        expected=make_tensor_type((64, 32), DType.f32, "umat"),
+    ),
+    TypeInferCase(
+        name="cpu_on_chip_keeps_the_neutral_rule",
+        op=_MM,
+        inputs=(
+            make_tensor_type((64, 16), DType.f32, "smem"),
+            make_tensor_type((16, 32), DType.f32, "smem"),
+        ),
+        expected=make_tensor_type((64, 32), DType.f32, "smem"),
+        target=CpuTarget(),
+    ),
+    TypeInferCase(
+        name="fp8_out_dtype_names_the_result",
+        op=MatMul(out_dtype="f32"),
+        inputs=(make_tensor_type((16, 8), DType.fp8e4m3), make_tensor_type((8, 32), DType.fp8e4m3)),
+        expected=make_tensor_type((16, 32), DType.f32),
+    ),
 ]
 
 
@@ -212,22 +335,22 @@ def test_matmul_typeinfer(case):
 
 
 @pytest.mark.parametrize(
-    "op",
-    (MatMul(a_layout="bad"), MatMul(b_layout="bad")),
-    ids=("invalid_a_layout", "invalid_b_layout"),
+    ("attrs", "match"),
+    (
+        ({"a_layout": "bad"}, "layout must be"),
+        ({"b_layout": "bad"}, "layout must be"),
+        ({"out_dtype": "f99"}, "DType: unknown value 'f99'"),
+    ),
+    ids=("invalid_a_layout", "invalid_b_layout", "unknown_out_dtype"),
 )
-def test_matmul_rejects_invalid_layouts(op):
-    run_typeinfer_case(
-        TypeInferCase(
-            name="invalid_layout",
-            op=op,
-            inputs=(
-                make_tensor_type((2, 3), DType.f32),
-                make_tensor_type((4, 3), DType.f32),
-            ),
-            expected=ExpectedError(match="layout must be"),
+def test_matmul_rejects_invalid_attributes(attrs, match):
+    """A bad layout fails in typeinfer; an unknown dtype name fails at construction."""
+    with pytest.raises(ValueError, match=match):
+        infer_call(
+            MatMul(**attrs),
+            make_tensor_type((2, 3), DType.f32),
+            make_tensor_type((4, 3), DType.f32),
         )
-    )
 
 
 def test_lhs_splits_k_rhs_unsplit_is_invalid():

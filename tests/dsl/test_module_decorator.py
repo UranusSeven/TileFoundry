@@ -21,9 +21,15 @@ from tilefoundry import func, module, prim_func
 from tilefoundry.dsl import ConstTensor, T, Tensor, tf  # noqa: F401 — tf/T used by bodies
 from tilefoundry.evaluator import evaluate
 from tilefoundry.evaluator.value import EvalError
+from tilefoundry.inspection import as_script
+from tilefoundry.ir.core import Call
 from tilefoundry.ir.core.errors import VerifyError
 from tilefoundry.ir.core.module import Module
-from tilefoundry.ir.types import Layout, Mesh, Topology
+from tilefoundry.ir.hir.loop_region import LoopRegion
+from tilefoundry.ir.hir.mesh_region import MeshRegion
+from tilefoundry.ir.hir.nn.matmul import MatMul
+from tilefoundry.ir.types import Layout, Mesh, StorageKind, Topology
+from tilefoundry.ir.visitor import collect_exprs
 from tilefoundry.runtime.resource import DictResource
 from tilefoundry.target import CpuTarget, CudaTarget
 from tilefoundry.utils.spec_ref import spec_ref_render
@@ -246,6 +252,141 @@ def test_one_shared_child_binds_once_per_owner():
     assert loaded_left.modules[0].module is loaded_right.modules[0].module
     assert evaluate(loaded_left.leaf, ones).float().cpu().tolist() == [3.0, 3.0]
     assert evaluate(loaded_right.leaf, ones).float().cpu().tolist() == [10.0, 10.0]
+
+
+def test_a_held_child_takes_its_own_owners_target_types():
+    """A root types its own calls of a child under its Target; the child keeps its body.
+
+    The children declare no Target, so their matmuls and loop accumulators,
+    variants included, stay umat wherever they are held. A CUDA root's call of
+    the direct child is an f32 register tile and a CPU root's, on its own copy,
+    shared memory; neither writes into a child. A roundtrip keeps the inherited
+    Target and the call's storage, and a call the Target refuses fails where the
+    root makes it, leaving the child's types as they were.
+    """
+    from tests._source import import_dsl  # noqa: PLC0415
+    from tests.fixtures.placed.child_matmul_target import (  # noqa: PLC0415
+        K_LEN,
+        ChildMatmul,
+        ChildMatmulDirect,
+        ChildMatmulRoot,
+        ChildMatmulStaged,
+        K,
+        M,
+        N,
+    )
+
+    def storages(owner):
+        found = []
+        for function in owner.functions:
+            for body in (variant.body for variant in (function, *function.variants)):
+                for expr in () if body is None else collect_exprs(body):
+                    if isinstance(expr, Call) and isinstance(expr.target, MatMul):
+                        found.append(expr.type.storage)
+                    if isinstance(expr, LoopRegion):
+                        found.extend(p.type.storage for p in expr.params if p.name == "acc")
+        return found
+
+    def stored_types(owner):
+        exprs = [
+            expr
+            for function in owner.functions
+            for variant in (function, *function.variants)
+            for expr in collect_exprs(variant.body)
+        ]
+        params = [
+            param
+            for expr in exprs
+            if isinstance(expr, (LoopRegion, MeshRegion))
+            for param in expr.params
+        ]
+        return [(expr, expr.type) for expr in (*exprs, *params)]
+
+    def call_storage(owner, name):
+        (function,) = (function for function in owner.functions if function.name == name)
+        return function.body.type.storage
+
+    for standalone in (ChildMatmul, ChildMatmulDirect, ChildMatmulStaged):
+        assert storages(standalone) == [StorageKind.UMAT] * 3
+    held = ChildMatmulRoot.modules
+    for child in held:
+        assert child.target is None and child.resolve_target() is ChildMatmulRoot.target
+        assert storages(child) == [StorageKind.UMAT] * 3
+    assert call_storage(ChildMatmulRoot, "gemm_on_chip") is StorageKind.RMEM
+    before = [stored_types(child) for child in held]
+
+    @module(entry="gemm", target=CpuTarget(), topologies=(Topology("cta", 1),))
+    class _CpuRoot:
+        child, direct, staged = held
+
+        @func
+        def gemm(a: Tensor[(M, K), "bf16"], b: Tensor[(K, N), "bf16"]):
+            return child(a, b)  # noqa: F821 -- class-body binding
+
+        @func
+        def gemm_on_chip(a: Tensor[(M, K), "bf16"], b: Tensor[(K, N), "bf16"]):
+            return direct(a, b)  # noqa: F821 -- class-body binding
+
+        @func
+        def gemm_staged(a: Tensor[(M, K_LEN), "bf16"], b: Tensor[(K_LEN, N), "bf16"]):
+            return staged(a, b)  # noqa: F821 -- class-body binding
+
+    copies = _CpuRoot.modules
+    for copy_, original, types in zip(copies, held, before, strict=True):
+        assert copy_ is not original and copy_._parent is _CpuRoot and copy_.target is None
+        assert storages(copy_) == [StorageKind.UMAT] * 3
+        assert all(expr.type is stored for expr, stored in types)
+    assert call_storage(_CpuRoot, "gemm_on_chip") is StorageKind.SMEM
+    assert call_storage(ChildMatmulRoot, "gemm_on_chip") is StorageKind.RMEM
+    callees = [
+        expr.target
+        for function in _CpuRoot.functions
+        for expr in collect_exprs(function.body)
+        if isinstance(expr, Call)
+    ]
+    assert all(copy_.functions[0] in callees for copy_ in copies)
+    assert not any(original.functions[0] in callees for original in held)
+
+    imported = import_dsl(as_script(ChildMatmulRoot), "ChildMatmulRoot")
+    for child in imported.modules:
+        assert child.target is None and child.resolve_target() == ChildMatmulRoot.target
+        assert storages(child) == [StorageKind.UMAT] * 3
+    assert call_storage(imported, "gemm_on_chip") is StorageKind.RMEM
+
+    @module(entry="run", topologies=(Topology("cta", 1),))
+    class _Refused:
+        @func
+        def run(a: Tensor[(M, K), "f32"], b: Tensor[(K, N), "f32"]):
+            with Mesh(("cta",), layout=(1,), names=("g",)) as _cta:
+                acc = tf.matmul(
+                    tf.reshard(a[:, 0:16], (M, 16), "smem"),
+                    tf.reshard(b[0:16, :], (16, N), "smem"),
+                )
+                for k in tile(16, K, 16):  # noqa: F405 -- authored tile loop
+                    acc = acc + tf.matmul(
+                        tf.reshard(a[:, k], (M, 16), "smem"),
+                        tf.reshard(b[k, :], (16, N), "smem"),
+                    )
+                return tf.reshard(acc, (M, N), "gmem")
+
+    parsed = stored_types(_Refused)
+    refused = _Refused
+    with pytest.raises(VerifyError, match="no nvidia.h200_sxm MMA reads lhs f32 smem"):
+
+        @module(
+            entry="call",
+            target=CudaTarget("nvidia.h200_sxm"),
+            topologies=(Topology("cta", 1),),
+        )
+        class _RefusingRoot:
+            child = refused
+
+            @func
+            def call(a: Tensor[(M, K), "f32"], b: Tensor[(K, N), "f32"]):
+                return child(a, b)  # noqa: F821 -- class-body binding
+
+    assert storages(_Refused) == [StorageKind.UMAT] * 3
+    assert all(expr.type is stored for expr, stored in parsed)
 
 
 def test_forward_reference_sibling_fails_loudly():

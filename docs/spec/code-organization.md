@@ -116,6 +116,13 @@ license for unrelated helpers in the algebra modules.
 their stable responsibilities are owned by [core-ir](./core-ir.md),
 [parser](./parser.md), [visitor-registry](./visitor-registry.md), and [inspection](./inspection.md),
 respectively. Their internal file layout is not a per-Op contract.
+`ir/pattern/` MUST NOT import `inspection/`, not even inside a function: a failed
+match answers with the matcher's `Refusal`, and the consumer that reports it
+turns that data into text with `PatternPrinter.refusal`. `inspection/` may
+import `ir/pattern/`; the reverse edge does not exist. Likewise `ir/tir/cuda/`
+atoms never import `inspection/`: an atom is a `Printable` from `ir/core/`, a
+printer hands itself to `atom.print(printer, ctx)`, and the printer does not
+import an atom class.
 
 ## 2. File naming and content rules
 
@@ -148,7 +155,9 @@ target-neutral abstractions stay at `ir/{dialect}/{category}/`. For
 example the whole MMA surface is target-owned — `mma.py` defines the `TiledMma`
 op, `mma_atom.py` defines `MmaAtom` / `AtomPattern`, and `sm80_mma.py` /
 `wgmma.py` define the CUDA instruction declarations. All four live under
-`ir/tir/cuda/nn/`.
+`ir/tir/cuda/nn/`. A target-specific rule for a target-neutral Op nests the
+same way: the CUDA `MatMul` type rule lives in `ir/hir/cuda/nn/matmul.py`
+beside no Op class of its own.
 The backend-bound construction stays in TIR: HIR is the checking reference
 side, and carrying the instruction name in that reference would make two GPU
 targets require different HIR references. (`codegen/` and `runtime/` are

@@ -119,10 +119,18 @@ class TypeInferVisitor(ExprVisitor[Type]):
         if isinstance(target, Function):
             return self._call_function(call, target, arg_types, ctx)
         op_cls = type(target)
-        fn = typeinfer_registry.lookup(op_cls)
+        fn = self._target_rule(op_cls, ctx) or typeinfer_registry.lookup(op_cls)
         if fn is None:
             ctx.error(call, f"no typeinfer registered for {op_cls.__name__}")
         return fn(call, ctx)
+
+    @staticmethod
+    def _target_rule(op_cls: type, ctx: TypeInferContext):
+        """The rule registered for this Op under the walk's Target, if any."""
+        target = ctx.resolve_target()
+        if target is None:
+            return None
+        return typeinfer_registry.lookup((type(target), op_cls))
 
     def _call_function(
         self,
@@ -183,17 +191,20 @@ class TypeInferVisitor(ExprVisitor[Type]):
     def _region_memo(
         self, region: LoopRegion | MeshRegion, ctx: TypeInferContext
     ) -> dict[int, tuple[Expr, Type]]:
-        """Infer arguments and bind compatible entry parameters for an isolated region."""
+        """Infer arguments and bind each region parameter to its argument's type.
+
+        A region parameter has no type of its own: it is the value its argument
+        takes as the region is entered, so a type stored on it by an earlier
+        walk does not constrain this one. A walk that owns the body stores the
+        entry type on every parameter, captures the body never reads included.
+        """
         arg_types = tuple(self.visit(arg, ctx) for arg in region.args)
         from .verify import verify_region_isolated  # noqa: PLC0415
 
         verify_region_isolated(region, ctx)
-        for index, (param, arg_type) in enumerate(zip(region.params, arg_types, strict=True)):
-            if not types_compatible(param.annotation, arg_type):
-                ctx.error(
-                    region,
-                    f"{type(region).__name__} arg {index} type mismatch for param {param.name!r}",
-                )
+        if self._owns_body:
+            for param, arg_type in zip(region.params, arg_types, strict=True):
+                param.type = arg_type
         return {
             **ctx.memo,
             **{
@@ -203,10 +214,22 @@ class TypeInferVisitor(ExprVisitor[Type]):
         }
 
     def visit_LoopRegion(self, region: LoopRegion, ctx: TypeInferContext) -> Type:
-        """Infer a loop after binding its induction and carried variables."""
+        """Infer a loop after binding its induction and carried variables.
+
+        The entry values give the carried types and the result, so a loop that
+        runs no iteration has the type it was entered with. Each yielded value
+        must fit the entry type of the parameter it carries into; a yield that
+        is more specific does not change that type.
+        """
         for bound in (region.start, region.extent, region.step):
             if isinstance(bound, Expr):
                 self.visit(bound, ctx)
+        if len(region.yield_values) > len(region.params):
+            ctx.error(
+                region,
+                f"LoopRegion yields {len(region.yield_values)} values but has "
+                f"{len(region.params)} params",
+            )
         memo = self._region_memo(region, ctx)
         memo[id(region.induction_var)] = (region.induction_var, region.induction_var.annotation)
         inner = TypeInferVisitor(
@@ -215,9 +238,14 @@ class TypeInferVisitor(ExprVisitor[Type]):
             ranges=self._ranges,
         )
         body_type = inner.visit(region.body, ctx)
-        for y in region.yield_values:
-            inner.visit(y, ctx)
         carried = region.params[: len(region.yield_values)]
+        for index, (phi, y) in enumerate(zip(carried, region.yield_values, strict=True)):
+            entry_type = memo[id(phi)][1]
+            if not types_compatible(entry_type, inner.visit(y, ctx)):
+                ctx.error(
+                    region,
+                    f"LoopRegion yield {index} type mismatch for param {phi.name!r}",
+                )
         if not carried:
             return body_type
         if len(carried) == 1:
@@ -235,7 +263,8 @@ class TypeInferVisitor(ExprVisitor[Type]):
         """
         memo = self._region_memo(expr, ctx)
         mesh = make_mesh(ctx.current_mesh, expr.mesh) if ctx.current_mesh else expr.mesh
-        return self.visit(expr.body, replace(ctx, current_mesh=mesh, memo=memo))
+        inner = TypeInferVisitor(memo=memo, owns_body=self._owns_body, ranges=self._ranges)
+        return inner.visit(expr.body, replace(ctx, current_mesh=mesh, memo=memo))
 
     def visit_Function(self, fn: Function, ctx: TypeInferContext) -> Type:
         """Refresh one complete function after binding its parameter types."""
@@ -279,4 +308,7 @@ def inference_type(
     )
 
 
-__all__ = ["TypeInferVisitor", "inference_type"]
+__all__ = [
+    "TypeInferVisitor",
+    "inference_type",
+]

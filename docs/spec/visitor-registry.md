@@ -197,6 +197,7 @@ class TypeInferContext:
 
     def child_for(self, callee: Function) -> Module | None: ...
     def scope_for(self, callee: Function) -> FunctionScope | None: ...
+    def resolve_target(self) -> Target | None: ...
     def for_callee(self, callee: Function) -> TypeInferContext: ...
     def type_of(self, expr: Expr) -> Type: ...
     def local_type_of(self, expr: Expr) -> Type: ...
@@ -216,6 +217,15 @@ nothing of that kind rather than guessing.
     how the other is constructed.
   - Crossing a Function boundary uses `dataclasses.replace` so a context
     subclass retains its analysis-specific state.
+  - `resolve_target` answers which Target's rules apply: the scope Module's
+    resolved Target, or `None` without a scope or when no Module on the owner
+    chain declares one. The parser's context, which reads a function before its
+    Module exists, MUST answer with the Target that function is parsed under
+    when it has no scope. With a scope, the scope Module's owner chain answers
+    first; only a child the `@module` being built will hold, whose chain has no
+    Target yet, answers with the Target that build declares, and any other
+    scope without a Target answers `None`
+    ([parser §1.4](./parser.md#14-context-and-diagnostics)).
   - `memo` is the current scope's identity-pinned type table. Crossing a
     Function boundary creates a fresh context table; a region keeps its scope
     and seeds a nested visitor table from the enclosing one.
@@ -225,20 +235,31 @@ nothing of that kind rather than guessing.
     a derived Function into the IR.
   - The two tables have opposite lifetimes: `memo` is replaced at a Function
     boundary, while `instantiated_memo` is shared by the complete traversal.
-  - `type_of` only looks up `memo` and otherwise returns `expr.type`; it never
-    starts a traversal or infers a type on demand.
+  - `TypeInferContext.type_of` only looks up `memo`: a type stored on the node
+    by an earlier walk is never an input, and a value this inference has not
+    visited or bound is an error through `ctx.error`. It never starts a
+    traversal or infers a type on demand. Only a caller that runs a typeinfer
+    rule itself binds that rule's inputs in `memo`. A shared access relation
+    asks the context it is given: inference passes its own, and code that reads
+    typed IR passes its stage's context (analysis its `AnalyzeContext`).
+  - `VerifyContext.type_of` and `CostContext.type_of` read IR that is already
+    typed, so they return `expr.type`; `CostContext` reads a selected type
+    first.
   - `local_type_of` is the same read in a context without a topology window;
     contexts with a window override it to project the read type.
 
 Registry + decorator:
 
 ```python
-typeinfer_registry: DispatchRegistry[type[Op]]   # module-level registry keyed by type[Op]
-def register_typeinfer(op_cls: type[Op]): ...     # decorator: register a typeinfer handler for one Op class
+typeinfer_registry: DispatchRegistry[type[Op] | tuple[type[Target], type[Op]]]
+def register_typeinfer(op_cls: type[Op], *, target: type[Target] | None = None): ...
 ```
 
 - constraints:
   - handler signature is `(call: Call, ctx: TypeInferContext) -> Type | TypeInferResults`.
+  - Without `target` a handler is keyed by its Op class and answers everywhere;
+    with `target` it is keyed `(target, op_cls)` and answers only where
+    `ctx.resolve_target()` is of that Target type.
     A bare `Type` states no value range; the decorator normalizes it to
     `TypeInferResults(type)` without changing the other registries.
 
@@ -279,6 +300,7 @@ def inference_type(expr: Expr, ctx: TypeInferContext | None = None, *, ranges=Fa
     subclass with no rule raises via `ctx.error` in `default_visit_leaf` rather
     than trusting a possibly-stale `Expr.type` field.
   - `visit_leaf_Call` branches on its target. An `Op` looks up
+    `(type(ctx.resolve_target()), type(target))` first, then
     `typeinfer_registry.lookup(type(target))`; an unregistered Op routes through
     `ctx.error`. Handlers read operand types through `ctx.type_of`, which sees
     the current scope's memo bindings. A `Function` binds parameters into a new visitor memo and walks
@@ -286,14 +308,21 @@ def inference_type(expr: Expr, ctx: TypeInferContext | None = None, *, ranges=Fa
     callee with equal argument types reuse the result in `instantiated_memo`.
   - `visit_leaf_Tuple` derives a structural `TupleType` directly from its
     already-derived operands, never the Tuple node's stamped `.type`.
-  - `visit_LoopRegion` derives all `args` outside the region, verifies isolation
-    and parameter compatibility, then seeds a new visitor with induction and all
-    entry bindings before body/yields are visited
-    ([hir §1.2](./hir.md#12-loopregion)). It overrides the complete node
-    visit; the base has no per-kind operand hook.
+  - `visit_LoopRegion` and `visit_MeshRegion` derive all `args` outside the
+    region, verify isolation, and bind each parameter to its argument's type; a
+    type stored on a parameter is never read as a constraint. An owning visitor
+    stores that type on every parameter, including captures the body does not
+    read; a non-owning one stores nothing.
+  - `visit_LoopRegion` rejects more yields than parameters, seeds a new visitor
+    with induction and all entry bindings, visits body and yields once, and
+    checks each yield with `types_compatible(entry_type, yield_type)`. The
+    result is the carried entry types ([hir §1.2](./hir.md#12-loopregion)). It
+    overrides the complete node visit; the base has no per-kind operand hook.
   - `visit_MeshRegion` composes the region mesh with the enclosing HIR
-    `current_mesh`, checks the resulting topology, and visits the body in a
-    replaced child context. The region result type is the body's type.
+    `current_mesh`, checks the resulting topology, and visits the body with a
+    new visitor seeded from the region's entry bindings, in a replaced child
+    context, so a rule reading `ctx.type_of` inside the body sees the types
+    derived in it. The region result type is the body's type.
   - `visit_leaf_ShapeOf` returns the node's declared rank-0 i32 type.
   - `inference_type` creates a fresh non-owning visitor and returns the inferred
     type without writing it to `expr.type` by default. With `ranges=True`, it

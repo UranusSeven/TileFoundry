@@ -77,6 +77,16 @@ class Module:
     declares the `Target` and the ordered `Topology` hierarchy.
   - a `Module` owns its child subtree. Placing a child that already belongs to
     another owner MUST NOT change what the first owner's subtree resolves.
+  - a child declares no Target, so its bodies are typed without one, and
+    holding it does not type them again. A call of a child function is typed
+    from the callee body under the caller's effective Target with the call's
+    own argument types ([hir §1.1](./hir.md#11-function)); that writes the
+    caller's `Call.type` and nothing in the child.
+  - a `@module` class body that places a child another owner already holds
+    places an independent `cloned()` copy, detached from that owner, so its
+    calls reach the copy and the child resolves this owner's Target without
+    changing what the first owner's subtree resolves. The copy keeps the
+    ownership inside its own subtree.
   - `owns(function)` MUST use identity and accept the Module's direct functions
     and their specialization variants. With `derived=True`, it MUST also follow
     a rebuilt function's recorded origin
@@ -592,6 +602,33 @@ effect (e.g. `tir.memory.Copy` / `tir.cuda.nn.TiledMma`) and produces no
 readable value (`UnitType`, [types §6](./types.md#6-unittype)); in Stmt position
 it appears as `Evaluate(op, args)`
 ([tir §1.4](./tir.md#14-evaluate)).
+
+### 2.4 `Printable` and `PrinterBase`
+
+```python
+class PrinterBase(ABC):
+    """A printer: the one entry that writes a value as source text."""
+
+    @abstractmethod
+    def print(self, value, ctx=None, indent: str = "") -> str: ...
+
+class Printable(ABC):
+    """A value that writes itself, handing the values it holds to *printer*."""
+
+    @abstractmethod
+    def print(self, printer: PrinterBase, ctx=None) -> str: ...
+```
+
+- constraints:
+  - Both live in `ir/core/inspection.py` and import no printer, so an IR value
+    can print itself without an `ir` to `inspection` dependency, and a concrete
+    printer depends on these interfaces rather than on the value's class.
+  - `PrinterBase.print` is a printer's one public entry. A printer hands a
+    `Printable` itself and the caller's `ctx`; it does not recognise a value by
+    a method name it happens to have.
+  - `Printable.print` writes the value and prints every value it holds with
+    `printer.print(value, ctx)`, so imports and names land in the caller's
+    context.
 
 ## 3. `Pattern`
 

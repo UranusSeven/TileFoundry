@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from enum import Enum
+
 from tilefoundry.ir.core.param_def import ParamDef
 from tilefoundry.ir.types import (
     ComposedLayout,
+    DType,
     Layout,
     Mesh,
     ShardLayout,
@@ -16,7 +20,7 @@ from tilefoundry.ir.types.stride import compact_row_major
 
 from . import predicates as P
 from .constraint import DistinctConstraint
-from .match import between_rules, evaluated
+from .match import PatternMatcher, between_rules, evaluated
 from .pattern import (
     AndPattern,
     ComposedLayoutPattern,
@@ -180,6 +184,46 @@ def matched_row_issues(pattern, matcher) -> tuple[int, int] | None:
     return find(pattern)
 
 
+def variants(
+    parameters: tuple[ParamDef, ...],
+    *,
+    vary_defaulted: bool,
+    values: Callable[[ParamDef], tuple] | None = None,
+) -> tuple[dict, ...]:
+    """Every binding of *parameters* that their patterns admit, in declaration order.
+
+    Enum parameters take their members in declaration order and DType parameters
+    every declared dtype; ``values`` supplies the others, which stay unbound
+    without it or when it answers ``None``, while an empty answer admits no
+    binding. A parameter with a default is varied only with ``vary_defaulted``.
+    No parameters give one empty binding.
+    """
+    states: tuple[dict, ...] = ({},)
+    for param in parameters:
+        if param.has_default and not vary_defaulted:
+            continue
+        options = _finite_options(param, values)
+        if options is None:
+            continue
+        held = []
+        for state in states:
+            for value in options:
+                matcher = PatternMatcher(state)
+                if matcher.match(param.pattern, value) and matcher.solve():
+                    held.append({**state, param.name: value})
+        states = tuple(held)
+    return states
+
+
+def _finite_options(param: ParamDef, values) -> tuple | None:
+    annotation = param.annotation
+    if isinstance(annotation, type) and issubclass(annotation, Enum):
+        return tuple(annotation)
+    if annotation is DType:
+        return tuple(DType._members().values())
+    return None if values is None else values(param)
+
+
 def fixed_pattern_value(value, bindings: dict):
     """Resolve one declaration value when every symbolic leaf is bound."""
     if isinstance(value, tuple):
@@ -337,6 +381,7 @@ __all__ = [
     "_mangle_variant_name",
     "declared_execution_mesh",
     "dtype_place",
+    "variants",
     "locate_dim_var",
     "operand_tile",
     "storage_place",

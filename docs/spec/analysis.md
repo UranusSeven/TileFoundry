@@ -217,6 +217,9 @@ Each reported Call's JSON projection is under its `compute-cost` key:
     The Function record MUST include authored-loop repetition and therefore is
     not the direct sum of the one-occurrence Call records.
   - An op with no registered cost evaluator MUST raise `AnalysisError`.
+  - Dim arithmetic (`DimAdd`, `DimSub`, `DimMul`, `DimFloorDiv`, `DimMod`,
+    `DimMin`, `DimMax`) is scalar address work, not tensor work: its evaluator
+    MUST state no flops, no service, and zero traffic in every operand slot.
   - Missing program geometry MUST NOT be replaced with a target capacity.
   - `logical` MUST multiply only the authored loop trip counts for loops whose
     induction variable or carried argument the Call transitively reads.
@@ -1205,7 +1208,10 @@ class AnalysisCheckContext:
 - constraints:
   - The operation MUST infer types over the full reachable Function graph and
     validate its caller/callee execution context, and MUST NOT run an analysis
-    or attach derived Metadata to the authored IR.
+    or attach derived Metadata to the authored IR. The inlined view it returns
+    is its own copy: its types are inferred and stored on it under the
+    program's Target and arguments, so analyses read that view's `Expr.type`
+    rather than a stamp of a shared child body.
   - The reachable Function and Mesh geometry and every effective Module
     topology extent MUST be concrete before this operation runs. A public
     Analyze call with `dims` MUST resolve all three through one binding pass
@@ -1441,8 +1447,14 @@ class AnalyzeContext:
     target: Target
     topology_level: str | None
     options: object | None
-    root: IterationScope
-    current: IterationScope
+    root: IterationScope | None = None
+    current: IterationScope | None = None
+    current_mesh: Mesh | None = None
+
+    @property
+    def topologies(self) -> tuple[Topology, ...]: ...
+    def type_of(self, expr: Expr) -> Type: ...
+    def local_type_of(self, expr: Expr) -> Type: ...
 
 
 AnalysisCallable = Callable[
@@ -1489,6 +1501,14 @@ class Target:
     caller options, and the shared root/current `IterationScope` view. The
     `topology_level` MAY be `None` only when the Module declares no topology;
     options MAY be `None`.
+  - The same `AnalyzeContext` is what analysis reads types and access relations
+    through. It is created before the scope tree, which reads relations through
+    it with no topology level, and its `root`/`current` are bound to that tree
+    before any analysis runs. `type_of` returns the `Expr.type` that
+    `check_program` stored on the analyzed copy; `local_type_of` projects it to
+    `topology_level` over the Module's topologies, or returns it whole without
+    one. `current_mesh` is `None`: relations are asked outside any execution
+    mesh.
   - Analyze MUST obtain every root and dependency from the same exact Target
     instance through `get_analyzer`.
   - A Target subclass MUST inherit its base Analyzers through normal Python

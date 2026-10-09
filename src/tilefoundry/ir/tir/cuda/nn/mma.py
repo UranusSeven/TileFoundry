@@ -6,7 +6,7 @@ import torch
 
 from tilefoundry.evaluator.registry import register_schedule_eval
 from tilefoundry.evaluator.value import TensorValue
-from tilefoundry.ir.core import Call, Op, OpCapability, Var
+from tilefoundry.ir.core import Call, Op, OpCapability
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.pattern import (
@@ -18,13 +18,12 @@ from tilefoundry.ir.pattern import (
 from tilefoundry.ir.pattern import (
     predicates as P,
 )
-from tilefoundry.ir.types import DType, Mesh, TensorType, UnitType
+from tilefoundry.ir.types import DType, Mesh, UnitType
 from tilefoundry.visitor_registry import register_typeinfer, register_verify_stmt
 from tilefoundry.visitor_registry.access_relation import (
     AccessRelation,
     matmul_relations,
     register_access_relation,
-    relations_of,
 )
 from tilefoundry.visitor_registry.contexts import TypeInferContext
 
@@ -33,6 +32,7 @@ from .sm80_mma import Mma as _Sm80Mma
 from .wgmma import Wgmma
 
 _FP_ACC_WIDEN = {
+    (DType.fp8e4m3, DType.f32),
     (DType.f16, DType.f32),
     (DType.bf16, DType.f32),
     (DType.f16, DType.f16),
@@ -111,28 +111,12 @@ def _tiled_mma_access_relation(call: "Call", ctx) -> tuple[AccessRelation, ...]:
     return (accumulated, *operands, accumulated)
 
 
-def operand_relations(
-    op: TiledMma, operand_types: tuple[TensorType, ...]
-) -> tuple[AccessRelation, ...]:
-    """Return the registered operand relations for these concrete types."""
-    args = tuple(
-        Var(name=f"operand{index}", type=type_)
-        for index, type_ in enumerate(operand_types)
-    )
-    call = Call(target=op, args=args, type=UnitType())
-    try:
-        relations = relations_of(call, TypeInferContext())
-    except ValueError as error:
-        raise ValueError(
-            f"{op.atom.reference_name} has no registered operand access relation: {error}"
-        ) from error
-    return relations
-
-
 @register_schedule_eval(TiledMma)
 def _eval_scheduled_mma(ctx):
     acc, lhs, rhs = (arg.data for arg in ctx.args)
-    return TensorValue(data=acc + torch.matmul(lhs, rhs), type=ctx.result_type)
+    return TensorValue(
+        data=acc + torch.matmul(lhs.to(acc.dtype), rhs.to(acc.dtype)), type=ctx.result_type
+    )
 
 
 @register_verify_stmt(TiledMma)
@@ -182,4 +166,4 @@ def verify_operand_shapes(call: "Call", ctx: "VerifyContext") -> None:
         )
 
 
-__all__ = ["TiledMma", "operand_relations", "verify_mma", "verify_operand_shapes"]
+__all__ = ["TiledMma", "verify_mma", "verify_operand_shapes"]

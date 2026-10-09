@@ -904,12 +904,44 @@ class ParserChildModuleResolver:
                 return child
         return None
 
+    def will_hold(self, module: object) -> bool:
+        """Whether *module* is in a child subtree the Module being built will hold."""
+        if self.module_scope is None:
+            return False
+        pending = [child for _name, child in self.module_scope.items()]
+        while pending:
+            node = pending.pop()
+            if node is module:
+                return True
+            pending.extend(getattr(node, "modules", ()))
+        return False
+
 
 @dataclass
 class ParserTypeInferContext(TypeInferContext):
     """Type inference state bound alongside names in parser lexical frames."""
 
     child_resolver: ParserChildModuleResolver | None = None
+    parser_target: object | None = None
+
+    def resolve_target(self):
+        """The Target whose rules apply while parsing.
+
+        A scope whose owner chain declares a Target answers with it. A child the
+        Module being built will hold has no Target of its own yet, so it takes
+        the one this build will give it; any other scope without a Target has
+        none. Outside a scope, the parsed function's Target applies.
+        """
+        if self.scope is None:
+            return self.parser_target
+        target = super().resolve_target()
+        if (
+            target is None
+            and self.child_resolver is not None
+            and self.child_resolver.will_hold(self.scope.module)
+        ):
+            return self.parser_target
+        return target
 
     def child_for(self, callee: object):
         if self.child_resolver is not None:
@@ -1128,7 +1160,7 @@ class ModuleBuildContext:
             if name.startswith("__") and name.endswith("__"):
                 continue
             if isinstance(value, runtime.Module):
-                child = value if value.name == name else value.renamed(name)
+                child = _unshared(value, name)
                 modules.append(child)
                 module_bindings[name] = child
             elif (
@@ -1136,8 +1168,9 @@ class ModuleBuildContext:
                 and value
                 and all(isinstance(item, runtime.Module) for item in value)
             ):
-                modules.extend(value)
-                for child in value:
+                children = tuple(_unshared(item, item.name) for item in value)
+                modules.extend(children)
+                for child in children:
                     module_bindings[child.name] = child
             elif isinstance(value, (runtime.Function, runtime.PrimFunction)):
                 if id(value) in self.owned:
@@ -1210,6 +1243,23 @@ class ModuleBuildContext:
             elif isinstance(function, runtime.PrimFunction):
                 verify_prim_function(function, module_fns=result)
         return result
+
+
+def _unshared(child, name: str):
+    """The child this build will hold, independent of any other owner.
+
+    A child resolves its Target through the owner that holds it, and placing it
+    here must not change what another owner's subtree resolves. A child another
+    owner already holds is therefore copied and detached from that owner; the
+    copy keeps the ownership inside its own subtree.
+    """
+    placed = child if child.name == name else child.renamed(name)
+    if child._parent is None:
+        return placed
+    if placed is child:
+        placed = child.cloned()
+    placed._parent = None
+    return placed
 
 
 _MODULE_CONTEXTS: list[ModuleBuildContext] = []
@@ -1307,7 +1357,11 @@ class MatchContext:
             scope.define_mesh("mesh", resolved_mesh)
         scope.define(
             _TYPE_INFER_CONTEXT,
-            ParserTypeInferContext(child_resolver=provider, current_mesh=resolved_mesh),
+            ParserTypeInferContext(
+                child_resolver=provider,
+                current_mesh=resolved_mesh,
+                parser_target=function.target,
+            ),
         )
         return context
 
@@ -1336,7 +1390,7 @@ class MatchContext:
             )
             scope.define(
                 _TYPE_INFER_CONTEXT,
-                ParserTypeInferContext(child_resolver=provider),
+                ParserTypeInferContext(child_resolver=provider, parser_target=function.target),
             )
         else:
             scope = self.lexical_scope.fork() if isolated_scope else self.lexical_scope

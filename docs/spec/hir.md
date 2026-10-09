@@ -133,7 +133,9 @@ consistent across construction sites.
 visitor memo with the actual argument types bound to the callee's formal
 parameters, then walking the callee body in a child context. This is type
 inference only: it does not rebuild a `Function`, mutate the target, or create
-a per-call instance.
+a per-call instance. The callee body is read under the caller's effective
+Target and none of its nodes is written; only a walk that owns the caller's
+body stores the result on the caller's `Call`.
 Caller-supplied layout (sharding) flowing into a layout-unconstrained
 parameter propagates through the body, including through a `Tuple` or
 `LoopRegion` return.
@@ -417,10 +419,15 @@ Each structured region exposes its invariant bindings through `captures()`.
 parameters and arguments. Analysis stores those pairs on its iteration-scope
 tree, so capture resolution does not need to inspect the region kind.
 
-Type inference derives every argument outside the loop and checks compatibility
-with its parameter annotation. It seeds the inner visitor with the induction
-binding and all parameter types, then derives the body and yields. A carry
-result is read from the first `k` parameter bindings.
+Type inference derives every argument outside the loop and binds each
+parameter to its argument's type; a region parameter has no type of its own,
+so a type stored on it by an earlier inference does not constrain the entry
+value. It seeds the inner visitor with the induction binding and all parameter
+bindings, then derives the body and yields. Every yield MUST satisfy
+`types_compatible(entry_type, yield_type)` for the parameter it carries into,
+and `k > len(params)` is an error. The carry result is the entry type of the
+first `k` parameters: a more specific yield does not narrow it, and a loop that
+runs no iteration has that type. There is no fixed-point iteration.
 
 `LoopRegion.type` is `TensorType` (single carry) or `TupleType`
 (multi-carry); the value is the Expr itself, not a `Call`.
@@ -446,6 +453,8 @@ class MeshRegion(Expr):
   - `params` and `args` have equal length. The body may reference each captured
     value only through its corresponding parameter; an argument is never read
     directly from the body. This is the same binding boundary as `Function`.
+    Each parameter takes its argument's current type, as for `LoopRegion`
+    ([§1.2](#12-loopregion)).
   - The region result is reachable through the values that escape its lexical
     body. A single escaping value is the region's `body`; multiple escaping
     values are carried by a `Tuple` and read through `TupleGetItem` projections.
@@ -1351,6 +1360,28 @@ Consensus torch.nn.functional ops.
     `(M, K)` and `(K, N)` before deriving the output, contraction ownership, and
     `Partial(sum)` state. Its cost is `2 * numel(local_output) * local_K`, where
     `local_K` is reconstructed from that same logical-axis mapping.
+  - `MatMul` requires one common operand dtype. `MatMul.out_dtype` names the
+    result dtype; it defaults to `None`, which means the operand dtype, and a
+    dtype name is resolved at construction, so an unknown name fails there.
+    `out_dtype` states where the result is rounded, not which dtype hardware
+    accumulates in. The flops cost stays keyed by the operand dtype; the
+    result's traffic uses the result dtype. Evaluation with a result dtype equal
+    to the operand dtype and an operand that is not an 8-bit float is
+    `torch.matmul` on the operands; otherwise it is `torch.matmul` on the
+    operands widened to `f32`, then cast once to the result dtype.
+  - Under a CUDA Target, a `MatMul` with an operand in `smem` or `rmem` takes
+    its result storage from the MMA instructions the Target supports for it:
+    each declaration's A, B and C are read in every configuration its patterns
+    admit, and a configuration whose A and B admit the operand dtypes and
+    storages and whose C admits the result dtype contributes C's storage. One
+    storage is the result storage; several are `umat`, for the author to
+    resolve; none MUST be refused, naming the Target, both operands and the
+    result dtype. Operands in `gmem` or `umat` keep the target-neutral rule,
+    and so does every other Target.
+  - Where no Target is in reach (`ctx.resolve_target()` is `None`), a `MatMul`
+    with an operand in `smem` or `rmem` has `umat` result storage: which
+    instruction computes it, and so where it lands, is decided once a Target
+    is known. A child Module is typed this way until a root holds it.
   - `Conv2D` requires rank-4 NCHW input and OIHW weight, a rank-1 bias, and one
     common operand dtype. `stride` and `dilation` are positive length-2 tuples,
     `padding` is a non-negative length-2 tuple, and `groups` is positive. Input

@@ -36,13 +36,12 @@ from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.math.binary import Binary as HirBinary
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.hir.schedule import ScheduleOp
+from tilefoundry.ir.hir.schedule import ScheduleOp, operand_relations
 from tilefoundry.ir.hir.sharding.mesh_coord import MeshCoord
 from tilefoundry.ir.hir.tensor._view_layout import derive_view_layout
 from tilefoundry.ir.hir.tensor.slice import Slice
 from tilefoundry.ir.hir.tensor.tuple_get_item import TupleGetItem
 from tilefoundry.ir.hir.tensor.zeros import Zeros
-from tilefoundry.ir.tir.cuda.nn.mma import operand_relations
 from tilefoundry.ir.tir.memory import AllocTensor, Copy, Fill, PtrOf, TensorView
 from tilefoundry.ir.tir.prim_function import PrimFunction
 from tilefoundry.ir.tir.stmts import Evaluate, For, LetStmt, MeshScope, Sequential
@@ -1106,7 +1105,9 @@ class Lowering(ExprVisitor[Expr]):
             (base, keys),
             type=cut_type,
         )
-        inferred = typeinfer_registry.lookup(Slice)(cut, TypeInferContext())
+        inferred = typeinfer_registry.lookup(Slice)(
+            cut, TypeInferContext(memo={id(arg): (arg, arg.type) for arg in (base, *starts)})
+        )
         cut.type = getattr(inferred, "type", inferred)
         pointer = Call(PtrOf(), (cut,), type=PointerType(held.dtype, held.storage))
         view = Call(

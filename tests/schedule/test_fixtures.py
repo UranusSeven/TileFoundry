@@ -33,16 +33,17 @@ from tilefoundry.analysis.metadata import (
 )
 from tilefoundry.cli import main as cli_main
 from tilefoundry.evaluator import EvalError, evaluate
+from tilefoundry.evaluator.value import to_torch_dtype
 from tilefoundry.inspection import PatternPrinter, as_script
 from tilefoundry.ir.core import Call, Op, OpCapability, Var, detach_metadata, get_metadata
+from tilefoundry.ir.core.errors import VerifyError
 from tilefoundry.ir.core.op_registry import iter_schemas
 from tilefoundry.ir.core.param_def import MemoryEffect, ParamDef, collect_param_defs
 from tilefoundry.ir.core.register import register_op
 from tilefoundry.ir.hir.function import Function
 from tilefoundry.ir.hir.loop_region import LoopRegion
 from tilefoundry.ir.hir.mesh_region import MeshRegion
-from tilefoundry.ir.hir.nn.matmul import MatMul
-from tilefoundry.ir.hir.schedule import ScheduleOp
+from tilefoundry.ir.hir.schedule import ScheduleOp, operand_relations
 from tilefoundry.ir.hir.tensor.cast import Cast as HirCast
 from tilefoundry.ir.hir.tensor.reshape import Reshape
 from tilefoundry.ir.hir.tensor.slice import Slice
@@ -58,7 +59,7 @@ from tilefoundry.ir.tir.async_copy import CopyAsync
 from tilefoundry.ir.tir.cuda.memory.copy_async_tensor import CopyAsyncTensor
 from tilefoundry.ir.tir.cuda.nn.mma import TiledMma
 from tilefoundry.ir.tir.cuda.nn.sm80_mma import Mma
-from tilefoundry.ir.tir.cuda.nn.wgmma import Wgmma
+from tilefoundry.ir.tir.cuda.nn.wgmma import Form, Wgmma
 from tilefoundry.ir.tir.memory import Copy
 from tilefoundry.ir.tir.stmts import Evaluate
 from tilefoundry.ir.types import (
@@ -68,7 +69,6 @@ from tilefoundry.ir.types import (
     ShardLayout,
     StorageKind,
     TensorType,
-    UnitType,
 )
 from tilefoundry.ir.types.layout import flatten
 from tilefoundry.ir.types.mesh import levels, starts
@@ -85,12 +85,19 @@ from tilefoundry.visitor_registry.verify import verify_prim_function
 
 PLAIN = (
     "chunk_rmsnorm",
+    "fp8_block_scaled_gemm",
     "gemm_8192x17408x5120_cta_grid",
     "gemm_relu_gemm_smem_staged",
     "gemm_relu_gemm_tiled",
     "gemm_relu_gemm_untiled",
 )
 PLAIN_DIMS = {"chunk_rmsnorm": {"chunks": 16}}
+PLAIN_REFUSED = {
+    "gemm_relu_gemm_smem_staged": (
+        r"no nvidia\.h200_sxm MMA reads lhs f32 smem and rhs f32 smem into f32"
+        r"(.|\n)*gemm_relu_gemm_smem_staged\.py:41:29"
+    ),
+}
 TIR = tuple(sorted((Path(__file__).parents[1] / "fixtures" / "schedule" / "tir").glob("*.py")))
 HIR = tuple(sorted((Path(__file__).parents[1] / "fixtures" / "schedule" / "hir").glob("*.py")))
 WGMMA_FACTS = Path(__file__).parents[1] / "fixtures" / "schedule" / "Wgmma.facts.txt"
@@ -126,6 +133,7 @@ class _RmemExpectation:
 
 SMEM_GOLDEN = {
     "scalar_binary": 0,
+    "fp8_block_scaled_gemm": 65_536,
     "gemm_8192x17408x5120_register_store": 196_608,
     "gemm_8192x17408x5120_tma_store": 212_992,
     "sm80_mma_ldmatrix": 1_536,
@@ -153,6 +161,15 @@ RMEM_EXPECTED = {
             "rhs literal materializes in rmem during lowering; the new result reuses "
             "the same register tile, so the HIR peak stays unchanged",
         ),
+    },
+    "fp8_block_scaled_gemm": {
+        "thread@128:256#0": _RmemExpectation(65_536, "128x128 f32 zero accumulator"),
+        "thread@128:256#1": _RmemExpectation(
+            66_048,
+            "128x128 f32 block product and its scaled aliases plus the 512-byte 128x1 row scale",
+        ),
+        "thread@128:256#2": _RmemExpectation(65_536, "f32 loop result/bf16 cast alias"),
+        "thread@0:384#0": _RmemExpectation(66_048, "parent envelope of the block-scaling region"),
     },
     "gemm_8192x17408x5120_register_store": {
         "thread@128:256#0": _RmemExpectation(131_072, "128x256 f32 zero accumulator"),
@@ -360,6 +377,10 @@ def _direct_operand_matches(function: PrimFunction) -> list[tuple[object, str, d
 
 @pytest.mark.parametrize("name", PLAIN)
 def test_plain_program_is_analyzable(name: str) -> None:
+    if name in PLAIN_REFUSED:
+        with pytest.raises(VerifyError, match=PLAIN_REFUSED[name]):
+            importlib.import_module(f"tests.fixtures.schedule.plain.{name}")
+        return
     module = importlib.import_module(f"tests.fixtures.schedule.plain.{name}")
     program = next(value for value in vars(module).values() if type(value).__name__ == "Module")
     entry = program.entry_function()
@@ -567,6 +588,8 @@ def test_schedule_memory_report_carries_allocations(
     assert memory["solver_status"] == "feasible"
     for row in report["calls"]:
         allocation = row["memory"]
+        if "operands" not in allocation:
+            continue
         result = next(
             operand for operand in allocation["operands"] if operand["arg"] == "result"
         )
@@ -679,41 +702,83 @@ def test_schedule_copy_evaluates_to_the_source_value() -> None:
     assert torch.equal(result, source)
 
 
-def test_schedule_mma_evaluates_like_matmul_plus_accumulator() -> None:
-    acc_type = TensorType((16, 8), DType.f32, None, StorageKind.RMEM)
-    lhs_type = TensorType((16, 16), DType.bf16, None, StorageKind.RMEM)
-    rhs_type = TensorType((16, 8), DType.bf16, None, StorageKind.RMEM)
-    product_type = TensorType((16, 8), DType.bf16, None, StorageKind.RMEM)
-    acc = torch.arange(16 * 8, dtype=torch.float32).reshape(16, 8)
-    lhs = (torch.arange(16 * 16).reshape(16, 16) % 5).to(torch.bfloat16)
-    rhs = (torch.arange(16 * 8).reshape(16, 8) % 3).to(torch.bfloat16)
+@pytest.mark.parametrize(
+    ("atom", "dtype", "shape"),
+    (
+        pytest.param(Mma(), DType.bf16, (16, 16, 8), id="sm80_bf16"),
+        pytest.param(
+            Wgmma(n=8, dtype="fp8e4m3", form=Form.SS), DType.fp8e4m3, (64, 32, 8), id="fp8_ss"
+        ),
+        pytest.param(
+            Wgmma(n=8, dtype="fp8e4m3", form=Form.RS), DType.fp8e4m3, (64, 32, 8), id="fp8_rs"
+        ),
+    ),
+)
+def test_schedule_mma_evaluates_like_matmul_plus_accumulator(atom, dtype, shape) -> None:
+    """Products are summed in the accumulator dtype, not rounded to the operand dtype first.
 
-    product = _evaluate_call(
-        MatMul(),
-        ((lhs_type, lhs), (rhs_type, rhs)),
-        product_type,
-    )
+    Column 0 of lhs holds 2**-8, so each sum carries bits an operand-dtype result drops.
+    """
+    m, k, n = shape
+    operand = to_torch_dtype(dtype)
+    acc_type = TensorType((m, n), DType.f32, None, StorageKind.RMEM)
+    lhs_type = TensorType((m, k), dtype, None, StorageKind.RMEM)
+    rhs_type = TensorType((k, n), dtype, None, StorageKind.RMEM)
+    acc = torch.arange(m * n, dtype=torch.float32).reshape(m, n)
+    lhs = (torch.arange(m * k).reshape(m, k) % 5).float()
+    lhs[:, 0] = 2.0**-8
+    lhs = lhs.to(operand)
+    rhs = (torch.arange(k * n).reshape(k, n) % 3).to(operand)
+
     scheduled = _evaluate_call(
-        ScheduleOp(op=TiledMma(atom=Mma())),
+        ScheduleOp(op=TiledMma(atom=atom)),
         ((acc_type, acc), (lhs_type, lhs), (rhs_type, rhs)),
         acc_type,
     )
 
-    assert torch.equal(scheduled, acc + product)
+    exact = lhs.float() @ rhs.float()
+    assert torch.equal(scheduled, acc + exact)
+    assert not torch.equal(scheduled, acc + exact.to(operand).float())
+
+
+def test_fp8_block_scaled_gemm_matches_its_block_scaled_reference() -> None:
+    """The scheduled program equals sum_kb (A_kb @ B_kb) * a_scale[:, kb] * b_scale[kb, :].
+
+    Each 128-wide K block's FP8 product is exact in f32, then scaled by that
+    block's own positive row and tile scales; the scales differ across blocks,
+    so scaling a running total instead of each block would not match.
+    """
+    source = Path(__file__).parents[1] / "fixtures" / "schedule" / "hir" / "fp8_block_scaled_gemm.py"
+    module = _module_in(source)
+    m, n, k, block = 128, 128, 512, 128
+    generator = torch.Generator().manual_seed(0)
+    a = torch.randn(m, k, generator=generator).to(torch.float8_e4m3fn)
+    weight = torch.randn(n, k, generator=generator).to(torch.float8_e4m3fn)
+    b = weight.t()
+    a_scale = torch.rand(m, k // block, generator=generator) + 0.5
+    b_scale = torch.rand(k // block, n // block, generator=generator) + 0.5
+
+    scheduled = evaluate(module.entry_function(), a, b, a_scale, b_scale)
+
+    reference = sum(
+        (a[:, kb * block : (kb + 1) * block].float() @ b[kb * block : (kb + 1) * block].float())
+        * a_scale[:, kb : kb + 1]
+        * b_scale[kb, :].repeat_interleave(block)
+        for kb in range(k // block)
+    ).to(torch.bfloat16)
+    torch.testing.assert_close(scheduled.float(), reference.float(), rtol=2**-7, atol=0)
 
 
 def test_single_issue_schedule_preserves_instruction_relations() -> None:
     schedule = _copy_schedule_call(repeat=(1,), order=(0,))
     source = schedule.args[0]
     destination_type = TensorType((4,), DType.bf16, Layout((4,), (1,)), StorageKind.SMEM)
-    instruction = Call(
-        target=schedule.target.op,
-        args=(source, Var(name="dst", type=destination_type)),
-        type=UnitType(),
+    inferred = TypeInferContext()
+    inference_type(schedule, inferred)
+    scheduled = relations_of(schedule, inferred)
+    source, _destination, *result = operand_relations(
+        schedule.target.op, (source.type, destination_type)
     )
-    ctx = TypeInferContext()
-    scheduled = relations_of(schedule, ctx)
-    source, _destination, *result = relations_of(instruction, ctx)
     single = (source, *result)
     assert len(scheduled) == len(single)
     assert all(
@@ -1009,7 +1074,7 @@ def test_schedule_candidate_reports_cover_every_site(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     reports = []
-    for name in PLAIN:
+    for name in (name for name in PLAIN if name not in PLAIN_REFUSED):
         source = f"tests/fixtures/schedule/plain/{name}.py"
         out = tmp_path / f"{name}.json"
         dims = [f"--dim={key}={value}" for key, value in PLAIN_DIMS.get(name, {}).items()]
@@ -1021,8 +1086,11 @@ def test_schedule_candidate_reports_cover_every_site(
     assert all(row["candidates"] or row["refused"] for _name, row in sites)
     assert all(row["candidates"] for _name, row in sites if row["op"] == "tf.reshard")
     matmuls = [(name, row) for name, row in sites if row["op"] == "tf.matmul"]
-    assert len(matmuls) == 7
-    assert [name for name, row in matmuls if row["candidates"]] == ["gemm_8192x17408x5120_cta_grid"]
+    assert len(matmuls) == 6
+    assert [name for name, row in matmuls if row["candidates"]] == [
+        "fp8_block_scaled_gemm",
+        "gemm_8192x17408x5120_cta_grid",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1030,8 +1098,8 @@ def test_schedule_candidate_reports_cover_every_site(
     (
         ("chunk_rmsnorm", ("chunks=16",), 0, 7, 0),
         ("chunk_rmsnorm", ("chunks=32",), 0, 7, 0),
+        ("fp8_block_scaled_gemm", (), 1, 5, 1),
         ("gemm_8192x17408x5120_cta_grid", (), 1, 4, 1),
-        ("gemm_relu_gemm_smem_staged", (), 2, 6, 0),
         ("gemm_relu_gemm_tiled", (), 2, 2, 0),
         ("gemm_relu_gemm_untiled", (), 2, 0, 0),
     ),
@@ -1064,6 +1132,15 @@ def test_schedule_candidates_reports_every_plain_site(
     assert sum(bool(row["candidates"]) for row in matmul_rows) == accepted_matmuls
     assert all(row["candidates"] or row["refused"] for row in report["lines"])
     assert all(row["candidates"] for row in reshard_rows)
+
+    if name == "fp8_block_scaled_gemm":
+        (matmul,) = matmul_rows
+        assert [candidate["id"] for candidate in matmul["candidates"]] == ["T.cuda.sm90.Wgmma"]
+        (wgmma,) = matmul["candidates"]
+        assert wgmma["bindings"]
+        assert all(
+            binding.endswith(", dtype=fp8e4m3, form=SS") for binding in wgmma["bindings"]
+        )
 
     if name == "chunk_rmsnorm":
         binaries = [row for row in report["lines"] if row["op"] == "tf.binary"]

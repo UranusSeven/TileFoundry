@@ -941,7 +941,7 @@ instance binds the parameters for one call; it does not carry a second copy of
 concrete fragment layouts that could drift from those patterns.
 
 ```python
-class MmaAtom:
+class MmaAtom(Printable):
     namespace: str
     execution_mesh: Mesh
     capability: str
@@ -954,13 +954,47 @@ class MmaAtom:
 
     def role(self, role: str) -> TensorPattern: ...
     def execution_mesh_pattern(self) -> MeshPattern: ...
+    def print(self, printer: PrinterBase, ctx=None) -> str: ...
+
+def variants(
+    parameters: tuple[ParamDef, ...],
+    *,
+    vary_defaulted: bool,
+    values: Callable[[ParamDef], tuple] | None = None,
+) -> tuple[dict, ...]: ...  # ir/pattern/utils.py
 ```
 
 - constraints:
   - `parameters` MUST preserve declaration order. Construction MUST reject an
     unknown binding and a value refused by its `ParamDef.pattern`; an omitted
     parameter MUST take the value implied by earlier bindings or its declared
-    default, and otherwise construction MUST fail.
+    default, and otherwise construction MUST fail. `bindings` then holds every
+    parameter, in declaration order.
+  - A string bound to a `DType` parameter MUST resolve through
+    `DType.from_name` at construction, so `dtype="bf16"` and `DType.bf16` bind
+    the same value; whether that dtype is one the declaration takes is still its
+    `ParamDef.pattern`'s answer. An Enum parameter takes only its Enum members;
+    no string spelling of a member is accepted.
+  - `variants(declaration.parameters, vary_defaulted=..., values=...)` MUST
+    return every binding of the parameters, in declaration order, that their
+    patterns admit under the earlier bindings. It enumerates bindings; it does
+    not build atoms or infer parameters from operand types. Enum parameters
+    take their members in declaration order and `DType` parameters every
+    declared dtype; `values` supplies the others, which stay unbound without it
+    or when it answers `None`, while an empty answer admits no binding. A
+    parameter with a default is varied only when `vary_defaulted` is true. No
+    parameters give one empty binding. `schedule candidates` calls it with
+    `vary_defaulted=False` and binds `int` parameters to `1..` the site's
+    largest extent; CUDA `MatMul` typing calls it with `vary_defaulted=True`
+    and leaves `int` parameters unbound.
+  - `MmaAtom` is `Printable` ([core-ir §2.4](./core-ir.md#24-printable-and-printerbase)):
+    `print(printer, ctx)` is the atom's importable DSL source. It states every
+    binding in declaration order, implied ones included, writes an Enum as
+    `<namespace>.<Enum>.<member>`, and hands every other value, the mesh
+    included, to `printer.print(value, ctx)`, so a `DType` prints as its name
+    and imports land in the caller's context. The atom never builds a printer.
+    A value with no Python form fails explicitly. `repr(atom)` is a local
+    diagnostic with the same bindings and is not an import surface.
   - `role("A")`, `role("B")`, and `role("C")` MUST resolve the declaration's
     role pattern under the instance bindings. The logical TIR orientation is
     always A `(M,K)`, B `(K,N)`, C `(M,N)`; each role pattern separately states
@@ -978,9 +1012,13 @@ class MmaAtom:
 
 The public declarations are `T.cuda.sm80.Mma()` (BF16 `16x8x16`, F32
 accumulator, register A/B/C over one warp) and
-`T.cuda.sm90.Wgmma(n=..., form=..., a_major=..., mesh=...)` (BF16
-`64 x n x 16` over one warpgroup). `Form` and `Major` live beside `Wgmma`
-under `T.cuda.sm90`.
+`T.cuda.sm90.Wgmma(n=..., dtype=..., form=..., a_major=..., b_major=..., mesh=...)`
+(`dtype` is `bf16`, `f16` or `fp8e4m3`; `64 x n x k` over one warpgroup with
+an F32 accumulator, where `k` is 32 bytes of `dtype`). `dtype` has no default.
+`a_major` and `b_major` default to `Major.MN`. A 16-bit B may be either major
+and a 16-bit A read from registers is K-major; an `fp8e4m3` A and B are
+K-major only, so that `dtype` implies both and an explicit `Major.MN` is
+refused. `Form` and `Major` live beside `Wgmma` under `T.cuda.sm90`.
 
 ##### Calling convention
 
